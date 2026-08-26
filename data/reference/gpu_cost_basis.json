@@ -1,8 +1,26 @@
 {
-  "full_evaluation_images": 4952,
-  "evaluation_seconds_per_image": 0.38,
-  "training_minutes_per_round": 1.0,
-  "pool_export_minutes_per_round": null,
-  "selection_minutes_per_round": null,
-  "source": "Measured operational timings supplied for the live-cycle design."
+  "source": "T4 smoke run, 2026-08-26: N_TASKS=3, CANDIDATE_IMAGES=300, BUDGET_PER_TASK=100, EPOCHS=1, EVAL_MAX_PER_CLASS=8, EVAL_REMAINDER_RATIO=0",
+  "predict_minutes_per_1000_images": 3.966666666666667,
+  "train_seconds_per_iteration": 0.9,
+  "train_minutes_fixed_overhead": 2.0534499999999998,
+  "evaluate_minutes_per_1000_images_reference_run": 6.462035541195477,
+  "evaluate_minutes_fixed_overhead": 0.3,
+  "observed": {
+    "t2": {
+      "predict_min": 1.19,
+      "train_min": 2.3,
+      "evaluate_min": 0.4,
+      "opened": 49,
+      "banked": 18,
+      "U_Recall50": 21.74
+    },
+    "t3": {
+      "predict_min": 1.2,
+      "train_min": 2.8,
+      "evaluate_min": 0.4,
+      "opened": 55,
+      "banked": 7,
+      "U_Recall50": 14.29
+    }
+  }
 }

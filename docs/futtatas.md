@@ -90,12 +90,32 @@ végzetes: a PROB-nak van tiszta PyTorch-tartaléka, csak lassabb — ki is írj
 
 ---
 
-## 4. lépés — A valódi lánc (armonként ~4 óra)
+## 4. lépés — A valódi lánc
+
+**Mért költség** (T4-en, a 2026-08-26-i próbafutás alapján — `data/reference/gpu_cost_basis.json`):
+
+| beállítás | perc/taszk | óra/arm |
+|---|---:|---:|
+| 10 taszk, 4000 jelölt, 600 keret, 5 epoch | 62 | **9,3** |
+| 6 taszk, 4000 jelölt, 600 keret, 5 epoch | 62 | **5,2** |
+| 6 taszk, 2000 jelölt, 600 keret, 5 epoch | 51 | **4,3** |
+| 10 taszk, 2000 jelölt, 400 keret, 3 epoch | 35 | **5,3** |
+
+A teljes tíz-taszkos lánc tehát **nem fér bele** egy Colab-estébe armonként. A
+`TIME_BUDGET_MINUTES = 420` tisztán megállítja, és a következő futás onnan folytatja —
+tehát nem baj, csak több este. Ha három armot akarsz egy hétvégén, a **6 taszk / 2000
+jelölt** sor a realista választás.
+
+
 
 ```python
 RUN_GPU    = True
 SMOKE_TEST = False
 ARM        = "prior_consult_batch"
+
+# ha három armot akarsz egy hétvégén:
+N_TASKS          = 6
+CANDIDATE_IMAGES = 2000
 ```
 
 **Runtime → Run all.** A `TIME_BUDGET_MINUTES = 420` miatt tisztán megáll, mielőtt a
