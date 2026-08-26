@@ -1,0 +1,81 @@
+class_name,introduced_task,train_objects,test_objects,group,group_test_frequency
+person,t1,262465,11004,head,head
+car,t1,43867,1932,head,head
+chair,t2,29820,1791,head,head
+bottle,t4,14657,1025,head,head
+book,t4,13512,1161,head,head
+cup,t4,12998,899,head,head
+handbag,t2,11753,540,head,head
+traffic light,t2,11431,637,head,head
+bird,t1,10806,440,head,head
+boat,t1,10759,430,head,head
+umbrella,t2,10354,413,head,head
+truck,t1,9973,415,head,head
+sheep,t1,9509,361,head,head
+diningtable,t2,9421,697,head,head
+motorbike,t1,8725,371,head,head
+kite,t3,8472,336,head,head
+bench,t2,8454,413,head,head
+backpack,t2,8309,371,head,head
+cow,t1,8147,380,head,head
+bowl,t4,7274,626,head,head
+bicycle,t1,7113,316,head,head
+horse,t1,6587,273,head,medium
+skis,t3,6566,241,head,medium
+sports ball,t3,6207,263,head,medium
+bus,t1,6069,285,head,medium
+tie,t2,6055,254,head,medium
+surfboard,t3,5915,269,head,medium
+wine glass,t4,5879,343,medium,head
+elephant,t1,5513,255,medium,medium
+dog,t1,5508,218,medium,medium
+skateboard,t3,5495,179,medium,tail
+banana,t3,5407,379,medium,head
+zebra,t1,5303,268,medium,medium
+pottedplant,t2,5200,343,medium,head
+cell phone,t4,5146,262,medium,medium
+aeroplane,t1,5135,143,medium,tail
+giraffe,t1,5131,232,medium,medium
+suitcase,t2,4795,303,medium,medium
+tennis racket,t3,4780,225,medium,medium
+cat,t1,4768,202,medium,tail
+train,t1,4571,190,medium,tail
+remote,t4,4402,283,medium,medium
+knife,t4,4235,326,medium,head
+baseball glove,t3,3721,148,medium,tail
+sofa,t2,3618,261,medium,medium
+pizza,t3,3473,285,medium,medium
+cake,t3,3430,316,medium,medium
+donut,t3,3423,338,medium,head
+spoon,t4,3316,253,medium,medium
+laptop,t4,3311,231,medium,medium
+fork,t4,3225,215,medium,tail
+baseball bat,t3,3209,146,medium,tail
+tvmonitor,t4,3174,288,medium,medium
+clock,t4,3018,267,tail,medium
+frisbee,t3,2627,115,tail,tail
+snowboard,t3,2614,69,tail,tail
+apple,t3,2366,239,tail,medium
+orange,t3,2250,287,tail,medium
+bed,t2,2214,163,tail,tail
+teddy bear,t4,2071,191,tail,tail
+vase,t4,2015,277,tail,medium
+sandwich,t3,1863,177,tail,tail
+hot dog,t3,1649,127,tail,tail
+carrot,t3,1551,371,tail,head
+sink,t2,1455,225,tail,medium
+oven,t2,1310,143,tail,tail
+bear,t1,1294,71,tail,tail
+stop sign,t2,1277,75,tail,tail
+fire hydrant,t2,1228,101,tail,tail
+keyboard,t4,1160,153,tail,tail
+refrigerator,t2,1141,126,tail,tail
+parking meter,t2,1076,60,tail,tail
+toothbrush,t4,957,57,tail,tail
+broccoli,t3,832,316,tail,medium
+mouse,t4,825,106,tail,tail
+toilet,t2,745,179,tail,tail
+scissors,t4,607,36,tail,tail
+microwave,t2,580,55,tail,tail
+hair drier,t4,111,11,tail,tail
+toaster,t2,53,9,tail,tail

@@ -1,0 +1,8 @@
+{
+  "full_evaluation_images": 4952,
+  "evaluation_seconds_per_image": 0.38,
+  "training_minutes_per_round": 1.0,
+  "pool_export_minutes_per_round": null,
+  "selection_minutes_per_round": null,
+  "source": "Measured operational timings supplied for the live-cycle design."
+}

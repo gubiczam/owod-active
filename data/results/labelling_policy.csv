@@ -1,0 +1,4 @@
+policy,images,labelled,background,ignored,classes,oracle_cost,seed,half_labelled_share,cost_ratio_vs_budget,supervision_per_oracle_unit
+box_only,306,423,14877,0,31,600,0,0.20669489816495262,1.0,0.705
+full_image,306,3498,11802,0,55,1082,0,0.0,1.8033333333333332,3.232902033271719
+known_plus_selected,306,2729,11802,769,34,600,0,0.0,1.0,4.548333333333333

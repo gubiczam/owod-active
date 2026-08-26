@@ -1,0 +1,345 @@
+"""The cycle. One task: score, ask, label, rehearse, fine-tune, evaluate.
+
+Two ways to run the same configuration.
+
+:func:`simulate`
+    CPU, minutes, no dataset. Runs on the committed PROB pass and answers
+    **what a score selects**: how many real unknown objects the budget buys, in
+    which frequency group, from how many classes, at what oracle cost. This is
+    where arms are swept, because a sweep here costs seconds.
+
+:func:`run_chain`
+    GPU, hours, the real thing. PROB's weights are updated, PROB's own evaluator
+    scores the checkpoint, and the numbers are mAP and U-Recall.
+
+**They answer different questions and the split is not a matter of taste.** The
+earlier work checked the frozen-feature surrogate against the real detector and
+found it ranks acquisition methods on forgetting in the *reverse* order. So a
+simulation may be used to compare what a score selects, and may not be used to
+claim one arm forgets less than another. :func:`simulate` refuses to report a
+detection metric for that reason.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+import numpy as np
+
+from owl import clustering, labelling, metrics, protocol, proposals, replay, selection
+from owl.bridge import Bridge
+
+
+@dataclass
+class CycleConfig:
+    """Everything one run of the chain needs. The notebook edits this and only this."""
+
+    # --- the protocol -----------------------------------------------------
+    n_tasks: int = 10
+    budget_per_task: int = 600          # regions the oracle is asked about
+    rounds_per_task: int = 6            # 1 = one shot, 6 = 6x100 (consultation, point 7)
+    candidate_images_per_task: int = 4000
+
+    # --- the four experimental variables ----------------------------------
+    arm: str = "prior_consult_batch"    # owl.selection.ARMS
+    labelling_policy: str = "known_plus_selected"   # owl.labelling.POLICIES
+    replay_arm: str = "tail_favouring"  # owl.replay.ARMS
+    replay_reallocate: bool = False     # re-size the memory every task
+
+    # --- training ---------------------------------------------------------
+    epochs: int = 5
+    learning_rate: float = 2e-4
+    batch_size: int = 2
+    n_clusters: int = 1600
+    seed: int = 0
+
+    def describe(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
+class TaskResult:
+    task: str
+    new_class: str | None
+    selection_row: dict
+    annotation_row: dict
+    replay_row: dict
+    evaluation_row: dict | None = None
+
+    def flat(self) -> dict[str, object]:
+        row: dict[str, object] = {"task": self.task, "new_class": self.new_class or "—"}
+        row |= self.selection_row
+        row |= {f"label_{k}": v for k, v in self.annotation_row.items() if k != "policy"}
+        row |= {f"replay_{k}": v for k, v in self.replay_row.items()}
+        if self.evaluation_row:
+            row |= self.evaluation_row
+        return row
+
+
+# ------------------------------------------------------------- simulation ---
+
+
+def simulate(
+    candidates: proposals.Candidates,
+    config: CycleConfig,
+    *,
+    chain: Sequence[protocol.Task] | None = None,
+    partition: clustering.Partition | None = None,
+) -> list[TaskResult]:
+    """Walk the chain on the committed pool and report what each budget buys.
+
+    No detection metric is produced. What comes out is the composition of the
+    annotation: real objects found, split by frequency group, and what the
+    oracle was charged.
+    """
+
+    chain = chain or protocol.build_chain(config.n_tasks)
+    groups = protocol.load_groups()
+    oracle = candidates.oracle()
+    group_of = np.asarray([groups.get(name, "") for name in oracle.class_name])
+
+    if partition is None:
+        partition = clustering.fit(
+            candidates.embeddings, n_clusters=config.n_clusters, seed=config.seed
+        )
+
+    arm = selection.ARMS[config.arm]
+    spent = np.zeros(len(candidates), dtype=bool)
+    labelled_embeddings = np.zeros((0, candidates.embeddings.shape[1]), dtype=np.float32)
+    memory = replay.Memory((), {}, 0.0, 0)
+    results: list[TaskResult] = []
+
+    for task in chain[1:]:
+        picked = selection.select(
+            candidates, arm,
+            budget=config.budget_per_task,
+            rounds=config.rounds_per_task,
+            labelled_embeddings=labelled_embeddings,
+            n_known=task.n_prev,
+            exclude=spent,
+            partition=partition,
+        )
+        annotation = labelling.annotate(
+            candidates, picked,
+            policy=config.labelling_policy,
+            known_classes=task.previous_classes,
+        )
+
+        index = picked.indices
+        is_object = oracle.kind[index] != "background"
+        found = group_of[index][is_object]
+        target = oracle.class_name[index] == task.new_class
+
+        results.append(
+            TaskResult(
+                task=task.name,
+                new_class=task.new_class,
+                selection_row={
+                    "asked": len(picked),
+                    "objects": int(is_object.sum()),
+                    "head": int((found == "head").sum()),
+                    "medium": int((found == "medium").sum()),
+                    "tail": int((found == "tail").sum()),
+                    "classes_seen": int(np.unique(oracle.class_name[index][is_object]).size),
+                    "target_instances": int(np.unique(oracle.object_id[index][target]).size),
+                },
+                annotation_row=annotation.summary()
+                | {"half_labelled": labelling.half_labelling_rate(annotation, candidates)},
+                replay_row=memory.summary(),
+            )
+        )
+
+        spent[index] = True
+        labelled_embeddings = np.vstack(
+            [labelled_embeddings, candidates.embeddings[annotation.labelled]]
+        )
+
+    return results
+
+
+# ----------------------------------------------------------- the real chain ---
+
+
+def run_chain(
+    bridge: Bridge,
+    config: CycleConfig,
+    *,
+    workspace: Path,
+    candidate_index: Mapping[str, Mapping[str, int]],
+    start_checkpoint: Path,
+    test_set: str,
+    chain: Sequence[protocol.Task] | None = None,
+    time_budget_minutes: float | None = None,
+) -> list[TaskResult]:
+    """Run the task chain on the GPU, one checkpoint per task, resumable.
+
+    Every artefact is keyed by ``workspace / task / arm``, and the bridge skips
+    any call whose output already exists — so a Colab session that is cut off
+    resumes at the task it died on rather than at the beginning.
+
+    ``time_budget_minutes`` stops the chain cleanly before the runtime is lost
+    and prints which tasks were not run. Nothing is silently truncated.
+    """
+
+    chain = chain or protocol.build_chain(config.n_tasks)
+    workspace = Path(workspace)
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "config.json").write_text(json.dumps(config.describe(), indent=2), encoding="utf-8")
+
+    arm = selection.ARMS[config.arm]
+    replay_spec = dict(replay.ARMS[config.replay_arm])
+    replay_selector = replay_spec.pop("selector", "greedy")
+
+    generator = np.random.default_rng(config.seed)
+    all_images = np.asarray(sorted(candidate_index), dtype=object)
+    used_images: set[str] = set()
+    labelled_history: dict[str, list[str]] = {}
+    memory = replay.Memory((), {}, 0.0, 0)
+    checkpoint = Path(start_checkpoint)
+    results: list[TaskResult] = []
+    previous_baseline: float | None = None
+    elapsed = 0.0
+
+    for task in chain[1:]:
+        task_dir = workspace / f"{task.name}_{config.arm}"
+        task_dir.mkdir(parents=True, exist_ok=True)
+
+        if time_budget_minutes is not None and elapsed >= time_budget_minutes:
+            remaining = [t.name for t in chain[chain.index(task):]]
+            print(f"Stopping cleanly: {elapsed:.0f} min used. Not run: {remaining}")
+            break
+
+        # ---- 1. this task's candidate images ----------------------------
+        pool = np.asarray([i for i in all_images if i not in used_images], dtype=object)
+        take = min(config.candidate_images_per_task, pool.size)
+        candidate_ids = [
+            str(v) for v in generator.choice(pool, size=take, replace=False)
+        ]
+
+        # ---- 2. one detector pass over them ------------------------------
+        export = bridge.predict(
+            candidate_ids,
+            checkpoint=checkpoint,
+            output=task_dir / "proposals.npz",
+            n_prev=0, n_current=task.n_prev,
+        )
+        candidates = proposals.from_predict(export)
+
+        # ---- 3. spend the budget ----------------------------------------
+        picked = selection.select(
+            candidates, arm,
+            budget=config.budget_per_task,
+            rounds=config.rounds_per_task,
+            n_known=task.n_prev,
+        )
+        opened = [str(v) for v in picked.images(candidates)]
+        used_images.update(opened)
+
+        # ---- 4. what the oracle's answers are worth ----------------------
+        found = sum(candidate_index.get(image, {}).get(task.new_class, 0) for image in opened)
+        with_target = sum(1 for image in opened if task.new_class in candidate_index.get(image, {}))
+        labelled_history[task.name] = opened
+
+        # ---- 5. the exemplar memory --------------------------------------
+        if replay_spec["total"] > 0:
+            history = {
+                image: candidate_index.get(image, {})
+                for images in labelled_history.values() for image in images
+            }
+            fresh = replay.build(
+                history, task.previous_classes,
+                total=replay_spec["total"], alpha=replay_spec["alpha"],
+                seed=config.seed, selector=replay_selector,
+            )
+            memory = replay.Memory(
+                image_ids=replay.carry_forward(
+                    memory, fresh.image_ids, reallocate=config.replay_reallocate
+                ),
+                per_class=fresh.per_class, alpha=fresh.alpha, total=fresh.total,
+            )
+
+        # ---- 6. fine-tune -------------------------------------------------
+        supervision = "train" if config.labelling_policy == "box_only" else "ft"
+        checkpoint = bridge.train(
+            opened,
+            previous_checkpoint=checkpoint,
+            output_checkpoint=task_dir / "checkpoint.pth",
+            output_dir=task_dir / "train",
+            n_prev=task.n_prev, n_current=task.n_current,
+            replay_ids=memory.image_ids,
+            supervision_mode=supervision,
+            epochs=config.epochs, learning_rate=config.learning_rate,
+            batch_size=config.batch_size,
+        )
+
+        # ---- 7. score it ---------------------------------------------------
+        metrics_path = bridge.evaluate(
+            checkpoint=checkpoint, test_set=test_set,
+            output=task_dir / "metrics.json",
+            n_prev=task.n_prev, n_current=task.n_current,
+        )
+        evaluation = metrics.from_bridge_metrics(metrics_path)
+        row = metrics.task_row(
+            evaluation, task=task.name, new_class=task.new_class,
+            previous_baseline=previous_baseline,
+        )
+        row["exchange_rate"] = metrics.exchange_rate(row)
+        previous_baseline = evaluation.known_map50
+
+        results.append(
+            TaskResult(
+                task=task.name, new_class=task.new_class,
+                selection_row={
+                    "asked": len(picked),
+                    "images_opened": len(opened),
+                    "target_objects_in_images": found,
+                    "images_with_target": with_target,
+                },
+                annotation_row={"policy": config.labelling_policy, "supervision": supervision},
+                replay_row=memory.summary(),
+                evaluation_row=row,
+            )
+        )
+        elapsed = bridge.cost_report()["total"]
+        _write_rows(results, workspace / f"results_{config.arm}.csv")
+
+    return results
+
+
+def _write_rows(results: Sequence[TaskResult], path: Path) -> None:
+    import csv
+
+    rows = [r.flat() for r in results]
+    if not rows:
+        return
+    columns = list(dict.fromkeys(key for row in rows for key in row))
+    with Path(path).open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def table(rows: Sequence[Mapping[str, object]], digits: int = 2) -> str:
+    """Plain-text table. The notebook prints everything through this."""
+
+    rows = [dict(row) for row in rows]
+    if not rows:
+        return "(empty)"
+    columns = list(dict.fromkeys(key for row in rows for key in row))
+
+    def show(value: object) -> str:
+        if value is None:
+            return "—"
+        if isinstance(value, float):
+            return f"{value:.{digits}f}"
+        return str(value)
+
+    widths = {c: max(len(c), *(len(show(r.get(c))) for r in rows)) for c in columns}
+    lines = ["  ".join(c.ljust(widths[c]) for c in columns)]
+    lines.append("  ".join("-" * widths[c] for c in columns))
+    for row in rows:
+        lines.append("  ".join(show(row.get(c)).ljust(widths[c]) for c in columns))
+    return "\n".join(lines)

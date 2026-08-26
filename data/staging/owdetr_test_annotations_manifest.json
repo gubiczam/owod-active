@@ -1,0 +1,17 @@
+{
+  "dataset": "/Volumes/AI_SSD/datasets/owod_canonical",
+  "image_list": "/Volumes/AI_SSD/datasets/owod_canonical/ImageSets/OWDETR/owdetr_test.txt",
+  "mode": "plain",
+  "reference_images": 0,
+  "candidate_images": 4952,
+  "packed_annotations": 4952,
+  "images_come_from": "COCO train2017/val2017, downloaded in Colab",
+  "missing": [],
+  "missing_count": 0,
+  "archive": "/Users/gubiczam/daowod_stage/daowod_test_split.tar.gz",
+  "archive_bytes": 721996,
+  "first_reference": null,
+  "last_reference": null,
+  "first_candidate": "000000000139",
+  "last_candidate": "000000581781"
+}
