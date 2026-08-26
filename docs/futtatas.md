@@ -126,6 +126,12 @@ Colab elvágja, és kiírja, melyik taszkokat nem futtatta le.
 paraméterekkel: ami már megvan, azt kihagyja, és ott folytatja, ahol abbahagyta. A
 checkpointok és a metrikák a Drive-on gyűlnek, `MyDrive/OWL/work/<arm>/` alatt.
 
+> **Ha közben megváltoztattál egy paramétert, a futás megáll és megmondja, melyiket.**
+> Ez szándékos: egy másik konfigurációval készült taszkot újrahasznosítani annyi, mintha
+> két különböző kísérlet sorait egy táblázatba írnánk. A hibaüzenet kiírja a törléshez
+> szükséges pontos parancsot. **Külön munkakönyvtár kell a próbafutásnak és a valódi
+> futásnak** — a `SMOKE_TEST` és a `FAST_CHAIN` más konfiguráció.
+
 ### Ehhez legalább két arm kell
 
 Egy arm önmagában nem eredmény, mert nincs mihez hasonlítani. Futtasd le ugyanezt

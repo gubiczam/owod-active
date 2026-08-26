@@ -77,6 +77,19 @@ class CycleConfig:
     def describe(self) -> dict[str, object]:
         return asdict(self)
 
+    #: Fields whose value changes what the numbers mean. Everything except
+    #: bookkeeping: a run that differs in any of these is a different experiment
+    #: and may not reuse another one's cached tasks.
+    RESULT_AFFECTING = (
+        "n_tasks", "budget_per_task", "rounds_per_task", "candidate_images_per_task",
+        "proposals_per_image", "arm", "labelling_policy", "replay_arm",
+        "replay_reallocate", "reuse_deferred_labels", "epochs", "learning_rate",
+        "batch_size", "n_clusters", "seed",
+    )
+
+    def fingerprint(self) -> dict[str, object]:
+        return {name: getattr(self, name) for name in self.RESULT_AFFECTING}
+
 
 @dataclass
 class TaskResult:
@@ -215,7 +228,36 @@ def run_chain(
     groups = protocol.load_groups()
     workspace = Path(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
-    (workspace / "config.json").write_text(json.dumps(config.describe(), indent=2), encoding="utf-8")
+
+    # Resuming is keyed on files existing, which is fast and which silently makes
+    # two different experiments into one. A smoke run and a real run share this
+    # workspace, so the real run reused the smoke run's checkpoints and metrics
+    # for the tasks the smoke run had reached — and the table came out with two
+    # tasks measured on a sixteen-image evaluation split and the rest on a
+    # fourteen-hundred-image one, which reads as a twenty-nine-point swing in
+    # forgetting that never happened. So the stored configuration is compared,
+    # and a run that differs is refused rather than blended.
+    stamp = workspace / "config.json"
+    if stamp.exists():
+        stored = json.loads(stamp.read_text(encoding="utf-8"))
+        current = config.fingerprint()
+        differing = {
+            name: (stored.get(name), value)
+            for name, value in current.items()
+            if name in stored and stored[name] != value
+        }
+        if differing:
+            lines = "\n".join(
+                f"    {name}: stored {was!r}, now {now!r}"
+                for name, (was, now) in sorted(differing.items())
+            )
+            raise RuntimeError(
+                f"{workspace} holds results from a different configuration:\n{lines}\n"
+                "Resuming would mix them into one table. Either delete that "
+                f"directory —\n    rm -rf '{workspace}'\n"
+                "— or point `workspace` somewhere else."
+            )
+    stamp.write_text(json.dumps(config.fingerprint(), indent=2), encoding="utf-8")
 
     arm = selection.ARMS[config.arm]
     replay_spec = dict(replay.ARMS[config.replay_arm])
@@ -239,6 +281,40 @@ def run_chain(
     for task in chain[1:]:
         task_dir = workspace / f"{task.name}_{config.arm}"
         task_dir.mkdir(parents=True, exist_ok=True)
+        state_path = task_dir / "state.json"
+
+        # ---- 0. already finished? ----------------------------------------
+        #
+        # A completed task is one that has metrics, not one that still has its
+        # checkpoint: checkpoints are pruned to save Drive, so keying the skip on
+        # them makes a resumed run retrain work it had already paid for. The
+        # accumulated state — what has been opened, banked, trained on, and held
+        # in memory — is restored from disk, because a chain resumed without it
+        # would select images it had already bought and rebuild a memory it had
+        # already allocated.
+        if state_path.exists() and (task_dir / "metrics.json").exists():
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            used_images.update(saved["used_images"])
+            ledger.update(saved["ledger"])
+            trained_on.update(saved["trained_on"])
+            labelled_history[task.name] = saved["labelled"]
+            memory = replay.Memory(
+                image_ids=tuple(saved["memory"]), per_class=saved["memory_per_class"],
+                alpha=saved["memory_alpha"], total=saved["memory_total"],
+            )
+            previous_baseline = saved["known_map50"]
+            restored = Path(saved["checkpoint"])
+            if restored.exists():
+                checkpoint = restored
+            results.append(TaskResult(
+                task=task.name, new_class=task.new_class,
+                selection_row=saved["selection_row"],
+                annotation_row=saved["annotation_row"],
+                replay_row=saved["replay_row"],
+                evaluation_row=saved["evaluation_row"],
+            ))
+            print(f"  [{task.name}] already done; restored from {state_path.name}")
+            continue
 
         if time_budget_minutes is not None and elapsed >= time_budget_minutes:
             remaining = [t.name for t in chain[chain.index(task):]]
@@ -403,8 +479,7 @@ def run_chain(
         row["exchange_rate"] = metrics.exchange_rate(row)
         previous_baseline = evaluation.known_map50
 
-        results.append(
-            TaskResult(
+        result = TaskResult(
                 task=task.name, new_class=task.new_class,
                 selection_row={
                     "asked": len(picked),
@@ -415,11 +490,30 @@ def run_chain(
                     "target_objects_in_images": found,
                     "images_with_target": with_target,
                 },
-                annotation_row={"policy": config.labelling_policy, "supervision": supervision},
+                annotation_row={"policy": config.labelling_policy,
+                                "supervision": supervision},
                 replay_row=memory.summary(),
                 evaluation_row=row,
-            )
         )
+        results.append(result)
+
+        state_path.write_text(json.dumps({
+            "used_images": sorted(used_images),
+            "ledger": sorted(ledger),
+            "trained_on": sorted(trained_on),
+            "labelled": labelled_history[task.name],
+            "memory": list(memory.image_ids),
+            "memory_per_class": dict(memory.per_class),
+            "memory_alpha": memory.alpha,
+            "memory_total": memory.total,
+            "known_map50": evaluation.known_map50,
+            "checkpoint": str(checkpoint),
+            "selection_row": result.selection_row,
+            "annotation_row": result.annotation_row,
+            "replay_row": result.replay_row,
+            "evaluation_row": result.evaluation_row,
+        }, indent=2), encoding="utf-8")
+
         elapsed = bridge.cost_report()["total"]
         _write_rows(results, workspace / f"results_{config.arm}.csv")
         written.append(Path(checkpoint))

@@ -473,3 +473,127 @@ def test_the_chain_writes_its_rows_as_it_goes(tmp_path, index, config):
     written = tmp_path / f"results_{config.arm}.csv"
     assert written.exists()
     assert len(written.read_text(encoding="utf-8").strip().splitlines()) == 4  # header + 3
+
+
+def test_a_workspace_from_a_different_configuration_is_refused(tmp_path, index, config):
+    """The bug that produced an unusable results table.
+
+    Resuming is keyed on output files existing. A smoke run and a real run shared
+    a workspace, so the real run silently reused the smoke run's checkpoints and
+    metrics for the tasks it had reached. Two rows were then measured on a
+    sixteen-image evaluation split and three on a fourteen-hundred-image one, and
+    the difference read as a twenty-nine-point swing in forgetting.
+    """
+
+    from dataclasses import replace
+
+    smoke = replace(config, budget_per_task=10, epochs=1)
+    runner.run_chain(
+        FakeBridge(), smoke, workspace=tmp_path, candidate_index=index,
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+    )
+    with pytest.raises(RuntimeError, match="different configuration") as caught:
+        runner.run_chain(
+            FakeBridge(), config, workspace=tmp_path, candidate_index=index,
+            start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+            chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+        )
+    message = str(caught.value)
+    assert "budget_per_task" in message and "epochs" in message
+    assert "rm -rf" in message, "the message must say how to proceed"
+
+
+def test_the_same_configuration_still_resumes(tmp_path, index, config):
+    first = FakeBridge()
+    runner.run_chain(
+        first, config, workspace=tmp_path, candidate_index=index,
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+    )
+    second = FakeBridge()
+    runner.run_chain(
+        second, config, workspace=tmp_path, candidate_index=index,
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+    )
+    assert not second.of("train"), "a completed chain must not retrain"
+
+
+def test_bookkeeping_only_changes_do_not_block_a_resume(tmp_path, index, config):
+    """keep_checkpoints does not change any number, so it must not refuse."""
+
+    from dataclasses import replace
+
+    runner.run_chain(
+        FakeBridge(), config, workspace=tmp_path, candidate_index=index,
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+    )
+    runner.run_chain(
+        FakeBridge(), replace(config, keep_checkpoints=0), workspace=tmp_path,
+        candidate_index=index, start_checkpoint=tmp_path / "t1.pth",
+        test_set="owl_shared_test", chain=protocol.build_chain(4),
+        prepare_images=lambda ids: ids,
+    )
+
+
+def test_a_resumed_chain_restores_what_it_had_already_bought(tmp_path, index, config):
+    """Resuming without the accumulated state is not resuming, it is restarting.
+
+    ``used_images`` stops a later task re-buying images the oracle already
+    answered for, and the ledger and the memory are what the replay allocation is
+    built from. A chain that forgets them selects duplicates and reallocates a
+    memory it had already paid for, and nothing about the output says so.
+    """
+
+    from dataclasses import replace
+
+    stop_early = replace(config, n_tasks=4)
+    first = FakeBridge()
+    partial = runner.run_chain(
+        first, stop_early, workspace=tmp_path, candidate_index=index,
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+        time_budget_minutes=4,      # two tasks' worth of fake calls
+    )
+    assert 0 < len(partial) < 3, f"expected a partial chain, got {len(partial)}"
+    bought = {image for row in partial for image in first.of("train")[0]["images"]}
+
+    second = FakeBridge()
+    complete = runner.run_chain(
+        second, stop_early, workspace=tmp_path, candidate_index=index,
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+    )
+    assert len(complete) == 3, "the resumed run must finish the chain"
+
+    # the restored rows are the originals, not recomputed ones
+    for before, after in zip(partial, complete):
+        assert before.flat() == after.flat(), f"{after.task} changed on resume"
+
+    # and no image the first run trained on is bought again by the second
+    fresh = {image for call in second.of("train") for image in call["images"]}
+    assert not (fresh & bought), "a resumed task re-bought images already paid for"
+
+
+def test_resuming_does_not_retrain_a_task_whose_checkpoint_was_pruned(tmp_path, index, config):
+    """Checkpoints are pruned to save Drive; completion is keyed on metrics."""
+
+    from dataclasses import replace
+
+    tight = replace(config, keep_checkpoints=1)
+    runner.run_chain(
+        FakeBridge(), tight, workspace=tmp_path, candidate_index=index,
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+    )
+    assert len(list(tmp_path.rglob("checkpoint.pth"))) == 1
+
+    again = FakeBridge()
+    runner.run_chain(
+        again, tight, workspace=tmp_path, candidate_index=index,
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+    )
+    assert not again.calls, f"a finished chain did work again: {again.verbs()}"
