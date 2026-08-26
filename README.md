@@ -13,6 +13,8 @@ taszkonként egy új osztállyal.
 
 ## Indulás
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/gubiczam/owod-active/blob/main/notebooks/owod_active.ipynb)
+
 **[`notebooks/owod_active.ipynb`](notebooks/owod_active.ipynb) — Futtasd le mindet.**
 GPU nélkül, adathalmaz nélkül, néhány perc alatt lefut, és végigmegy a kutatás minden
 kérdésén. Magyar magyarázat, angol kód.
