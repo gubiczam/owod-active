@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 from owl import protocol, runner
+from owl.evaluation_subset import check_split_name
 
 
 class FakeBridge:
@@ -67,6 +68,7 @@ class FakeBridge:
         # PROB reads a validation split during training and its default names a
         # file this protocol never writes, so a caller that omits this is broken.
         assert test_set, "train was not told which test set to build the val loader from"
+        check_split_name(test_set, purpose="test")
         assert eval_every > epochs, (
             "PROB would evaluate inside the training loop; evaluation is the "
             "expensive half of this protocol and is a separate call here")
@@ -81,6 +83,7 @@ class FakeBridge:
         return output_checkpoint
 
     def evaluate(self, *, checkpoint, test_set, output, n_prev, n_current, batch_size=4):
+        check_split_name(test_set, purpose="test")
         self.calls.append({
             "verb": "evaluate", "n_prev": n_prev, "n_current": n_current,
             "test_set": test_set,
@@ -161,7 +164,7 @@ def test_the_chain_asks_for_its_images_before_the_detector_runs(tmp_path, index,
     fake = FakeBridge()
     runner.run_chain(
         fake, config, workspace=tmp_path, candidate_index=index,
-        start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=prepare,
     )
 
@@ -179,7 +182,7 @@ def test_an_unavailable_image_is_dropped_rather_than_killing_the_run(tmp_path, i
     fake = FakeBridge()
     runner.run_chain(
         fake, config, workspace=tmp_path, candidate_index=index,
-        start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=prepare,
     )
     for call in fake.of("predict"):
@@ -191,7 +194,7 @@ def test_the_chain_refuses_to_predict_on_nothing(tmp_path, index, config):
     with pytest.raises(RuntimeError, match="no usable candidate images"):
         runner.run_chain(
             fake, config, workspace=tmp_path, candidate_index=index,
-            start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+            start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
             chain=protocol.build_chain(4), prepare_images=lambda ids: [],
         )
 
@@ -204,7 +207,7 @@ def test_images_with_no_currently_known_object_are_not_trained_on(
     fake = FakeBridge()
     results = runner.run_chain(
         fake, config, workspace=tmp_path, candidate_index=index_with_barren_images,
-        start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     known_by_task = {t.name: set(t.known_classes) for t in protocol.build_chain(4)[1:]}
@@ -223,7 +226,7 @@ def test_the_wasted_half_of_the_budget_is_reported_not_hidden(
     fake = FakeBridge()
     results = runner.run_chain(
         fake, config, workspace=tmp_path, candidate_index=index_with_barren_images,
-        start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     for row in results:
@@ -252,7 +255,7 @@ def test_a_label_paid_for_early_is_used_when_its_class_becomes_declarable(
     banked = FakeBridge()
     results = runner.run_chain(
         banked, replace(config, reuse_deferred_labels=True), workspace=tmp_path / "on",
-        candidate_index=pool, start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        candidate_index=pool, start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=chain, prepare_images=lambda ids: ids,
     )
     reused = [row.selection_row["images_from_earlier_tasks"] for row in results]
@@ -263,7 +266,7 @@ def test_a_label_paid_for_early_is_used_when_its_class_becomes_declarable(
     discarded = FakeBridge()
     off = runner.run_chain(
         discarded, replace(config, reuse_deferred_labels=False), workspace=tmp_path / "off",
-        candidate_index=pool, start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        candidate_index=pool, start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=chain, prepare_images=lambda ids: ids,
     )
     assert all(row.selection_row["images_from_earlier_tasks"] == 0 for row in off)
@@ -276,7 +279,7 @@ def test_no_image_is_trained_on_twice_through_the_ledger(tmp_path, index, config
     fake = FakeBridge()
     runner.run_chain(
         fake, config, workspace=tmp_path, candidate_index=index,
-        start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     seen: set[str] = set()
@@ -297,7 +300,7 @@ def test_a_task_with_too_little_trainable_content_says_so(tmp_path, config):
         runner.run_chain(
             fake, replace(config, batch_size=2), workspace=tmp_path,
             candidate_index=barren, start_checkpoint=tmp_path / "t1.pth",
-            test_set="eval", chain=protocol.build_chain(4),
+            test_set="owl_shared_test", chain=protocol.build_chain(4),
             prepare_images=lambda ids: ids,
         )
 
@@ -309,7 +312,7 @@ def test_the_class_counts_follow_probs_convention_end_to_end(tmp_path, index, co
     chain = protocol.build_chain(4)
     runner.run_chain(
         fake, config, workspace=tmp_path, candidate_index=index,
-        start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=chain, prepare_images=lambda ids: ids,
     )
     for task, call in zip(chain[1:], fake.of("predict")):
@@ -326,7 +329,7 @@ def test_the_calls_happen_in_the_only_order_that_makes_sense(tmp_path, index, co
     fake = FakeBridge()
     runner.run_chain(
         fake, config, workspace=tmp_path, candidate_index=index,
-        start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     assert fake.verbs() == ["predict", "train", "evaluate"] * 3
@@ -338,7 +341,7 @@ def test_each_task_trains_from_the_previous_tasks_checkpoint(tmp_path, index, co
     fake = FakeBridge()
     runner.run_chain(
         fake, config, workspace=tmp_path, candidate_index=index,
-        start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     used = [call["checkpoint"] for call in fake.of("predict")]
@@ -350,7 +353,7 @@ def test_replay_grows_and_never_holds_a_future_class(tmp_path, index, config):
     fake = FakeBridge()
     results = runner.run_chain(
         fake, config, workspace=tmp_path, candidate_index=index,
-        start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     sizes = [row.replay_row["images"] for row in results]
@@ -373,7 +376,7 @@ def test_the_labelling_policy_reaches_probs_supervision_flag(tmp_path, index, co
         runner.run_chain(
             fake, replace(config, labelling_policy=policy),
             workspace=tmp_path / policy, candidate_index=index,
-            start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+            start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
             chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
         )
         assert {call["supervision"] for call in fake.of("train")} == {expected}, policy
@@ -386,7 +389,7 @@ def test_a_resumed_run_refetches_nothing_and_retrains_nothing(tmp_path, index, c
         "workspace": tmp_path,
         "candidate_index": index,
         "start_checkpoint": tmp_path / "t1.pth",
-        "test_set": "eval",
+        "test_set": "owl_shared_test",
         "chain": protocol.build_chain(4),
     }
     first = FakeBridge()
@@ -408,7 +411,7 @@ def test_old_checkpoints_are_pruned_so_drive_does_not_fill(tmp_path, index, conf
     fake = FakeBridge()
     runner.run_chain(
         fake, replace(config, keep_checkpoints=2), workspace=tmp_path,
-        candidate_index=index, start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        candidate_index=index, start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     surviving = sorted(p.name for p in tmp_path.rglob("checkpoint.pth"))
@@ -423,7 +426,7 @@ def test_keeping_every_checkpoint_is_still_possible(tmp_path, index, config):
     fake = FakeBridge()
     runner.run_chain(
         fake, replace(config, keep_checkpoints=0), workspace=tmp_path,
-        candidate_index=index, start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        candidate_index=index, start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     assert len(list(tmp_path.rglob("checkpoint.pth"))) == 3
@@ -433,7 +436,7 @@ def test_the_time_budget_stops_the_chain_and_says_what_it_skipped(tmp_path, inde
     fake = FakeBridge()
     results = runner.run_chain(
         fake, config, workspace=tmp_path, candidate_index=index,
-        start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
         time_budget_minutes=1,      # one fake call's worth
     )
@@ -447,7 +450,7 @@ def test_the_chain_writes_its_rows_as_it_goes(tmp_path, index, config):
     fake = FakeBridge()
     runner.run_chain(
         fake, config, workspace=tmp_path, candidate_index=index,
-        start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     written = tmp_path / f"results_{config.arm}.csv"

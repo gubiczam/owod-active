@@ -203,6 +203,12 @@ class Bridge:
     ) -> Path:
         """PROB's official evaluator. Cached on ``output``."""
 
+        from owl.evaluation_subset import check_split_name
+
+        # PROB routes a split by substring of its name, and a wrong route is
+        # silent: see owl.evaluation_subset.check_split_name.
+        check_split_name(test_set, purpose="test")
+
         output = Path(output)
         if output.exists():
             self._note("evaluate", output, cached=True)

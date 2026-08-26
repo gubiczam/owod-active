@@ -168,6 +168,19 @@ A PROB saját `OWEvaluator`-a. Taszkonként kiírt számok:
 A csereárfolyam a döntő szám. A teljes t2-felügyelet 0,20-at fizet. Egy futás, ami 74-et
 fizet, nem cserél, hanem veszít.
 
+**A split nevének jelentése van.** A PROB **részszöveg** szerint dönti el, milyen
+annotáció-szűrést alkalmaz: a `make_coco_transforms` a `train` / `ft` / `val` / `test`
+markereket vizsgálja ebben a sorrendben, majd az `OWDetection.__getitem__` már csak a
+`train` / `test` / `ft`-t. Egy `val`-ra illeszkedő név tehát olyan ágra kerül, ahol
+**egyetlen szűrő sem fut** — és a `label_known_class_and_unknown` az, ami a még nem ismert
+objektumokat átcímkézi az unknown indexre. Nélküle **nincs unknown ground truth, tehát a
+U-Recall minden armon, minden taszkon nulla**, a jövőbeli osztályok objektumait pedig
+ismertként pontozza a kiértékelő.
+
+A csapda az, hogy `eval` tartalmazza a `val`-t. Az `owl.evaluation_subset.check_split_name`
+ezért minden kiértékelési splitnevet ellenőriz, és csak azt engedi át, amiben a `test` az
+egyetlen marker. Ez nem óvatosság: hibaüzenet helyett hihető, hamis számokat kaptunk volna.
+
 **A közös, csökkentett teszthalmaz.** A teljes 4 952 képes teszt checkpointonként ~32 perc,
 tíz taszkon armonként öt óra. Az `evaluation_subset` megtartja minden deklarált osztályból a
 képeket (osztályonként legfeljebb `max_per_class`-t, ami kiegyenlíti a költséget a lánc

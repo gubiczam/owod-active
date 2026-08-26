@@ -43,6 +43,9 @@ sys.path.insert(0, str(ROOT))
 # ---------------------------------------------------------------- the fakes ---
 
 
+from owl.evaluation_subset import check_split_name
+
+
 class FakeBridge:
     """Stands in for PROB. Writes output shaped the way the real bridge does."""
 
@@ -126,6 +129,7 @@ class FakeBridge:
               n_prev, n_current, test_set, replay_ids=(), supervision_mode="ft",
               eval_every=10**6, **_):
         assert test_set, "train was not told which test set to build the val loader from"
+        check_split_name(test_set, purpose="test")
         split = self.data_root / "ImageSets" / "OWDETR" / f"{test_set}.txt"
         assert split.exists(), (
             f"PROB train would fail: it builds a validation dataset from {split}, "
@@ -156,6 +160,7 @@ class FakeBridge:
         return output_checkpoint
 
     def evaluate(self, *, checkpoint, test_set, output, n_prev, n_current, **_):
+        check_split_name(test_set, purpose="test")
         assert Path(checkpoint).exists()
         split = self.data_root / "ImageSets" / "OWDETR" / f"{test_set}.txt"
         assert split.exists(), f"PROB evaluate would fail: no image set at {split}"

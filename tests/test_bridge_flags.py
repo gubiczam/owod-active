@@ -101,7 +101,7 @@ def test_train_disables_evaluation_during_training(instrument, tmp_path):
     instrument.train(
         ["a"], previous_checkpoint=tmp_path / "t1.pth",
         output_checkpoint=tmp_path / "o" / "c.pth", output_dir=tmp_path / "o",
-        n_prev=19, n_current=1, test_set="eval", epochs=5,
+        n_prev=19, n_current=1, test_set="owl_shared_test", epochs=5,
     )
     command = command_for(instrument, "train")
     every = int(command[command.index("--eval-every") + 1])
@@ -121,7 +121,7 @@ def test_predict_and_evaluate_carry_the_class_counts(instrument, tmp_path):
     (tmp_path / "t1.pth").write_bytes(b"x")
     instrument.predict(["a"], checkpoint=tmp_path / "t1.pth",
                        output=tmp_path / "p.npz", n_prev=0, n_current=19)
-    instrument.evaluate(checkpoint=tmp_path / "t1.pth", test_set="eval",
+    instrument.evaluate(checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
                         output=tmp_path / "m.json", n_prev=19, n_current=1)
     for verb, prev, current in (("predict", "0", "19"), ("evaluate", "19", "1")):
         command = command_for(instrument, verb)
@@ -132,7 +132,7 @@ def test_predict_and_evaluate_carry_the_class_counts(instrument, tmp_path):
 def test_evaluate_asks_for_no_detection_dump(instrument, tmp_path):
     """Writing per-image detections doubles the evaluation's cost and we never read them."""
     (tmp_path / "t1.pth").write_bytes(b"x")
-    instrument.evaluate(checkpoint=tmp_path / "t1.pth", test_set="eval",
+    instrument.evaluate(checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
                         output=tmp_path / "m.json", n_prev=19, n_current=1)
     assert "--no-detections" in command_for(instrument, "evaluate")
 
@@ -145,8 +145,8 @@ def test_the_seed_reaches_prob_on_every_verb(instrument, tmp_path):
                    n_prev=0, n_current=19)
     seeded.train(["a"], previous_checkpoint=tmp_path / "t1.pth",
                  output_checkpoint=tmp_path / "o" / "c.pth", output_dir=tmp_path / "o",
-                 n_prev=19, n_current=1, test_set="eval")
-    seeded.evaluate(checkpoint=tmp_path / "t1.pth", test_set="eval",
+                 n_prev=19, n_current=1, test_set="owl_shared_test")
+    seeded.evaluate(checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
                     output=tmp_path / "m.json", n_prev=19, n_current=1)
     for command in seeded.commands:
         assert command[command.index("--seed") + 1] == "7"
@@ -158,8 +158,57 @@ def test_every_command_names_the_dataset_and_its_root(instrument, tmp_path):
                        output=tmp_path / "p.npz", n_prev=0, n_current=19)
     instrument.train(["a"], previous_checkpoint=tmp_path / "t1.pth",
                      output_checkpoint=tmp_path / "o" / "c.pth", output_dir=tmp_path / "o",
-                     n_prev=19, n_current=1, test_set="eval")
-    instrument.evaluate(checkpoint=tmp_path / "t1.pth", test_set="eval",
+                     n_prev=19, n_current=1, test_set="owl_shared_test")
+    instrument.evaluate(checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
                         output=tmp_path / "m.json", n_prev=19, n_current=1)
     for command in instrument.commands:
         assert "--dataset" in command and "--data-root" in command
+
+
+# --------------------------------------------------- how PROB routes a split ---
+
+
+def test_a_split_named_eval_gets_no_filtering_and_that_is_the_trap():
+    """The most expensive kind of bug: one that returns numbers instead of an error.
+
+    PROB picks the annotation filter by substring of the split's name.
+    ``make_coco_transforms`` tests train / ft / val / test in that order, and
+    ``OWDetection.__getitem__`` then tests train / test / ft only. So a name
+    matching ``val`` — and ``eval`` matches ``val`` — reaches a branch where
+    **no filter runs at all**.
+
+    What that costs: ``label_known_class_and_unknown`` is what relabels every
+    not-yet-known object to the unknown class index. Without it there is no
+    unknown ground truth, so U-Recall reads zero for every arm at every task,
+    and future-task objects are scored as if their class were already known.
+    """
+
+    from owl.evaluation_subset import MARKER_BEHAVIOUR, SplitNameError, check_split_name
+
+    assert check_split_name("owl_shared_test") == "owl_shared_test"
+    for wrong in ("owl_shared_eval", "owl_eval", "live_cycle_eval", "shared_val"):
+        with pytest.raises(SplitNameError, match="routes a split by substring"):
+            check_split_name(wrong)
+    # and a name carrying two markers is rejected rather than silently resolved
+    with pytest.raises(SplitNameError):
+        check_split_name("train_test_split")
+    assert "NOTHING" in MARKER_BEHAVIOUR["val"]
+
+
+def test_evaluate_refuses_a_misrouting_split_name(instrument, tmp_path):
+    from owl.evaluation_subset import SplitNameError
+
+    (tmp_path / "t1.pth").write_bytes(b"x")
+    with pytest.raises(SplitNameError):
+        instrument.evaluate(checkpoint=tmp_path / "t1.pth", test_set="owl_shared_eval",
+                            output=tmp_path / "m.json", n_prev=19, n_current=1)
+
+
+def test_writing_an_image_set_checks_the_name_it_will_be_known_by(tmp_path):
+    from owl import evaluation_subset as module
+
+    subset = module.EvaluationSubset(("a", "b"), ("a",), ("b",), {"chair": 1})
+    good = module.write_image_set(tmp_path / "owl_shared_test.txt", subset)
+    assert good.read_text().split() == ["a", "b"]
+    with pytest.raises(module.SplitNameError):
+        module.write_image_set(tmp_path / "owl_shared_eval.txt", subset)

@@ -165,10 +165,70 @@ def from_directory(
     )
 
 
+#: The markers PROB routes a split by, in the order ``make_coco_transforms``
+#: tests them. The first match wins, so a name carrying two is not merely
+#: ambiguous — it silently picks one behaviour.
+SPLIT_MARKERS: tuple[str, ...] = ("train", "ft", "val", "test")
+
+#: What ``OWDetection.__getitem__`` does for each marker. ``val`` is the trap:
+#: ``make_coco_transforms`` accepts it, and then the getitem branches test
+#: ``train`` / ``test`` / ``ft`` only, so a ``val`` split gets **no filtering at
+#: all**.
+MARKER_BEHAVIOUR = {
+    "train": "remove_prev_class_and_unk_instances — keeps only the current task's classes",
+    "ft": "remove_unknown_instances — keeps every class introduced so far",
+    "test": "label_known_class_and_unknown — relabels every unseen class to the unknown index",
+    "val": "NOTHING — no filtering is applied, so no object is ever labelled unknown",
+}
+
+
+class SplitNameError(ValueError):
+    """Raised when a split name would make PROB do the wrong thing silently."""
+
+
+def check_split_name(name: str, *, purpose: str = "test") -> str:
+    """Fail loudly on a split name PROB would route somewhere unintended.
+
+    PROB picks the annotation filter by **substring** of the split's name. That
+    makes an innocuous rename a silent change of meaning, and one case is a trap
+    worth naming: ``eval`` contains ``val``, so a split called
+    ``owl_shared_eval`` is routed to the ``val`` branch — and the branch that
+    applies the filtering tests only ``train`` / ``test`` / ``ft``, so **no
+    filtering runs**.
+
+    The consequence is not an error. It is that
+    :func:`label_known_class_and_unknown` never runs, so no object is ever
+    relabelled to the unknown class, so **U-Recall reads zero everywhere** and
+    future-task objects are scored as if their class were already known. A full
+    table of plausible, wrong numbers.
+
+    An evaluation split must therefore carry ``test`` and nothing else.
+    """
+
+    if purpose not in MARKER_BEHAVIOUR:
+        raise SplitNameError(f"Unknown purpose {purpose!r}; expected one of {SPLIT_MARKERS}.")
+    present = [marker for marker in SPLIT_MARKERS if marker in name]
+    if present != [purpose]:
+        raise SplitNameError(
+            f"The split name {name!r} carries the markers {present or ['none']}, not "
+            f"exactly ['{purpose}']. PROB routes a split by substring, so this one "
+            f"would get: {MARKER_BEHAVIOUR.get(present[0], 'no filtering at all') if present else 'no filtering at all'}. "
+            f"Rename it so that {purpose!r} is the only marker in it — "
+            f"'owl_shared_{purpose}' works, 'owl_shared_eval' does not, because "
+            "'eval' contains 'val'."
+        )
+    return name
+
+
 def write_image_set(path: str | Path, subset: EvaluationSubset) -> Path:
-    """Write one PROB-compatible ImageSet file."""
+    """Write one PROB-compatible ImageSet file.
+
+    The file's stem is the split name PROB will be given, so it is checked here:
+    see :func:`check_split_name`.
+    """
 
     target = Path(path)
+    check_split_name(target.stem, purpose="test")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("\n".join(subset.image_ids) + "\n", encoding="utf-8")
     return target
