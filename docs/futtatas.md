@@ -67,7 +67,9 @@ SMOKE_TEST = True     # ez a lényeg: két rövid taszk, apró teszthalmaz
 **Runtime → Run all.**
 
 Az „Előellenőrzés" cella kiírja, mi van meg és mi nincs. Ha valami `MISSING`, ott áll
-mellette, honnan kell odatenni — és a futás megáll, nem megy tovább félkészen.
+mellette, honnan kell odatenni, és a cella `CANNOT START`-tal zárul. **Az utána következő
+cellák ilyenkor egy olvasható hibaüzenettel állnak meg**, nem `NameError`-ral — de a
+diagnózis mindig az előellenőrzés kimenetében van, nem az alatta lévő hibában.
 
 Utána lefordítja a Deformable-DETR CUDA-kernelét (néhány perc). Ha ez elhasal, nem
 végzetes: a PROB-nak van tiszta PyTorch-tartaléka, csak lassabb — ki is írja.
@@ -139,4 +141,5 @@ húsz-osztályos felállás **2931**-et fizetett — ezért van most taszkonkén
 | `BUILD FAILED` a kernelnél | nem végzetes, csak lassabb; menj tovább |
 | `PROB bridge 'train' is missing ...` | a PROB nem a `feat/daowod-bridge-v2` ágról jött; a `bridge.ensure_checkout` ezt kezeli, töröld a `/content/PROB` mappát és futtasd újra |
 | a session elvágódott | ugyanezekkel a paraméterekkel Run all — folytatja |
+| `NameError` a környezet-cellában | az előellenőrző cella nem futott le, vagy nem ment át. Görgess vissza a kimenetéhez: ott áll, mi hiányzik |
 | minden `new_mAP50` nulla | ez volt a régi baj. Ellenőrizd, hogy `LEARNING_RATE = 2e-4` és `EPOCHS = 5` — 2e-5-tel nem tanul |
