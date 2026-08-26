@@ -90,7 +90,21 @@ végzetes: a PROB-nak van tiszta PyTorch-tartaléka, csak lassabb — ki is írj
 
 ---
 
-## 4. lépés — A valódi lánc
+## 4. lépés — A valódi lánc: nyisd meg a linket és Run all
+
+A repóban commitolt notebook **készen áll**: `RUN_GPU = True`, `SMOKE_TEST = False`,
+`FAST_CHAIN = True`, és mind a három armot lefuttatja egymás után —
+
+```python
+ARMS = ("prior_consult_batch", "random", "objectness")
+```
+
+— külön munkakönyvtárba, **egyetlen közös időkeretből**. A `TIME_BUDGET_MINUTES = 420`
+miatt egy Run all annyit végez el, amennyit a session engedi, tisztán megáll, kiírja mi
+maradt, és a **következő Run all ott folytatja**. Három arm × 5,3 óra ≈ 16 óra, tehát
+számolj **három Run all-lal**. Semmit nem kell átírni közben.
+
+
 
 > A csoportonkénti U-Recall egy **második forward-passt** igényel a teszthalmazon
 > (a dobozszintű detekciós artefaktért), tehát a kiértékelés kétszerese. Ez a terv fő
@@ -138,24 +152,18 @@ checkpointok és a metrikák a Drive-on gyűlnek, `MyDrive/OWL/work/<arm>/` alat
 > szükséges pontos parancsot. **Külön munkakönyvtár kell a próbafutásnak és a valódi
 > futásnak** — a `SMOKE_TEST` és a `FAST_CHAIN` más konfiguráció.
 
-### Ehhez legalább két arm kell
+### Miért három arm
 
-Egy arm önmagában nem eredmény, mert nincs mihez hasonlítani. Futtasd le ugyanezt
-**csak az `ARM` átírásával**:
+| arm | mi ez |
+|---|---|
+| `prior_consult_batch` | a módszer |
+| `random` | a padló — enélkül egyetlen szám sem értelmezhető |
+| `objectness` | az ingyenes kontroll: `objectness × √terület`, semmi tanulás. **Ezt kell vernünk**, nem a randomot |
 
-| sorrend | `ARM` | mi ez |
-|---|---|---|
-| 1. | `"prior_consult_batch"` | a mi módszerünk |
-| 2. | `"random"` | a padló — enélkül semmi nem értelmezhető |
-| 3. | `"objectness"` | az ingyenes kontroll — ezt kell vernünk |
-
-Három arm ≈ 12 óra, két-három Colab-esten elosztva. **Ha kevés az idő**, vedd
-`N_TASKS = 6`-ra: az még mindig lefedi a head-osztályt és mind a három tail-osztályt
-(traffic light → fire hydrant → stop sign → parking meter → bench), és armonként ~2
-órára jön ki.
-
-Mindegyik arm a saját mappájába ír, tehát nem írják felül egymást, és mindegyik ugyanazt
-a közös teszthalmazt használja, tehát összehasonlíthatók.
+Mindegyik a saját mappájába ír és ugyanazt a közös teszthalmazt használja, tehát
+összehasonlíthatók. A notebook a végén kiírja a döntő táblázatot: **tail U-Recall azonos
+orákulum-költségen**, csak addig a taszkig, ameddig *minden* arm eljutott — egy öt-taszkos
+armot egy két-taszkos ellen kimutatni nem eredmény.
 
 ---
 

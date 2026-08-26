@@ -289,7 +289,10 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
                     "\nN_TASKS, BUDGET_PER_TASK, ROUNDS_PER_TASK = 4, 40, 2"
                     "\nCANDIDATE_IMAGES, PROPOSALS_PER_IMAGE = 60, 4"
                     "\nEVAL_MAX_PER_CLASS, EVAL_REMAINDER_RATIO = 3, 0"
-                    "\nN_CLUSTERS, TIME_BUDGET_MINUTES = 64, 10_000\n"
+                    "\nN_CLUSTERS, TIME_BUDGET_MINUTES = 64, 10_000"
+                    # two arms, not three: enough to exercise the loop and the
+                    # cross-arm comparison, cheap enough to run on every commit
+                    "\nARMS = ('prior_consult_batch', 'random')\n"
                 )
 
             for before, after in substitutions(workspace):
@@ -323,15 +326,19 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
     # ---- what the run must have achieved ---------------------------------
     if run_gpu:
         fake = namespace["prob_bridge"]
+        by_arm = namespace["by_arm"]
+        assert set(by_arm) == {"prior_consult_batch", "random"}, sorted(by_arm)
         verbs = [call["verb"] for call in fake.calls]
-        assert verbs == ["predict", "train", "evaluate"] * 3, verbs
-        results = namespace["gpu_results"]
-        assert len(results) == 3, f"expected three tasks, got {len(results)}"
-        for row in results:
-            flat = row.flat()
-            for column in ("known_mAP50", "prev_mAP50", "new_mAP50", "U_Recall50"):
-                assert flat.get(column) is not None, f"{row.task} has no {column}"
-        print("\nGPU branch: 3 tasks, 9 PROB calls, every metric present.")
+        assert verbs == ["predict", "train", "evaluate"] * 6, verbs
+        for arm, results in by_arm.items():
+            assert len(results) == 3, f"{arm}: expected three tasks, got {len(results)}"
+            for row in results:
+                flat = row.flat()
+                for column in ("known_mAP50", "prev_mAP50", "new_mAP50", "U_Recall50",
+                               "U_Recall_tail", "oracle_cost_so_far"):
+                    assert flat.get(column) is not None, f"{arm} {row.task}: no {column}"
+        print("\nGPU branch: 2 arms x 3 tasks, 18 PROB calls, every metric present "
+              "including the grouped recall.")
     else:
         assert namespace["gpu_results"] == []
         print("\nCPU branch: complete, GPU chain correctly skipped.")

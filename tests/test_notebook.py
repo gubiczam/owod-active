@@ -38,6 +38,19 @@ def cell_containing(marker: str) -> str:
     return matches[0]
 
 
+def _with_flags(source: str, **flags: bool) -> str:
+    """Rewrite top-level boolean assignments, whatever they are set to now."""
+
+    import re
+
+    for name, value in flags.items():
+        source, count = re.subn(
+            rf"^{name} = \w+", f"{name} = {value}", source, count=1, flags=re.MULTILINE
+        )
+        assert count == 1, f"{name} is not assigned once at the top level"
+    return source
+
+
 def test_the_notebook_has_exactly_one_parameters_cell():
     assert cell_containing("# ============================== PARAMETERS")
 
@@ -210,12 +223,65 @@ def test_the_presets_resolve_the_way_the_run_guide_says(
     repository rather than numbers they retype.
     """
 
-    source = cell_containing("# ============================== PARAMETERS")
-    source = (source.replace("RUN_GPU = True", f"RUN_GPU = {run_gpu}")
-                    .replace("SMOKE_TEST = True", f"SMOKE_TEST = {smoke}")
-                    .replace("FAST_CHAIN = True", f"FAST_CHAIN = {fast}"))
+    # Substitute the assignment whatever its committed value is, so this test
+    # keeps testing the presets rather than the current defaults.
+    source = _with_flags(
+        cell_containing("# ============================== PARAMETERS"),
+        RUN_GPU=run_gpu, SMOKE_TEST=smoke, FAST_CHAIN=fast,
+    )
     namespace: dict = {}
     exec(compile(source, "parameters", "exec"), namespace)  # noqa: S102
     assert namespace["N_TASKS"] == tasks
     assert namespace["CANDIDATE_IMAGES"] == candidates
     assert namespace["EPOCHS"] == epochs
+
+
+def test_the_notebook_runs_every_arm_from_one_press():
+    """A single arm's numbers have nothing to be measured against.
+
+    The method, the floor and the learning-free control all have to run on the
+    same protocol, so the notebook loops them rather than asking the user to
+    edit a name and press Run all three times.
+    """
+
+    parameters = cell_containing("# ============================== PARAMETERS")
+    namespace: dict = {}
+    exec(compile(parameters, "parameters", "exec"), namespace)  # noqa: S102
+    arms = namespace["ARMS"]
+    assert arms[0] == "prior_consult_batch", "the method comes first"
+    assert "random" in arms, "the floor must be measured, not assumed"
+    assert "objectness" in arms, "the learning-free control is the bar to beat"
+
+    from owl import selection
+
+    for arm in arms:
+        assert arm in selection.ARMS, f"{arm} is not a registered arm"
+
+
+def test_the_arms_share_one_time_budget_and_say_what_did_not_run():
+    """The session is what runs out, so the budget cannot be per arm."""
+
+    chain = cell_containing("for arm in ARMS:")
+    assert "TIME_BUDGET_MINUTES - spent" in chain, "each arm would get a full budget"
+    assert "not started" in chain, "an arm that never ran must be named"
+    assert "Run all again" in chain, "the user must be told it resumes"
+
+
+def test_the_notebook_is_committed_ready_to_run():
+    """The user's ask: open the link, press Run all, change nothing."""
+
+    parameters = cell_containing("# ============================== PARAMETERS")
+    namespace: dict = {}
+    exec(compile(parameters, "parameters", "exec"), namespace)  # noqa: S102
+    assert namespace["RUN_GPU"] is True
+    assert namespace["SMOKE_TEST"] is False, "the smoke test has already passed"
+    assert namespace["FAST_CHAIN"] is True
+    assert namespace["N_TASKS"] == 6 and namespace["CANDIDATE_IMAGES"] == 2000
+
+
+def test_the_comparison_only_uses_the_depth_every_arm_reached():
+    """A five-task arm against a two-task arm is not a result."""
+
+    results = cell_containing("tail U-Recall at equal oracle cost")
+    assert "min(len(rows) for rows in by_arm.values()" in results
+    assert "every arm reached" in results
