@@ -92,6 +92,11 @@ végzetes: a PROB-nak van tiszta PyTorch-tartaléka, csak lassabb — ki is írj
 
 ## 4. lépés — A valódi lánc
 
+> A csoportonkénti U-Recall egy **második forward-passt** igényel a teszthalmazon
+> (a dobozszintű detekciós artefaktért), tehát a kiértékelés kétszerese. Ez a terv fő
+> végpontja, ezért alapból be van kapcsolva; `measure_grouped_recall=False` kikapcsolja
+> és feladja a fő eredményt.
+
 **Mért költség** (T4-en, a 2026-08-26-i próbafutás alapján — `data/reference/gpu_cost_basis.json`):
 
 | beállítás | perc/taszk | óra/arm |
@@ -99,6 +104,7 @@ végzetes: a PROB-nak van tiszta PyTorch-tartaléka, csak lassabb — ki is írj
 | 10 taszk, 4000 jelölt, 600 keret, 5 epoch | 62 | **9,3** |
 | 6 taszk, 4000 jelölt, 600 keret, 5 epoch | 62 | **5,2** |
 | 6 taszk, 2000 jelölt, 600 keret, 5 epoch | 51 | **4,3** |
+| ugyanaz, csoportonkénti U-Recall-lal | 63 | **5,3** |
 | 10 taszk, 2000 jelölt, 400 keret, 3 epoch | 35 | **5,3** |
 
 A teljes tíz-taszkos lánc tehát **nem fér bele** egy Colab-estébe armonként. A
@@ -157,6 +163,8 @@ a közös teszthalmazt használja, tehát összehasonlíthatók.
 
 | oszlop | mit válaszol meg |
 |---|---|
+| **`U_Recall_tail`** | **a kutatási terv fő végpontja**: az ismeretlen tail-objektumok mekkora részét találja meg, ezen az orákulum-költségen. Az armokat *ezen* az oszlopon kell összemérni, azonos `oracle_cost_so_far` mellett |
+| `U_Recall_head` / `_medium` | ugyanaz a többi gyakorisági csoportra — enélkül a tail-szám nem értelmezhető |
 | `images_no_supervision` | a keret mekkora része ment olyan képre, amin **még** nincs tanítható osztály |
 | `images_from_earlier_tasks` | mennyi korábban kifizetett címke vált most használhatóvá, **ingyen** |
 | `prev_mAP50` | **mennyit felejtett** — a korábbi osztályok pontossága |

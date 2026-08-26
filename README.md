@@ -54,7 +54,22 @@ frissülnek, és a PROB saját kiértékelője ad számot.
 Minden szám alább a `data/results/` alatti CSV-kből, három maggal, 600 régiós kerettel.
 Kézzel beírt szám nincs.
 
-### A fő eredmény: hova megy a keret
+### A kutatási terv fő végpontja: tail-U-Recall az orákulum-költség függvényében
+
+A terv kiértékelési szakasza ezt jelöli meg megkülönböztető mérésként, és ezt jósolja:
+*„a várt tendencia, hogy az eloszlás-tudatos kiválasztás azonos tail-szintet lényegesen
+kevesebb annotációból ér el."* A hivatalos kiértékelő aggregált U-Recallja ezt **nem tudja
+megmutatni** — az egyszerre átlagol minden ismeretlen osztályra, vagyis épp azt a
+szerkezetet mossa el, amiről a kutatás szól.
+
+Az `owl.metrics.unknown_recall_by_group` ezért dobozszinten bontja fel: minden ismeretlen
+ground-truth objektumhoz megkeresi, hogy egy *unknown*-nak detektált doboz átfedi-e IoU
+0,5-nél, és a valódi osztálya gyakorisági csoportja szerint számolja. A detekciók
+ugyanazok, amikből a hivatalos szám készül, tehát ez a hivatalos U-Recall **felbontása,
+nem újraimplementálása**. Taszkonként kiírva, `oracle_cost_so_far` mellett — ez az az
+oszlop, amin az armokat össze kell mérni.
+
+### Hova megy a keret (fagyasztott készlet, CPU)
 
 | arm | ismeretlen objektum | ebből **tail** | tail-arány | megnyitott kép |
 |---|---:|---:|---:|---:|

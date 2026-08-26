@@ -129,12 +129,27 @@ def test_predict_and_evaluate_carry_the_class_counts(instrument, tmp_path):
         assert command[command.index("--current-introduced-classes") + 1] == current
 
 
-def test_evaluate_asks_for_no_detection_dump(instrument, tmp_path):
-    """Writing per-image detections doubles the evaluation's cost and we never read them."""
+def test_evaluate_writes_the_detections_the_plan_needs(instrument, tmp_path):
+    """The per-box artefact costs a second forward pass and is on by default.
+
+    An earlier version of this test asserted the opposite — that
+    ``--no-detections`` is always passed, because the artefact doubles the
+    evaluation and nothing read it. That premise is gone: the research plan's
+    headline endpoint is U-Recall split by frequency group, which cannot be
+    computed from the aggregate the evaluator prints, and the artefact is where
+    the per-box detections live. So the default flipped, and the flag now appears
+    only when the decomposition is deliberately given up.
+    """
+
     (tmp_path / "t1.pth").write_bytes(b"x")
     instrument.evaluate(checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
-                        output=tmp_path / "m.json", n_prev=19, n_current=1)
-    assert "--no-detections" in command_for(instrument, "evaluate")
+                        output=tmp_path / "on.json", n_prev=19, n_current=1)
+    assert "--no-detections" not in command_for(instrument, "evaluate")
+
+    off = bridge.Bridge(prob_root=tmp_path, data_root=tmp_path, dry_run=True)
+    off.evaluate(checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+                 output=tmp_path / "off.json", n_prev=19, n_current=1, detections=False)
+    assert "--no-detections" in off.commands[0]
 
 
 def test_the_seed_reaches_prob_on_every_verb(instrument, tmp_path):

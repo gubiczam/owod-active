@@ -12,9 +12,13 @@ forgotten, how much was learned, and whether unknowns are still being found.
 from __future__ import annotations
 
 import ast
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
 
 GROUPS: tuple[str, ...] = ("head", "medium", "tail")
 
@@ -192,31 +196,111 @@ def forgetting(
     return result
 
 
-def grouped_unknown_recall(
-    detections: Mapping[str, Sequence[str]],
-    ground_truth: Mapping[str, Sequence[str]],
-    groups: Mapping[str, Sequence[str]],
-) -> dict[str, float | None]:
-    """Tail-resolved U-Recall, the proposal's headline metric for Contribution A."""
+def _iou(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
+    """IoU of one xyxy box against many."""
 
-    recalled = dict.fromkeys(groups, 0)
-    present = dict.fromkeys(groups, 0)
-    membership = {name: group for group, names in groups.items() for name in names}
+    if boxes.size == 0:
+        return np.zeros(0)
+    left = np.maximum(box[0], boxes[:, 0])
+    top = np.maximum(box[1], boxes[:, 1])
+    right = np.minimum(box[2], boxes[:, 2])
+    bottom = np.minimum(box[3], boxes[:, 3])
+    overlap = np.clip(right - left, 0, None) * np.clip(bottom - top, 0, None)
+    area = (box[2] - box[0]) * (box[3] - box[1])
+    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    return overlap / np.maximum(area + areas - overlap, 1e-9)
 
-    for image_id, truth in ground_truth.items():
-        found = list(detections.get(image_id, ()))
-        for class_name in truth:
-            group = membership.get(class_name)
-            if group is None:
-                continue
-            present[group] += 1
-            if class_name in found:
-                found.remove(class_name)
-                recalled[group] += 1
 
-    return {
-        group: (recalled[group] / present[group] if present[group] else None) for group in groups
+def unknown_recall_by_group(
+    artifact: Mapping[str, object] | str,
+    *,
+    known_classes: Sequence[str],
+    groups: Mapping[str, str],
+    iou_threshold: float = 0.5,
+    minimum_score: float = 0.0,
+) -> dict[str, dict[str, float]]:
+    """U-Recall split by the true class's frequency group.
+
+    **This is the research plan's headline endpoint.** The plan asks for
+    "csoportonkénti mAP és U-Recall ... valamint a tail-U-Recall ... mint az
+    orákulum-költség függvénye", and predicts that distribution-aware selection
+    reaches the same tail level from far fewer annotations. The aggregate U-Recall
+    the official evaluator reports cannot show that: it averages over every
+    unknown class at once, which is exactly the structure the research is about.
+
+    Computed from the detections artifact, which holds the same post-processed
+    detections the official numbers come from — so this is a decomposition of
+    U-Recall, not a re-implementation of it. The artifact's ground truth carries
+    each object's **true** class name (``ground_truth_records`` reads
+    ``load_instances`` before PROB relabels unknowns), which is what makes the
+    grouping possible at all.
+
+    An unknown object counts as recalled when some detection of the unknown class
+    overlaps it at ``iou_threshold``. Detections are matched greedily by
+    descending score and each is used once, so two detections on one object
+    cannot recall two.
+    """
+
+    if isinstance(artifact, (str, Path)):
+        artifact = json.loads(Path(artifact).read_text(encoding="utf-8"))
+    if artifact.get("schema") != "daowod_detections_v1":
+        raise MetricsError(
+            f"Unexpected detections schema {artifact.get('schema')!r}; this reader "
+            "understands 'daowod_detections_v1'."
+        )
+
+    unknown_name = artifact["unknown_class_name"]
+    known = set(known_classes)
+
+    truth: dict[str, list[tuple[str, list[float]]]] = {}
+    for record in artifact["ground_truth"]:
+        name = record["class_name"]
+        if name in known or name == unknown_name:
+            continue                       # a known object is not an unknown to find
+        truth.setdefault(record["image_id"], []).append((name, record["box"]))
+
+    found: dict[str, list[tuple[float, list[float]]]] = {}
+    for record in artifact["detections"]:
+        if record["class_name"] != unknown_name or record["score"] < minimum_score:
+            continue
+        found.setdefault(record["image_id"], []).append((record["score"], record["box"]))
+
+    tally = {group: [0, 0] for group in (*GROUPS, "unassigned")}
+    for image_id, objects in truth.items():
+        boxes = np.asarray([box for _, box in objects], dtype=float)
+        names = [name for name, _ in objects]
+        claimed = np.zeros(len(objects), dtype=bool)
+
+        for _, box in sorted(found.get(image_id, ()), key=lambda item: -item[0]):
+            overlaps = _iou(np.asarray(box, dtype=float), boxes)
+            overlaps[claimed] = -1.0
+            best = int(np.argmax(overlaps)) if overlaps.size else -1
+            if best >= 0 and overlaps[best] >= iou_threshold:
+                claimed[best] = True
+
+        for name, hit in zip(names, claimed):
+            group = groups.get(name, "unassigned")
+            if group not in tally:
+                group = "unassigned"
+            tally[group][1] += 1
+            tally[group][0] += int(hit)
+
+    result = {
+        group: {
+            "recalled": recalled,
+            "objects": total,
+            "recall": 100.0 * recalled / total if total else None,
+        }
+        for group, (recalled, total) in tally.items()
     }
+    recalled = sum(v["recalled"] for v in result.values())
+    objects = sum(v["objects"] for v in result.values())
+    result["all"] = {
+        "recalled": recalled,
+        "objects": objects,
+        "recall": 100.0 * recalled / objects if objects else None,
+    }
+    return result
 
 
 def from_bridge_metrics(path, *, class_names=None) -> Evaluation:
@@ -228,10 +312,7 @@ def from_bridge_metrics(path, *, class_names=None) -> Evaluation:
     still-running job.
     """
 
-    import json
-    from pathlib import Path as _Path
-
-    payload = json.loads(_Path(path).read_text(encoding="utf-8"))
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
     official = payload.get("official_metrics", {})
     per_class = per_class_ap50(payload, class_names=class_names)
     return Evaluation(

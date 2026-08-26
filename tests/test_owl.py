@@ -456,3 +456,91 @@ def test_the_frequency_split_of_a_real_run_is_computable():
     grouped = metrics.grouped_map(evaluation, membership)
     assert set(grouped) == {"head", "medium", "tail"}
     assert all(value is not None and value > 0 for value in grouped.values())
+
+
+# ------------------------------- the plan's headline endpoint ---------------
+
+
+def _artifact(objects, detections, unknown="unknown"):
+    return {
+        "schema": "daowod_detections_v1",
+        "unknown_class_name": unknown,
+        "ground_truth": objects,
+        "detections": detections,
+    }
+
+
+def test_unknown_recall_splits_by_the_true_class_of_the_object():
+    """The aggregate U-Recall cannot answer the plan's question; this can."""
+
+    objects = [
+        {"image_id": "a", "class_name": "fire hydrant", "box": [0, 0, 10, 10]},
+        {"image_id": "a", "class_name": "chair", "box": [50, 50, 60, 60]},
+        {"image_id": "a", "class_name": "person", "box": [20, 20, 30, 30]},
+    ]
+    detections = [
+        {"image_id": "a", "class_name": "unknown", "score": 0.9, "box": [0, 0, 10, 10]},
+    ]
+    result = metrics.unknown_recall_by_group(
+        _artifact(objects, detections),
+        known_classes=["person"],
+        groups={"fire hydrant": "tail", "chair": "head", "person": "head"},
+    )
+    assert result["tail"] == {"recalled": 1, "objects": 1, "recall": 100.0}
+    assert result["head"] == {"recalled": 0, "objects": 1, "recall": 0.0}
+    assert result["all"]["objects"] == 2, "a known object is not an unknown to find"
+
+
+def test_two_detections_on_one_object_recall_it_once():
+    objects = [{"image_id": "a", "class_name": "fire hydrant", "box": [0, 0, 10, 10]}]
+    detections = [
+        {"image_id": "a", "class_name": "unknown", "score": 0.9, "box": [0, 0, 10, 10]},
+        {"image_id": "a", "class_name": "unknown", "score": 0.8, "box": [1, 1, 9, 9]},
+    ]
+    result = metrics.unknown_recall_by_group(
+        _artifact(objects, detections), known_classes=[],
+        groups={"fire hydrant": "tail"},
+    )
+    assert result["tail"]["recalled"] == 1
+
+
+def test_a_detection_that_does_not_overlap_recalls_nothing():
+    objects = [{"image_id": "a", "class_name": "fire hydrant", "box": [0, 0, 10, 10]}]
+    detections = [
+        {"image_id": "a", "class_name": "unknown", "score": 0.9, "box": [80, 80, 90, 90]},
+    ]
+    result = metrics.unknown_recall_by_group(
+        _artifact(objects, detections), known_classes=[],
+        groups={"fire hydrant": "tail"},
+    )
+    assert result["tail"]["recall"] == 0.0
+
+
+def test_a_known_class_detection_does_not_count_as_discovery():
+    """Only detections of the unknown class recall an unknown object."""
+
+    objects = [{"image_id": "a", "class_name": "fire hydrant", "box": [0, 0, 10, 10]}]
+    detections = [
+        {"image_id": "a", "class_name": "car", "score": 0.99, "box": [0, 0, 10, 10]},
+    ]
+    result = metrics.unknown_recall_by_group(
+        _artifact(objects, detections), known_classes=[],
+        groups={"fire hydrant": "tail"},
+    )
+    assert result["tail"]["recall"] == 0.0
+
+
+def test_a_foreign_schema_is_refused_rather_than_misread():
+    with pytest.raises(metrics.MetricsError, match="daowod_detections_v1"):
+        metrics.unknown_recall_by_group(
+            {"schema": "something_else"}, known_classes=[], groups={}
+        )
+
+
+def test_the_groups_of_the_real_benchmark_partition_the_unknowns():
+    """Every class the chain can meet must land in a named frequency group."""
+
+    groups = protocol.load_groups()
+    chain = protocol.build_chain(10)
+    for name in protocol.unknown_classes(chain[1]):
+        assert groups.get(name) in metrics.GROUPS, f"{name} has no frequency group"

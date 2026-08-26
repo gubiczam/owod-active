@@ -200,8 +200,18 @@ class Bridge:
         n_prev: int,
         n_current: int,
         batch_size: int = 4,
+        detections: bool = True,
     ) -> Path:
-        """PROB's official evaluator. Cached on ``output``."""
+        """PROB's official evaluator. Cached on ``output``.
+
+        ``detections`` writes the per-box artefact alongside the metrics. It
+        costs a second forward pass over the evaluation split — roughly doubling
+        the expensive half of the protocol — and it is on by default because the
+        research plan's headline endpoint needs it: U-Recall split by frequency
+        group cannot be computed from the aggregate the evaluator prints, and the
+        artefact holds the same post-processed detections those aggregates come
+        from. See :func:`owl.metrics.unknown_recall_by_group`.
+        """
 
         from owl.evaluation_subset import check_split_name
 
@@ -219,8 +229,8 @@ class Bridge:
              "--test-set", test_set,
              "--output", str(output),
              "--output-dir", str(output.parent / f"{output.stem}_eval"),
-             "--batch-size", str(batch_size),
-             "--no-detections"],
+             "--batch-size", str(batch_size)]
+            + ([] if detections else ["--no-detections"]),
             n_prev=n_prev, n_current=n_current, label=f"evaluate:{output.stem}",
         )
         return output

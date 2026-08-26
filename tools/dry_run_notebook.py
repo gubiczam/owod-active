@@ -159,7 +159,8 @@ class FakeBridge:
         output_checkpoint.write_bytes(b"fake checkpoint")
         return output_checkpoint
 
-    def evaluate(self, *, checkpoint, test_set, output, n_prev, n_current, **_):
+    def evaluate(self, *, checkpoint, test_set, output, n_prev, n_current,
+                 detections=True, **_):
         check_split_name(test_set, purpose="test")
         assert Path(checkpoint).exists()
         split = self.data_root / "ImageSets" / "OWDETR" / f"{test_set}.txt"
@@ -175,12 +176,34 @@ class FakeBridge:
             return output
         output.parent.mkdir(parents=True, exist_ok=True)
         step = len([c for c in self.calls if c["verb"] == "evaluate"])
-        output.write_text(json.dumps({
+        payload = {
             "known_AP50": 60.0 - step, "U_Recall": 20.0 - step,
             "previous_known_AP50": 70.0 - 2 * step, "current_known_AP50": 3.0 + step,
             "unknown_AP50": 0.4, "WI": 0.03, "A_OSE": 1200,
             "coco_eval_bbox": [30.0, 30.0, *[float(i % 40) for i in range(80)], 0.4],
-        }), encoding="utf-8")
+                }
+        output.write_text(json.dumps(payload), encoding="utf-8")
+
+        if detections:
+            # the same shape the bridge writes, so the grouped-recall reader is
+            # exercised rather than merely imported
+            from owl import protocol as _protocol
+
+            artefact = output.with_name(f"{output.stem}_detections.json")
+            unknown = _protocol.CLASS_ORDER[n_prev + n_current:][:6]
+            truth, found = [], []
+            for index, name in enumerate(unknown):
+                box = [10.0 * index, 0.0, 10.0 * index + 8.0, 8.0]
+                truth.append({"image_id": "img0", "class_name": name, "box": box})
+                if index % 2 == 0:                      # half of them recalled
+                    found.append({"image_id": "img0", "class_name": "unknown",
+                                  "score": 0.9, "box": box})
+            artefact.write_text(json.dumps({
+                "schema": "daowod_detections_v1", "unknown_class_name": "unknown",
+                "ground_truth": truth, "detections": found,
+            }), encoding="utf-8")
+            payload["detections_path"] = str(artefact)
+            output.write_text(json.dumps(payload), encoding="utf-8")
         return output
 
     def cost_report(self):

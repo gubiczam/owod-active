@@ -82,7 +82,8 @@ class FakeBridge:
         output_checkpoint.write_bytes(b"fake")
         return output_checkpoint
 
-    def evaluate(self, *, checkpoint, test_set, output, n_prev, n_current, batch_size=4):
+    def evaluate(self, *, checkpoint, test_set, output, n_prev, n_current,
+                 batch_size=4, detections=True):
         check_split_name(test_set, purpose="test")
         self.calls.append({
             "verb": "evaluate", "n_prev": n_prev, "n_current": n_current,
@@ -92,14 +93,36 @@ class FakeBridge:
         if output.exists():
             return output
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps({
+        payload = {
             "known_AP50": 40.0, "U_Recall": 20.0, "WI": 0.03, "A_OSE": 1000,
             "previous_known_AP50": 60.0, "current_known_AP50": 5.0,
             "unknown_AP50": 0.5,
             # the real bridge writes no per_class_AP50; it writes this vector,
             # shaped [mAP, mAP, <80 classes>, unknown]
             "coco_eval_bbox": [30.0, 30.0, *[float(i % 40) for i in range(80)], 0.5],
-        }), encoding="utf-8")
+                }
+        output.write_text(json.dumps(payload), encoding="utf-8")
+
+        if detections:
+            # the same shape the bridge writes, so the grouped-recall reader is
+            # exercised rather than merely imported
+            from owl import protocol as _protocol
+
+            artefact = output.with_name(f"{output.stem}_detections.json")
+            unknown = _protocol.CLASS_ORDER[n_prev + n_current:][:6]
+            truth, found = [], []
+            for index, name in enumerate(unknown):
+                box = [10.0 * index, 0.0, 10.0 * index + 8.0, 8.0]
+                truth.append({"image_id": "img0", "class_name": name, "box": box})
+                if index % 2 == 0:                      # half of them recalled
+                    found.append({"image_id": "img0", "class_name": "unknown",
+                                  "score": 0.9, "box": box})
+            artefact.write_text(json.dumps({
+                "schema": "daowod_detections_v1", "unknown_class_name": "unknown",
+                "ground_truth": truth, "detections": found,
+            }), encoding="utf-8")
+            payload["detections_path"] = str(artefact)
+            output.write_text(json.dumps(payload), encoding="utf-8")
         return output
 
     def cost_report(self):
@@ -597,3 +620,46 @@ def test_resuming_does_not_retrain_a_task_whose_checkpoint_was_pruned(tmp_path, 
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     assert not again.calls, f"a finished chain did work again: {again.verbs()}"
+
+
+def test_the_plans_headline_endpoint_reaches_the_table(tmp_path, index, config):
+    """U-Recall by frequency group, against oracle cost.
+
+    The plan asks for "csoportonkénti mAP és U-Recall ... valamint a tail-U-Recall
+    ... mint az orákulum-költség függvénye", and predicts that distribution-aware
+    selection reaches the same tail level from fewer annotations. The aggregate
+    U-Recall the evaluator prints averages over every unknown class at once and
+    therefore cannot show that at all.
+    """
+
+    fake = FakeBridge()
+    results = runner.run_chain(
+        fake, config, workspace=tmp_path, candidate_index=index,
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+    )
+    for row in results:
+        flat = row.flat()
+        for column in ("U_Recall_head", "U_Recall_medium", "U_Recall_tail",
+                       "U_Recall_all", "oracle_cost_so_far"):
+            assert column in flat, f"{row.task} is missing {column}"
+        assert flat["unknown_objects_all"] > 0
+
+    costs = [row.flat()["oracle_cost_so_far"] for row in results]
+    assert costs == sorted(costs) and costs[0] == config.budget_per_task, costs
+
+
+def test_turning_the_grouped_recall_off_skips_the_second_forward_pass(tmp_path, index, config):
+    """It is the expensive half of evaluation, so it must be optional and visible."""
+
+    from dataclasses import replace
+
+    fake = FakeBridge()
+    results = runner.run_chain(
+        fake, replace(config, measure_grouped_recall=False), workspace=tmp_path,
+        candidate_index=index, start_checkpoint=tmp_path / "t1.pth",
+        test_set="owl_shared_test", chain=protocol.build_chain(4),
+        prepare_images=lambda ids: ids,
+    )
+    assert not any("_detections.json" in p.name for p in tmp_path.rglob("*.json"))
+    assert "U_Recall_tail" not in results[0].flat()

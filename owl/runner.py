@@ -59,6 +59,13 @@ class CycleConfig:
     n_clusters: int = 1600
     seed: int = 0
 
+    #: Write the per-box detections artefact and decompose U-Recall by frequency
+    #: group. This is the research plan's headline endpoint — "tail-U-Recall as a
+    #: function of oracle cost" — and it cannot come from the aggregate the
+    #: evaluator prints. It costs a second forward pass over the evaluation
+    #: split, so turning it off halves evaluation and gives up the main result.
+    measure_grouped_recall: bool = True
+
     #: An image the oracle labelled whose objects are all future-task classes
     #: cannot be trained on yet — PROB's split keeps only the classes introduced
     #: so far. The label is still ours: we paid for it. With this on, such an
@@ -466,6 +473,7 @@ def run_chain(
             checkpoint=checkpoint, test_set=test_set,
             output=task_dir / "metrics.json",
             n_prev=task.n_prev, n_current=task.n_new,
+            detections=config.measure_grouped_recall,
         )
         evaluation = metrics.from_bridge_metrics(metrics_path)
         # The head/medium/tail split is the research plan's distinguishing form
@@ -477,6 +485,18 @@ def run_chain(
             groups=metrics.group_membership(task.known_classes, groups),
         )
         row["exchange_rate"] = metrics.exchange_rate(row)
+
+        # The plan's headline endpoint: how much of the *tail* the detector still
+        # finds as unknown, at this point on the oracle-cost axis.
+        artefact = json.loads(metrics_path.read_text(encoding="utf-8")).get("detections_path")
+        if artefact and Path(artefact).exists():
+            by_group = metrics.unknown_recall_by_group(
+                Path(artefact), known_classes=task.known_classes, groups=groups,
+            )
+            for name in ("head", "medium", "tail", "all"):
+                row[f"U_Recall_{name}"] = by_group[name]["recall"]
+                row[f"unknown_objects_{name}"] = by_group[name]["objects"]
+            row["oracle_cost_so_far"] = (len(results) + 1) * config.budget_per_task
         previous_baseline = evaluation.known_map50
 
         result = TaskResult(
