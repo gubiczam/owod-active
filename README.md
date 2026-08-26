@@ -194,12 +194,14 @@ tools/run_experiments.py      minden szám újraszámolása
 
 ```
 OWL/
-  checkpoints/SOWODB/t1.pth              a PROB publikált t1 checkpointja (478 MB)
-  data/owdetr_pool_annotations.tar.gz    a jelöltképek VOC-XML annotációi
+  checkpoints/SOWODB/t1.pth    a PROB publikált t1 checkpointja (478 MB)
 ```
 
-A képek nem kellenek a Drive-ra — a notebook a COCO-ról tölti le őket igény szerint, csak
-azokat, amiket a kiválasztás megnyit. A PROB-ot a
+**Ez az egyetlen feltöltés.** A 28 800 jelöltkép annotációja a repóban van
+(`data/staging/`, 4,6 MB), a képeket pedig a notebook a COCO-ról tölti le igény szerint,
+csak azokat, amiket a kiválasztás megnyit. A notebook előellenőrző cellája a `DAOWOD`
+mappában is keres, tehát ha egy korábbi futásból már ott van a checkpoint, nem kell újra
+feltölteni. A PROB-ot a
 [`gubiczam/PROB`](https://github.com/gubiczam/PROB) `feat/daowod-bridge-v2` ága adja, ahol
 a `daowod_prob_bridge.py` a `predict` / `train` / `evaluate` igéket kiteszi.
 

@@ -57,6 +57,55 @@ def test_chain_refuses_to_run_off_the_end():
         protocol.build_chain(100)
 
 
+def test_every_owl_data_source_uses_the_benchmark_spelling():
+    """Six classes are spelled two ways and it is a real trap.
+
+    The raw VOC annotation files say ``dining table``, ``potted plant``,
+    ``couch``, ``tv``, ``airplane``, ``motorcycle``. The benchmark's class order
+    says ``diningtable``, ``pottedplant``, ``sofa``, ``tvmonitor``,
+    ``aeroplane``, ``motorbike``. Two of the ten tasks declare classes on that
+    list, so if one of our own tables drifted to the COCO spelling those tasks
+    would silently count zero instances of their own target.
+
+    PROB's loader does the mapping itself
+    (``datasets/torchvision_datasets/open_world.py``, VOC_CLASS_NAMES_COCOFIED),
+    so the archives are correct as they come off disk. This pins the other side:
+    everything inside owl speaks the benchmark's spelling.
+    """
+    import json
+
+    from owl import evaluation_subset
+
+    cocofied = ["airplane", "dining table", "motorcycle", "potted plant", "couch", "tv"]
+    benchmark = ["aeroplane", "diningtable", "motorbike", "pottedplant", "sofa", "tvmonitor"]
+
+    root = protocol.GROUPS_PATH.parent
+    index = json.loads((root / "per_image_class_counts.json").read_text(encoding="utf-8"))
+    sources = {
+        "candidate index": {name for counts in index.values() for name in counts},
+        "class groups": set(protocol.load_groups()),
+        "class order": set(protocol.CLASS_ORDER),
+    }
+    for label, names in sources.items():
+        assert not names & set(cocofied), f"{label} drifted to the COCO spelling"
+        assert set(benchmark) <= names, f"{label} is missing benchmark-spelled classes"
+
+    for coco, voc in zip(cocofied, benchmark):
+        assert evaluation_subset.canonical_class_name(coco) == voc
+
+
+def test_the_declared_classes_are_reachable_in_the_candidate_pool():
+    """A task whose class appears in no candidate image cannot be learned."""
+    import json
+
+    index = json.loads(
+        (protocol.GROUPS_PATH.parent / "per_image_class_counts.json").read_text(encoding="utf-8")
+    )
+    for task in protocol.build_chain(10)[1:]:
+        images = sum(1 for counts in index.values() if task.new_class in counts)
+        assert images >= 300, f"{task.new_class} is in only {images} candidate images"
+
+
 # ----------------------------------------------------------------- proposals ---
 
 

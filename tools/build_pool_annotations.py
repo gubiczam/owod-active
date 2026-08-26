@@ -9,7 +9,18 @@ mount a 120 GB dataset. This packs exactly those XMLs and nothing else.
         --annotations /Volumes/AI_SSD/datasets/owod_canonical/Annotations \
         --output data/staging/owdetr_pool_annotations.tar.gz
 
-Upload the result to Drive once. It does not change between runs.
+The archive ships in the repository, so normally nothing needs uploading; rebuild
+it only if the candidate index changes.
+
+**On the two spellings.** Six classes are named one way in these XML files and
+another way in the benchmark's class order — ``dining table`` against
+``diningtable``, ``potted plant`` against ``pottedplant``, and likewise for
+``couch``/``sofa``, ``tv``/``tvmonitor``, ``airplane``/``aeroplane``,
+``motorcycle``/``motorbike``. The files are copied through unchanged, which is
+correct: PROB's own loader maps them (``VOC_CLASS_NAMES_COCOFIED`` in
+``datasets/torchvision_datasets/open_world.py``). Everything inside ``owl`` uses
+the benchmark spelling, and ``tests`` pins that so a table cannot drift and make
+the ``diningtable`` and ``pottedplant`` tasks silently count nothing.
 """
 
 from __future__ import annotations
@@ -58,6 +69,13 @@ def main() -> None:
         print(f"full list: {manifest}")
     else:
         print("every candidate image has an annotation.")
+
+    cocofied = {"airplane", "dining table", "motorcycle", "potted plant", "couch", "tv"}
+    print(
+        "Class names are copied through unchanged. Six of them use the COCO spelling "
+        f"({sorted(cocofied)}); PROB's loader maps those to the benchmark's own "
+        "spelling, so this is expected and must not be 'fixed' here."
+    )
 
 
 if __name__ == "__main__":

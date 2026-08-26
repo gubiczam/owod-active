@@ -45,9 +45,9 @@ MyDrive/OWL/checkpoints/SOWODB/t1.pth
 **Lehet, hogy már ott van.** A korábbi futásokból lehet egy `MyDrive/DAOWOD/checkpoints/SOWODB/t1.pth`
 — a notebook előellenőrzése ott is keres, tehát ha megvan, nem kell újra feltölteni.
 
-Az annotációk **nincsenek külön feltöltésre**: a repóban vannak (`data/staging/`), a
-képeket pedig a notebook a COCO-ról szedi le futás közben, csak azokat, amiket a
-kiválasztás megnyit.
+Az annotációk **nincsenek külön feltöltésre**: mind a 28 800 jelöltkép XML-je a repóban
+van (`data/staging/owdetr_pool_annotations.tar.gz`, 4,6 MB), a képeket pedig a notebook a
+COCO-ról szedi le futás közben, csak azokat, amiket a kiválasztás megnyit.
 
 ---
 
