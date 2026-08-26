@@ -23,7 +23,7 @@ detection metric for that reason.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -176,6 +176,7 @@ def run_chain(
     test_set: str,
     chain: Sequence[protocol.Task] | None = None,
     time_budget_minutes: float | None = None,
+    prepare_images: Callable[[Sequence[str]], Sequence[str]] | None = None,
 ) -> list[TaskResult]:
     """Run the task chain on the GPU, one checkpoint per task, resumable.
 
@@ -185,6 +186,14 @@ def run_chain(
 
     ``time_budget_minutes`` stops the chain cleanly before the runtime is lost
     and prints which tasks were not run. Nothing is silently truncated.
+
+    ``prepare_images`` is called with each task's candidate image ids before the
+    detector runs, and returns the ids that are actually usable. The detector
+    reads JPEGs off disk and dies on the first one that is missing, so something
+    has to put them there; on Colab that is a download from COCO, and only the
+    images a task actually offers the selector are worth fetching. Returning a
+    shorter list is how an unavailable image is dropped instead of killing the
+    run. It is not called when the task's detector pass is already cached.
     """
 
     chain = chain or protocol.build_chain(config.n_tasks)
@@ -222,11 +231,26 @@ def run_chain(
             str(v) for v in generator.choice(pool, size=take, replace=False)
         ]
 
-        # ---- 2. one detector pass over them ------------------------------
+        # ---- 2. make sure the images exist, then one detector pass -------
+        proposals_path = task_dir / "proposals.npz"
+        if prepare_images is not None and not proposals_path.exists():
+            available = [str(value) for value in prepare_images(candidate_ids)]
+            dropped = len(candidate_ids) - len(available)
+            if dropped:
+                print(f"  [{task.name}] {dropped} of {len(candidate_ids)} candidate "
+                      f"images could not be fetched; dropped")
+            candidate_ids = available
+        if not candidate_ids:
+            raise RuntimeError(
+                f"{task.name} has no usable candidate images. The detector reads JPEGs "
+                "off disk, so either prepare_images failed for all of them or the "
+                "dataset root is wrong."
+            )
+
         export = bridge.predict(
             candidate_ids,
             checkpoint=checkpoint,
-            output=task_dir / "proposals.npz",
+            output=proposals_path,
             n_prev=0, n_current=task.n_prev,
             max_proposals_per_image=config.proposals_per_image,
         )

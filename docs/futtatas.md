@@ -66,6 +66,10 @@ SMOKE_TEST = True     # ez a lényeg: két rövid taszk, apró teszthalmaz
 
 **Runtime → Run all.**
 
+Az első taszk pár percet a képek letöltésével kezd (taszkonként `CANDIDATE_IMAGES` darab
+a COCO-ról, ~600 MB 4 000 képnél). Ezt egyszer fizeted meg: egy újraindított futás a már
+lemezen lévőket kihagyja.
+
 Az „Előellenőrzés" cella kiírja, mi van meg és mi nincs. Ha valami `MISSING`, ott áll
 mellette, honnan kell odatenni, és a cella `CANNOT START`-tal zárul. **Az utána következő
 cellák ilyenkor egy olvasható hibaüzenettel állnak meg**, nem `NameError`-ral — de a
@@ -143,3 +147,4 @@ húsz-osztályos felállás **2931**-et fizetett — ezért van most taszkonkén
 | a session elvágódott | ugyanezekkel a paraméterekkel Run all — folytatja |
 | `NameError` a környezet-cellában | az előellenőrző cella nem futott le, vagy nem ment át. Görgess vissza a kimenetéhez: ott áll, mi hiányzik |
 | minden `new_mAP50` nulla | ez volt a régi baj. Ellenőrizd, hogy `LEARNING_RATE = 2e-4` és `EPOCHS = 5` — 2e-5-tel nem tanul |
+| `FileNotFoundError: .../JPEGImages/xxx.jpg` a `predict` alatt | egy jelöltkép nem töltődött le. A lánc taszkonként szedi le őket, és a nem elérhetőket kidobja — ha ez mégis előjön, a hálózat állt el a futás közben; Run all újra, folytatja |
