@@ -19,6 +19,10 @@ taszkonként egy új osztállyal.
 GPU nélkül, adathalmaz nélkül, néhány perc alatt lefut, és végigmegy a kutatás minden
 kérdésén. Magyar magyarázat, angol kód.
 
+**Ha egy új Claude-beszélgetést kezdesz:** illeszd be a
+[`docs/atadas.md`](docs/atadas.md)-t — állapotjelentés, a nyolc csapda, és a következő
+két hét sorrendje.
+
 **Ha futtatni akarod, és nem csak olvasni:**
 [`docs/futtatas.md`](docs/futtatas.md) — négy lépés, sorrendben, a próbafutástól a valódi
 láncig.

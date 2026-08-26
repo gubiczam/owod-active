@@ -220,6 +220,8 @@ def fake_subprocess(jpeg_dir: Path):
         joined = " ".join(text)
         if "nvidia-smi" in joined:
             return real.CompletedProcess(command, 0, "Tesla T4, 15360 MiB\n", "")
+        if text[0] == "which":
+            return real.CompletedProcess(command, 0, "/usr/local/cuda/bin/nvcc\n", "")
         if text[0] == "curl":
             target = Path(text[text.index("-o") + 1])
             target.parent.mkdir(parents=True, exist_ok=True)
