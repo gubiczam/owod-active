@@ -120,6 +120,27 @@ def index():
 
 
 @pytest.fixture
+def index_with_barren_images():
+    """Half the pool holds only classes no task in this chain ever declares.
+
+    PROB's fine-tuning split keeps only the classes introduced so far, so those
+    images arrive with zero boxes and its collate function fails on them. They
+    have to be filtered out before training, and counted.
+    """
+    declared = [task.new_class for task in protocol.build_chain(4)[1:]]
+    future = "toothbrush"       # task 4 of the benchmark; never declared here
+    assert future not in declared and future not in protocol.TASK1
+    pool = {}
+    for i in range(400):
+        if i % 2:
+            pool[f"img{i:04d}"] = {future: 2}
+        else:
+            pool[f"img{i:04d}"] = {declared[i % len(declared)]: 1,
+                                   protocol.TASK1[i % len(protocol.TASK1)]: 1}
+    return pool
+
+
+@pytest.fixture
 def config():
     return runner.CycleConfig(
         n_tasks=4, budget_per_task=20, rounds_per_task=2,
@@ -172,6 +193,112 @@ def test_the_chain_refuses_to_predict_on_nothing(tmp_path, index, config):
             fake, config, workspace=tmp_path, candidate_index=index,
             start_checkpoint=tmp_path / "t1.pth", test_set="eval",
             chain=protocol.build_chain(4), prepare_images=lambda ids: [],
+        )
+
+
+def test_images_with_no_currently_known_object_are_not_trained_on(
+    tmp_path, index_with_barren_images, config
+):
+    """The loader fails on them rather than skipping them, so we must filter."""
+
+    fake = FakeBridge()
+    results = runner.run_chain(
+        fake, config, workspace=tmp_path, candidate_index=index_with_barren_images,
+        start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+    )
+    known_by_task = {t.name: set(t.known_classes) for t in protocol.build_chain(4)[1:]}
+    for row, call in zip(results, fake.of("train")):
+        known = known_by_task[row.task]
+        for image in call["images"] + call["replay"]:
+            assert any(name in known for name in index_with_barren_images[image]), (
+                f"{image} would arrive at PROB with zero boxes")
+
+
+def test_the_wasted_half_of_the_budget_is_reported_not_hidden(
+    tmp_path, index_with_barren_images, config
+):
+    """An image the oracle was paid for and PROB cannot use is a measurement."""
+
+    fake = FakeBridge()
+    results = runner.run_chain(
+        fake, config, workspace=tmp_path, candidate_index=index_with_barren_images,
+        start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+    )
+    for row in results:
+        selection = row.selection_row
+        assert selection["images_no_supervision"] > 0, "half the pool is barren"
+        assert (
+            selection["images_trainable"] + selection["images_no_supervision"]
+            == selection["images_opened"]
+        )
+
+
+def test_a_label_paid_for_early_is_used_when_its_class_becomes_declarable(
+    tmp_path, config
+):
+    """The oracle answered; the answer keeps its value even if we cannot use it yet."""
+
+    from dataclasses import replace
+
+    chain = protocol.build_chain(4)
+    late = chain[-1].new_class          # declarable only at the last task
+    early = chain[1].new_class
+    pool = {}
+    for i in range(400):
+        pool[f"img{i:04d}"] = {late: 2} if i % 2 else {early: 1}
+
+    banked = FakeBridge()
+    results = runner.run_chain(
+        banked, replace(config, reuse_deferred_labels=True), workspace=tmp_path / "on",
+        candidate_index=pool, start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        chain=chain, prepare_images=lambda ids: ids,
+    )
+    reused = [row.selection_row["images_from_earlier_tasks"] for row in results]
+    assert reused[0] == 0, "nothing is banked before the first task"
+    assert sum(reused) > 0, "images holding the late class were never picked back up"
+
+    # and with the ledger off, nothing comes back
+    discarded = FakeBridge()
+    off = runner.run_chain(
+        discarded, replace(config, reuse_deferred_labels=False), workspace=tmp_path / "off",
+        candidate_index=pool, start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        chain=chain, prepare_images=lambda ids: ids,
+    )
+    assert all(row.selection_row["images_from_earlier_tasks"] == 0 for row in off)
+    trained_with = sum(len(c["images"]) for c in banked.of("train"))
+    trained_without = sum(len(c["images"]) for c in discarded.of("train"))
+    assert trained_with > trained_without, "banking must add supervision, not just bookkeeping"
+
+
+def test_no_image_is_trained_on_twice_through_the_ledger(tmp_path, index, config):
+    fake = FakeBridge()
+    runner.run_chain(
+        fake, config, workspace=tmp_path, candidate_index=index,
+        start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+    )
+    seen: set[str] = set()
+    for call in fake.of("train"):
+        fresh = set(call["images"])
+        assert not (fresh & seen), "an image reached training twice as new supervision"
+        seen |= fresh
+
+
+def test_a_task_with_too_little_trainable_content_says_so(tmp_path, config):
+    """PROB drops the last partial batch, so too few images trains on nothing."""
+
+    from dataclasses import replace
+
+    barren = {f"img{i:04d}": {"toothbrush": 1} for i in range(400)}
+    fake = FakeBridge()
+    with pytest.raises(RuntimeError, match="trainable images"):
+        runner.run_chain(
+            fake, replace(config, batch_size=2), workspace=tmp_path,
+            candidate_index=barren, start_checkpoint=tmp_path / "t1.pth",
+            test_set="eval", chain=protocol.build_chain(4),
+            prepare_images=lambda ids: ids,
         )
 
 

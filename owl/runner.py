@@ -59,6 +59,15 @@ class CycleConfig:
     n_clusters: int = 1600
     seed: int = 0
 
+    #: An image the oracle labelled whose objects are all future-task classes
+    #: cannot be trained on yet — PROB's split keeps only the classes introduced
+    #: so far. The label is still ours: we paid for it. With this on, such an
+    #: image is banked and joins the training set at the task where its class
+    #: becomes declarable, at no further annotation cost. This is the research
+    #: plan's feedback loop applied to the annotation ledger, and turning it off
+    #: is what measures what it is worth.
+    reuse_deferred_labels: bool = True
+
     #: How many task checkpoints to keep. Each is 478 MB, so a nine-task chain
     #: writes 4.3 GB and three arms fill a free Drive. Two is the minimum that
     #: keeps a resumed session working: the one a task starts from, and the one
@@ -215,6 +224,10 @@ def run_chain(
     all_images = np.asarray(sorted(candidate_index), dtype=object)
     used_images: set[str] = set()
     labelled_history: dict[str, list[str]] = {}
+    #: Every image the oracle has ever answered for, and whether it has been
+    #: trained on yet. An entry that is not yet trainable is not lost.
+    ledger: set[str] = set()
+    trained_on: set[str] = set()
     memory = replay.Memory((), {}, 0.0, 0)
     checkpoint = Path(start_checkpoint)
     results: list[TaskResult] = []
@@ -230,6 +243,8 @@ def run_chain(
             remaining = [t.name for t in chain[chain.index(task):]]
             print(f"Stopping cleanly: {elapsed:.0f} min used. Not run: {remaining}")
             break
+
+        known_now = set(task.known_classes)
 
         # ---- 1. this task's candidate images ----------------------------
         pool = np.asarray([i for i in all_images if i not in used_images], dtype=object)
@@ -283,9 +298,51 @@ def run_chain(
         used_images.update(opened)
 
         # ---- 4. what the oracle's answers are worth ----------------------
+        #
+        # PROB's fine-tuning split keeps only the classes introduced so far
+        # (`remove_unknown_instances`: category_id in range(0, prev + curr)). An
+        # image whose objects are all future-task classes therefore arrives with
+        # zero boxes, and the collate function fails on it rather than skipping
+        # it — `size of tensor a (0) must match the size of tensor b (4)`.
+        #
+        # So such an image cannot be trained on. That is not only a loader
+        # constraint, it is a result: the oracle was paid for it and it yields no
+        # supervision at this task, and how often an arm does that is worth
+        # knowing. Both numbers go in the row.
+        def usable(image: str, known: frozenset = frozenset(known_now)) -> bool:
+            """Would PROB see at least one box on this image at this task?"""
+            return any(name in known for name in candidate_index.get(image, {}))
+
+        ledger.update(opened)
+        trainable = [image for image in opened if usable(image)]
+        barren = len(opened) - len(trainable)
+
+        deferred: list[str] = []
+        if config.reuse_deferred_labels:
+            # labels paid for at an earlier task whose class is declarable now
+            deferred = sorted(
+                image for image in ledger - trained_on - set(opened) if usable(image)
+            )
+            trainable = list(dict.fromkeys([*trainable, *deferred]))
+
+        if barren:
+            print(f"  [{task.name}] {barren} of {len(opened)} opened images hold no "
+                  f"class known after this task; banked for a later one")
+        if deferred:
+            print(f"  [{task.name}] {len(deferred)} images banked at earlier tasks "
+                  "became trainable and cost nothing extra")
+        if len(trainable) < config.batch_size:
+            raise RuntimeError(
+                f"{task.name} kept only {len(trainable)} trainable images of "
+                f"{len(opened)} opened, and PROB's loader drops the last partial "
+                f"batch, so it needs at least {config.batch_size}. Raise "
+                "budget_per_task, or lower batch_size."
+            )
+
         found = sum(candidate_index.get(image, {}).get(task.new_class, 0) for image in opened)
         with_target = sum(1 for image in opened if task.new_class in candidate_index.get(image, {}))
-        labelled_history[task.name] = opened
+        labelled_history[task.name] = trainable
+        trained_on.update(trainable)
 
         # ---- 5. the exemplar memory --------------------------------------
         if replay_spec["total"] > 0:
@@ -298,17 +355,24 @@ def run_chain(
                 total=replay_spec["total"], alpha=replay_spec["alpha"],
                 seed=config.seed, selector=replay_selector,
             )
+            carried = replay.carry_forward(
+                memory, fresh.image_ids, reallocate=config.replay_reallocate
+            )
+            # same loader constraint: a replay image with no currently-known
+            # object arrives empty and fails the collate
+            carried = tuple(
+                image for image in carried
+                if any(name in known_now for name in candidate_index.get(image, {}))
+            )
             memory = replay.Memory(
-                image_ids=replay.carry_forward(
-                    memory, fresh.image_ids, reallocate=config.replay_reallocate
-                ),
+                image_ids=carried,
                 per_class=fresh.per_class, alpha=fresh.alpha, total=fresh.total,
             )
 
         # ---- 6. fine-tune -------------------------------------------------
         supervision = "train" if config.labelling_policy == "box_only" else "ft"
         checkpoint = bridge.train(
-            opened,
+            trainable,
             previous_checkpoint=checkpoint,
             output_checkpoint=task_dir / "checkpoint.pth",
             output_dir=task_dir / "train",
@@ -340,6 +404,9 @@ def run_chain(
                 selection_row={
                     "asked": len(picked),
                     "images_opened": len(opened),
+                    "images_trainable": len(trainable),
+                    "images_no_supervision": barren,
+                    "images_from_earlier_tasks": len(deferred),
                     "target_objects_in_images": found,
                     "images_with_target": with_target,
                 },

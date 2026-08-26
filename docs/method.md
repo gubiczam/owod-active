@@ -122,7 +122,20 @@ tail-objektum 47%-os aránynál.
 5. **Az exemplar-memória** (`owl/replay.py`): `m_c ∝ n_c^α`, `Σ m_c = M`. Az objektum-szintű
    allokációt egy halmazlefedési heurisztika váltja képlistára, mert egy kép több osztályt
    is kiszolgál. `minimum=1` garantálja, hogy egy tail-osztály ne kerekedjen nullára.
-6. **Finomhangolás** (`bridge.train`). `--supervision-mode ft` megtartja az előző taszkok
+6. **Csak azok a képek, amiken van tanítható tartalom.** A PROB `ft` splitje a
+   `remove_unknown_instances`-szel csak a `range(0, prev+curr)` osztályokat tartja meg, tehát
+   egy olyan kép, amin csak későbbi taszkok objektumai vannak, **nulla dobozzal** érkezik, és
+   a collate elhasal rajta (`size of tensor a (0) must match the size of tensor b (4)`).
+
+   Ez nem csak loader-korlát, hanem mérendő szám: az orákulumot kifizettük érte, és ezen a
+   taszkon nem ad felügyeletet. A `images_no_supervision` oszlop ezt jelenti.
+
+   **A címkét viszont nem dobjuk el.** A `reuse_deferred_labels` (alapból be) elteszi az ilyen
+   képet, és akkor kapcsolja be a tanításba, amikor az osztálya bevezethetővé válik — további
+   annotációs költség nélkül. Ez a kutatási terv visszacsatolási hurka az annotációs
+   nyilvántartásra alkalmazva, és a kikapcsolása az, ami megmondja, mennyit ér.
+
+7. **Finomhangolás** (`bridge.train`). `--supervision-mode ft` megtartja az előző taszkok
    dobozait a kiválasztott képeken; `train` eldobja őket. A `box_only` szabály a `train`-re
    képződik le, a másik kettő az `ft`-re.
 
@@ -133,7 +146,7 @@ tail-objektum 47%-os aránynál.
    a `--learning-rate` alapból 2e-5, amivel a korábbi munka 0,010 új-osztály mAP50-et mért;
    az `--epochs` alapból 1; a `--seed` pedig egyáltalán nem jutott át, tehát a
    `SEED = 1`-es futás is 0-val keveredett volna.
-7. **Kiértékelés** (`bridge.evaluate`) a közös, csökkentett teszthalmazon.
+8. **Kiértékelés** (`bridge.evaluate`) a közös, csökkentett teszthalmazon.
 
 Minden hívás újraindítható: ha a kimenet létezik, a hívás kimarad.
 

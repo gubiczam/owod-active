@@ -46,11 +46,40 @@ sys.path.insert(0, str(ROOT))
 class FakeBridge:
     """Stands in for PROB. Writes output shaped the way the real bridge does."""
 
+    #: The evaluator's class order, in PROB's own indexing. An annotation's
+    #: category_id is its position here, which is what the filtering ranges over.
+    CLASS_ORDER: tuple[str, ...] = ()
+
     def __init__(self, *, prob_root, data_root, feature_dim=64, **_):
+        from owl import protocol
+
         self.prob_root = Path(prob_root)
         self.data_root = Path(data_root)
         self.feature_dim = feature_dim
         self.calls: list[dict] = []
+        self.CLASS_ORDER = protocol.CLASS_ORDER
+
+    def _boxes_after_filtering(self, image_id: str, n_prev: int, n_current: int) -> int:
+        """How many boxes survive `remove_unknown_instances`.
+
+        PROB keeps ``category_id in range(0, prev + current)`` on a fine-tuning
+        split. An image whose objects all fall outside that range arrives with
+        zero boxes, and the collate function fails on it rather than skipping it.
+        Modelling this is the whole point: without it the fake accepts input the
+        real loader rejects.
+        """
+
+        from xml.etree import ElementTree
+
+        from owl.evaluation_subset import canonical_class_name
+
+        path = self.data_root / "Annotations" / f"{image_id}.xml"
+        known = set(self.CLASS_ORDER[: n_prev + n_current])
+        root = ElementTree.parse(path).getroot()
+        return sum(
+            1 for element in root.findall("object")
+            if canonical_class_name(element.findtext("name", "")) in known
+        )
 
     def check(self):
         return {"fake": True, "prob_root": str(self.prob_root)}
@@ -103,9 +132,19 @@ class FakeBridge:
             "which does not exist")
         assert Path(previous_checkpoint).exists(), (
             f"PROB train would fail: no checkpoint at {previous_checkpoint}")
+        empty = []
         for image_id in list(labelled_ids) + list(replay_ids):
             assert (self.data_root / "Annotations" / f"{image_id}.xml").exists(), (
                 f"PROB train would fail: no annotation for {image_id}")
+            if self._boxes_after_filtering(image_id, n_prev, n_current) == 0:
+                empty.append(image_id)
+        assert not empty, (
+            f"PROB train would fail: {len(empty)} of "
+            f"{len(labelled_ids) + len(replay_ids)} images arrive with zero boxes "
+            f"after remove_unknown_instances, e.g. {empty[:3]}. The collate "
+            "function raises 'size of tensor a (0) must match the size of tensor "
+            "b (4)' on the first one."
+        )
         self.calls.append({"verb": "train", "images": list(labelled_ids),
                            "replay": list(replay_ids), "n_prev": n_prev,
                            "n_current": n_current, "supervision": supervision_mode,

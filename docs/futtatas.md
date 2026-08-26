@@ -130,6 +130,8 @@ a közös teszthalmazt használja, tehát összehasonlíthatók.
 
 | oszlop | mit válaszol meg |
 |---|---|
+| `images_no_supervision` | a keret mekkora része ment olyan képre, amin **még** nincs tanítható osztály |
+| `images_from_earlier_tasks` | mennyi korábban kifizetett címke vált most használhatóvá, **ingyen** |
 | `prev_mAP50` | **mennyit felejtett** — a korábbi osztályok pontossága |
 | `new_mAP50` | **mennyit tanult** — a most bevezetett osztály |
 | `U_Recall50` | felismeri-e egyáltalán, hogy valami ismeretlen |
@@ -155,5 +157,6 @@ húsz-osztályos felállás **2931**-et fizetett — ezért van most taszkonkén
 | a Drive megtelt | a lánc taszkonként csak a két legutolsó checkpointot tartja meg (`keep_checkpoints`), armonként ~1 GB. Ha régebbi futásból maradtak, töröld a `MyDrive/OWL/work/` alatti régi arm-mappákat |
 | `NameError` a környezet-cellában | az előellenőrző cella nem futott le, vagy nem ment át. Görgess vissza a kimenetéhez: ott áll, mi hiányzik |
 | minden `new_mAP50` nulla | ez volt a régi baj. Ellenőrizd, hogy `LEARNING_RATE = 2e-4` és `EPOCHS = 5` — 2e-5-tel nem tanul |
+| `size of tensor a (0) must match the size of tensor b (4)` | egy kép nulla dobozzal érkezett: a PROB `ft` splitje csak a már bevezetett osztályokat tartja meg. Javítva: a lánc kiszűri ezeket, és a címkéjüket elteszi arra a taszkra, ahol az osztályuk bevezethető |
 | `FileNotFoundError: .../ImageSets/OWDETR/owod_all_task_test.txt` | a PROB a saját alapértelmezett teszt-splitjét kereste. Javítva: a `train` most átadja a közös teszthalmazt. Ha mégis előjön, régi klónból fut — **Runtime → Restart session**, Run all |
 | `FileNotFoundError: .../JPEGImages/xxx.jpg` a `predict` alatt | egy jelöltkép nem töltődött le. A lánc taszkonként szedi le őket, és a nem elérhetőket kidobja — ha ez mégis előjön, a hálózat állt el a futás közben; Run all újra, folytatja |
