@@ -111,12 +111,13 @@ jelölt** sor a realista választás.
 ```python
 RUN_GPU    = True
 SMOKE_TEST = False
+FAST_CHAIN = True          # 6 taszk, 2000 jelölt — ~4,3 óra armonként
 ARM        = "prior_consult_batch"
-
-# ha három armot akarsz egy hétvégén:
-N_TASKS          = 6
-CANDIDATE_IMAGES = 2000
 ```
+
+A `FAST_CHAIN` a repóban tárolt előbeállítás, nem kézzel átírt szám: ha egy `Revert to
+saved` után elvesznek a szerkesztéseid, **egy logikai értéket kell visszaállítani, nem
+négyet.** `FAST_CHAIN = False` a teljes tíz-taszkos lánc.
 
 **Runtime → Run all.** A `TIME_BUDGET_MINUTES = 420` miatt tisztán megáll, mielőtt a
 Colab elvágja, és kiírja, melyik taszkokat nem futtatta le.
@@ -173,6 +174,7 @@ húsz-osztályos felállás **2931**-et fizetett — ezért van most taszkonkén
 | `BUILD FAILED` a kernelnél | nem végzetes, csak lassabb; menj tovább |
 | `PROB bridge 'train' is missing ...` | a PROB nem a `feat/daowod-bridge-v2` ágról jött; a `bridge.ensure_checkout` ezt kezeli, töröld a `/content/PROB` mappát és futtasd újra |
 | a session elvágódott | ugyanezekkel a paraméterekkel Run all — folytatja |
+| `SplitNameError` vagy `unexpected keyword argument` közvetlenül **Run all** után | a notebook-cellák a böngésződből jönnek, az `owl` a friss klónból, és elcsúsztak. **File → Revert to saved**, majd `FAST_CHAIN` és `ARM` visszaállítása. A környezet-cellában lévő elcsúszás-őr ezt azonnal jelzi, nem három cellával később |
 | `unexpected keyword argument` bármelyik `owl` hívásban | a kernel a régi modult tartotta. **Runtime → Restart session**, aztán Run all: a notebook minden futásnál friss klónt húz és kiüríti a betöltött `owl` modulokat |
 | a Drive megtelt | a lánc taszkonként csak a két legutolsó checkpointot tartja meg (`keep_checkpoints`), armonként ~1 GB. Ha régebbi futásból maradtak, töröld a `MyDrive/OWL/work/` alatti régi arm-mappákat |
 | `NameError` a környezet-cellában | az előellenőrző cella nem futott le, vagy nem ment át. Görgess vissza a kimenetéhez: ott áll, mi hiányzik |

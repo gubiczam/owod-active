@@ -182,6 +182,16 @@ MARKER_BEHAVIOUR = {
 }
 
 
+#: The canonical name for this protocol's shared evaluation split.
+#:
+#: It lives here rather than in the notebook on purpose. The notebook's cells
+#: come from whoever last saved them, while ``owl`` is re-cloned on every run —
+#: so anything the two must agree on has to live in the package, or a notebook
+#: saved before a rename carries the old value and fails in a way that looks
+#: like a bug in the new code. That is exactly what happened to this name.
+SHARED_TEST_SET = "owl_shared_test"
+
+
 class SplitNameError(ValueError):
     """Raised when a split name would make PROB do the wrong thing silently."""
 

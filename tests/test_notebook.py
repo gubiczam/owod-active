@@ -148,3 +148,74 @@ def test_the_cpu_branch_runs_and_skips_the_chain(capsys):
 
     dry_run_notebook.run(run_gpu=False, verbose=False)
     assert "GPU chain correctly skipped" in capsys.readouterr().out
+
+
+def test_the_notebook_retypes_nothing_owl_already_defines():
+    """The recurring failure was drift between the cells and the package.
+
+    The cells come from whoever last saved the notebook; owl is re-cloned on
+    every run. So a value that exists in both places will eventually disagree,
+    and the split name did: a notebook saved before the rename carried
+    ``owl_shared_eval`` and failed against the new guard, which reads like a bug
+    in the new code. The fix is not a better error message — it is to stop
+    duplicating the value.
+    """
+
+    from owl import evaluation_subset
+
+    joined = "\n".join(code_cells())
+    assert "SHARED_TEST_SET" in joined, "the notebook must read the name from owl"
+    assert f'"{evaluation_subset.SHARED_TEST_SET}"' not in joined, (
+        "the split name is retyped in the notebook; import it instead"
+    )
+    assert '"owl_shared_eval"' not in joined
+
+
+def test_the_drift_guard_names_what_is_missing():
+    guard = cell_containing("_REQUIRED")
+    for expected in ("prepare_images", "proposals_per_image", "SHARED_TEST_SET",
+                     "per_class_ap50", "reuse_deferred_labels"):
+        assert expected in guard, f"{expected} is not covered by the drift guard"
+
+
+def test_the_cuda_extension_check_asks_a_fresh_interpreter():
+    """A wheel installed a moment ago is invisible to the process that installed it.
+
+    Asking in-process reported a working build as failed, which costs nothing but
+    three times the projected wall clock and a wrong decision about the run.
+    """
+
+    cell = cell_containing("MultiScaleDeformableAttention")
+    assert "msda_available" in cell
+    assert "sys.executable" in cell and "-c" in cell
+    assert "invalidate_caches" in cell
+
+
+@pytest.mark.parametrize(
+    ("run_gpu", "smoke", "fast", "tasks", "candidates", "epochs"),
+    [
+        (True, True, True, 3, 300, 1),      # smoke wins over fast
+        (True, False, True, 6, 2000, 5),    # the weekend chain
+        (True, False, False, 10, 4000, 5),  # the full chain
+        (False, True, True, 10, 4000, 5),   # CPU is never shrunk
+    ],
+)
+def test_the_presets_resolve_the_way_the_run_guide_says(
+    run_gpu, smoke, fast, tasks, candidates, epochs
+):
+    """Three flags, four meanings. A revert costs one boolean, not four values.
+
+    The user has to revert the notebook whenever owl gains something, which loses
+    their edits — so the configurations they actually run are presets in the
+    repository rather than numbers they retype.
+    """
+
+    source = cell_containing("# ============================== PARAMETERS")
+    source = (source.replace("RUN_GPU = True", f"RUN_GPU = {run_gpu}")
+                    .replace("SMOKE_TEST = True", f"SMOKE_TEST = {smoke}")
+                    .replace("FAST_CHAIN = True", f"FAST_CHAIN = {fast}"))
+    namespace: dict = {}
+    exec(compile(source, "parameters", "exec"), namespace)  # noqa: S102
+    assert namespace["N_TASKS"] == tasks
+    assert namespace["CANDIDATE_IMAGES"] == candidates
+    assert namespace["EPOCHS"] == epochs
