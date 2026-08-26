@@ -193,6 +193,15 @@ class Bridge:
     # ----------------------------------------------------------- internals ---
 
     def _call(self, verb: str, arguments: list[str], *, n_prev: int, n_current: int, label: str) -> None:
+        # PROB adds these two: seen = prev + current. `n_current` is therefore the
+        # *increment*, never the running total. owl.protocol.Task.n_new is what
+        # callers should pass.
+        if n_prev < 0 or n_current < 0 or n_prev + n_current < 1:
+            raise BridgeError(
+                f"Invalid class counts for {verb}: prev={n_prev}, current={n_current}. "
+                "PROB reads them as seen = prev + current, so both must be "
+                "non-negative and their sum at least one."
+            )
         command = [
             sys.executable, str(self.script), verb,
             "--dataset", self.dataset,

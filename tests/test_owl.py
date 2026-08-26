@@ -31,6 +31,27 @@ def test_chain_spans_all_three_frequency_groups():
     assert declared == {"head", "medium", "tail"}
 
 
+def test_the_increment_is_what_prob_is_told_not_the_running_total():
+    """PROB adds the two flags: seen = prev + current. Getting this wrong makes
+    every reported mAP wrong, silently, so it is pinned here."""
+    chain = protocol.build_chain(10)
+    for task in chain[1:]:
+        assert task.n_new == 1
+        assert task.n_prev + task.n_new == task.n_current
+    # the failure mode this guards against
+    last = chain[-1]
+    assert last.n_prev + last.n_current != last.n_current, "sanity: they differ"
+    assert last.n_prev + last.n_new == 28
+
+
+def test_the_bridge_rejects_impossible_class_counts():
+    from owl import bridge as bridge_module
+
+    instrument = bridge_module.Bridge(prob_root="/tmp/x", data_root="/tmp/y", dry_run=True)
+    with pytest.raises(bridge_module.BridgeError, match="seen = prev \\+ current"):
+        instrument._call("train", [], n_prev=0, n_current=0, label="bad")
+
+
 def test_chain_refuses_to_run_off_the_end():
     with pytest.raises(protocol.ProtocolError):
         protocol.build_chain(100)

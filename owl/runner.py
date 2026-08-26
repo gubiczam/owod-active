@@ -42,6 +42,9 @@ class CycleConfig:
     budget_per_task: int = 600          # regions the oracle is asked about
     rounds_per_task: int = 6            # 1 = one shot, 6 = 6x100 (consultation, point 7)
     candidate_images_per_task: int = 4000
+    proposals_per_image: int = 50        # PROB offers 100; the top 50 by its own
+                                        # objectness order is what the frozen pool
+                                        # keeps, and it halves the export's size
 
     # --- the four experimental variables ----------------------------------
     arm: str = "prior_consult_batch"    # owl.selection.ARMS
@@ -225,15 +228,25 @@ def run_chain(
             checkpoint=checkpoint,
             output=task_dir / "proposals.npz",
             n_prev=0, n_current=task.n_prev,
+            max_proposals_per_image=config.proposals_per_image,
         )
         candidates = proposals.from_predict(export)
 
         # ---- 3. spend the budget ----------------------------------------
+        # Cluster once per task, not once per round. The partition depends only on
+        # the pool's geometry, which does not move while the budget is spent, and
+        # a k-means over 200,000 proposals costs minutes — at six rounds that is
+        # the difference between one evening and three.
+        task_partition = clustering.fit(
+            candidates.embeddings, method=arm.cluster_method,
+            n_clusters=config.n_clusters, seed=config.seed,
+        )
         picked = selection.select(
             candidates, arm,
             budget=config.budget_per_task,
             rounds=config.rounds_per_task,
             n_known=task.n_prev,
+            partition=task_partition,
         )
         opened = [str(v) for v in picked.images(candidates)]
         used_images.update(opened)
@@ -268,7 +281,7 @@ def run_chain(
             previous_checkpoint=checkpoint,
             output_checkpoint=task_dir / "checkpoint.pth",
             output_dir=task_dir / "train",
-            n_prev=task.n_prev, n_current=task.n_current,
+            n_prev=task.n_prev, n_current=task.n_new,
             replay_ids=memory.image_ids,
             supervision_mode=supervision,
             epochs=config.epochs, learning_rate=config.learning_rate,
@@ -279,7 +292,7 @@ def run_chain(
         metrics_path = bridge.evaluate(
             checkpoint=checkpoint, test_set=test_set,
             output=task_dir / "metrics.json",
-            n_prev=task.n_prev, n_current=task.n_current,
+            n_prev=task.n_prev, n_current=task.n_new,
         )
         evaluation = metrics.from_bridge_metrics(metrics_path)
         row = metrics.task_row(
@@ -305,6 +318,8 @@ def run_chain(
         )
         elapsed = bridge.cost_report()["total"]
         _write_rows(results, workspace / f"results_{config.arm}.csv")
+        print(f"  [{task.name}] {elapsed:.0f} min spent so far; "
+              f"{len(chain) - 1 - len(results)} tasks left")
 
     return results
 

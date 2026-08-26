@@ -19,6 +19,10 @@ taszkonként egy új osztállyal.
 GPU nélkül, adathalmaz nélkül, néhány perc alatt lefut, és végigmegy a kutatás minden
 kérdésén. Magyar magyarázat, angol kód.
 
+**Ha futtatni akarod, és nem csak olvasni:**
+[`docs/futtatas.md`](docs/futtatas.md) — négy lépés, sorrendben, a próbafutástól a valódi
+láncig.
+
 ```bash
 pip install -e ".[dev]"
 pytest -q                                  # 30 állítás, ~90 másodperc
@@ -174,6 +178,7 @@ notebooks/owod_active.ipynb   EGY notebook, mind a két üzemmóddal
 docs/konzultacio_2026-08-25_lefedettseg.md   a konzultáció pontról pontra: hol van, mi jött ki
 docs/method.md                a specifikáció: minden tag, minden súly, egy taszk lépésről lépésre
 docs/inkrementalis_baselinek.md   mihez mérjük magunkat, és mi az, ami még nincs kész
+docs/futtatas.md              mit kell csinálni, sorrendben, a próbafutástól a valódi láncig
 data/pool/                    a commitolt PROB-átfutás (60 MB)
 data/results/                 minden jelentett szám ide generálódik
 data/reference/measured/      korábbi valódi GPU-futások metrikái, hivatkozási pontnak

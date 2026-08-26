@@ -73,6 +73,19 @@ class Task:
     n_current: int                  # classes known after it
 
     @property
+    def n_new(self) -> int:
+        """Classes this task introduces.
+
+        PROB's evaluator takes ``--prev-introduced-classes`` and
+        ``--current-introduced-classes`` and adds them: ``seen = prev + current``.
+        So the second flag wants the *increment*, not the running total. Passing
+        :attr:`n_current` there would claim ``2 * n_prev + 1`` known classes and
+        every reported number would be wrong. This property is what the bridge
+        must be given, and ``tests`` pins the arithmetic.
+        """
+        return self.n_current - self.n_prev
+
+    @property
     def name(self) -> str:
         return f"t{self.index}"
 
