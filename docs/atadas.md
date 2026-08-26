@@ -98,8 +98,20 @@ eredményfejezete. Ezt kell lefuttatni.**
 
 A kiválasztás **nem tudja, melyik a bevezetendő osztály**, és nagyjából a véletlen szintjén
 találja meg (mért: 0,80× – 2,39×). Taszkonként 6–50 példányt talál; egy osztály ennyiből
-nem tanulható. Nyers erővel nem járható: 3,2%-os előfordulású osztályból ~300 példányhoz
-**~17 000 régió/taszk** kellene a mostani 600 helyett.
+nem tanulható. Nyers erővel nem járható. A jelöltkészlet mért előfordulási arányaiból, és abból, hogy
+600 régió 218–393 képet nyit meg:
+
+| cél (fire hydrant, 3,16% előfordulás) | megnyitandó kép | keret/taszk |
+|---:|---:|---:|
+| 50 példány | 1 444 | ~4 000 régió |
+| 100 példány | 2 889 | ~8 000 régió |
+| 300 példány | 8 666 | **~24 000 régió** |
+| 1 000 példány (a PROB saját t2-je ennyit lát) | 28 887 | ~80 000 régió |
+
+**A hatékonysági görbe három pontja már megvan** a valódi (nem cache-elt) taszkokból:
+10 példány → 0,00 · 20 → 0,00 · 50 → **0,70** · [PROB teljes t2: ~1000 → 36,13].
+Ez nem hiányzó eredmény, hanem *a terv által kért annotációs hatékonyság-görbe* első
+szakasza — és azt mondja, hogy 600 régiós kereten a plaszticitás nem elérhető.
 
 Három lehetséges válasz, döntés kell:
 - **(a)** cél-visszacsatolás: az első kör után az orákulum már megnevezett néhány példányt
@@ -171,6 +183,31 @@ hibák, és mindegyikhez tartozik teszt.
    PyTorch-tartalékon fut: **~3× lassabb** (mért: 2000 képes predict 23,1 perc a
    tartalékon, ~8 perc fordítva). A notebook most kiírja a valódi buildhibát és ennek
    megfelelően árazza a sessiont.
+
+---
+
+## 5b. HA KÖZBEN FUT EGY GPU-LÁNC — koordináció
+
+A felhasználó párhuzamosan futtathat egy Colab-láncot, miközben te dolgozol. **A notebook
+minden Run all-nál friss klónt húz a `main`-ről**, tehát amit pusholsz, azt a következő
+Run all felveszi. Ez két konkrét veszélyt jelent:
+
+1. **Ha megváltoztatod a `CycleConfig` bármely `RESULT_AFFECTING` mezőjének alapértékét,
+   vagy a notebook paraméter-celláját, a folyamatban lévő lánc munkakönyvtára
+   használhatatlan lesz** — a fingerprint-őr helyesen megtagadja a folytatást, és a
+   felhasználó órákat veszít.
+2. Egy félbehagyott arm újraindításához a paramétereknek **bitre azonosnak** kell lenniük.
+
+**Amíg fut egy lánc, ezekhez ne nyúlj:** `owl/runner.py` `CycleConfig` alapértékei, a
+notebook 2. (paraméter-) cellája, `owl/protocol.py` osztálysorrend, `owl/selection.py`
+`ARMS` szótár, `owl/evaluation_subset.py` `SHARED_TEST_SET`.
+
+**Amihez szabadon nyúlhatsz:** `docs/`, `tools/run_experiments.py` és a CPU-mérések,
+`tests/`, README, új modul amit még senki nem hív, és bármi, ami csak *olvassa* az
+eredményeket (`data/results/`, elemzés, ábrák, dolgozatszöveg).
+
+Ha mégis kell egy fingerprintet érintő változtatás: **előbb kérdezd meg a felhasználót,
+fut-e lánc**, és ha igen, várd meg vagy adj neki új munkakönyvtárnevet.
 
 ---
 
