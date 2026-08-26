@@ -53,6 +53,12 @@ COCO-ról szedi le futás közben, csak azokat, amiket a kiválasztás megnyit.
 
 ## 3. lépés — Próbafutás (30–45 perc, GPU)
 
+> A notebook minden cellája le van futtatva itt, a GPU-ág is, hamis PROB-bal
+> (`tools/dry_run_notebook.py`, és a tesztek között is fut). Ez azt bizonyítja, hogy a
+> vezérlés végigmegy — azt nem, hogy a valódi PROB elfogadja az argumentumokat. Ezért van
+> még mindig szükség erre a próbafutásra.
+
+
 Ez azt bizonyítja, hogy a teljes lánc működik: detektor-átfutás → kiválasztás →
 címkézés → replay → tanítás → kiértékelés. **Ne hagyd ki.** Egy elgépelt Drive-útvonal
 négy óra után is ugyanúgy kiderül, csak drágábban.
@@ -145,6 +151,8 @@ húsz-osztályos felállás **2931**-et fizetett — ezért van most taszkonkén
 | `BUILD FAILED` a kernelnél | nem végzetes, csak lassabb; menj tovább |
 | `PROB bridge 'train' is missing ...` | a PROB nem a `feat/daowod-bridge-v2` ágról jött; a `bridge.ensure_checkout` ezt kezeli, töröld a `/content/PROB` mappát és futtasd újra |
 | a session elvágódott | ugyanezekkel a paraméterekkel Run all — folytatja |
+| `unexpected keyword argument` bármelyik `owl` hívásban | a kernel a régi modult tartotta. **Runtime → Restart session**, aztán Run all: a notebook minden futásnál friss klónt húz és kiüríti a betöltött `owl` modulokat |
+| a Drive megtelt | a lánc taszkonként csak a két legutolsó checkpointot tartja meg (`keep_checkpoints`), armonként ~1 GB. Ha régebbi futásból maradtak, töröld a `MyDrive/OWL/work/` alatti régi arm-mappákat |
 | `NameError` a környezet-cellában | az előellenőrző cella nem futott le, vagy nem ment át. Görgess vissza a kimenetéhez: ott áll, mi hiányzik |
 | minden `new_mAP50` nulla | ez volt a régi baj. Ellenőrizd, hogy `LEARNING_RATE = 2e-4` és `EPOCHS = 5` — 2e-5-tel nem tanul |
 | `FileNotFoundError: .../JPEGImages/xxx.jpg` a `predict` alatt | egy jelöltkép nem töltődött le. A lánc taszkonként szedi le őket, és a nem elérhetőket kidobja — ha ez mégis előjön, a hálózat állt el a futás közben; Run all újra, folytatja |

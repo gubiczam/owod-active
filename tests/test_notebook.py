@@ -115,3 +115,36 @@ def test_the_smoke_test_only_shrinks_the_gpu_chain():
     exec(parameters.replace("RUN_GPU = True", "RUN_GPU = False"), namespace)  # noqa: S102
     assert namespace["N_TASKS"] == 10, "the CPU path must keep the full chain"
     assert namespace["BUDGET_PER_TASK"] == 600
+
+
+@pytest.mark.slow
+def test_the_whole_notebook_runs_with_prob_and_colab_faked(capsys):
+    """The end-to-end check: every cell, GPU branch, real owl, fake PROB.
+
+    Two of the three bugs that reached a live GPU session are caught here and
+    nowhere else, because both were failures of the *notebook* rather than of
+    any module in it. Takes a couple of minutes: it runs the real arm sweep over
+    the real 80,000-proposal pool, which is most of the cost and also most of
+    the value.
+    """
+
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+    import dry_run_notebook
+
+    dry_run_notebook.run(run_gpu=True, verbose=False)
+    assert "GPU branch: 3 tasks, 9 PROB calls" in capsys.readouterr().out
+
+
+@pytest.mark.slow
+def test_the_cpu_branch_runs_and_skips_the_chain(capsys):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+    import dry_run_notebook
+
+    dry_run_notebook.run(run_gpu=False, verbose=False)
+    assert "GPU chain correctly skipped" in capsys.readouterr().out

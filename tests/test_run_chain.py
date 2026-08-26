@@ -267,6 +267,35 @@ def test_a_resumed_run_refetches_nothing_and_retrains_nothing(tmp_path, index, c
     assert fetches == [], "a cached detector pass must not trigger a download"
 
 
+def test_old_checkpoints_are_pruned_so_drive_does_not_fill(tmp_path, index, config):
+    """478 MB each x nine tasks x three arms fills a free Drive."""
+
+    from dataclasses import replace
+
+    fake = FakeBridge()
+    runner.run_chain(
+        fake, replace(config, keep_checkpoints=2), workspace=tmp_path,
+        candidate_index=index, start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+    )
+    surviving = sorted(p.name for p in tmp_path.rglob("checkpoint.pth"))
+    assert len(surviving) == 2, f"expected two checkpoints, found {surviving}"
+    # and the metrics of every task are still there, which is what resume reads
+    assert len(list(tmp_path.rglob("metrics.json"))) == 3
+
+
+def test_keeping_every_checkpoint_is_still_possible(tmp_path, index, config):
+    from dataclasses import replace
+
+    fake = FakeBridge()
+    runner.run_chain(
+        fake, replace(config, keep_checkpoints=0), workspace=tmp_path,
+        candidate_index=index, start_checkpoint=tmp_path / "t1.pth", test_set="eval",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+    )
+    assert len(list(tmp_path.rglob("checkpoint.pth"))) == 3
+
+
 def test_the_time_budget_stops_the_chain_and_says_what_it_skipped(tmp_path, index, config, capsys):
     fake = FakeBridge()
     results = runner.run_chain(

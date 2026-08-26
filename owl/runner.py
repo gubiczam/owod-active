@@ -59,6 +59,12 @@ class CycleConfig:
     n_clusters: int = 1600
     seed: int = 0
 
+    #: How many task checkpoints to keep. Each is 478 MB, so a nine-task chain
+    #: writes 4.3 GB and three arms fill a free Drive. Two is the minimum that
+    #: keeps a resumed session working: the one a task starts from, and the one
+    #: it produced. Set to 0 to keep every checkpoint.
+    keep_checkpoints: int = 2
+
     def describe(self) -> dict[str, object]:
         return asdict(self)
 
@@ -212,6 +218,7 @@ def run_chain(
     memory = replay.Memory((), {}, 0.0, 0)
     checkpoint = Path(start_checkpoint)
     results: list[TaskResult] = []
+    written: list[Path] = []
     previous_baseline: float | None = None
     elapsed = 0.0
 
@@ -342,10 +349,33 @@ def run_chain(
         )
         elapsed = bridge.cost_report()["total"]
         _write_rows(results, workspace / f"results_{config.arm}.csv")
+        written.append(Path(checkpoint))
+        freed = _prune_checkpoints(written, config.keep_checkpoints)
         print(f"  [{task.name}] {elapsed:.0f} min spent so far; "
-              f"{len(chain) - 1 - len(results)} tasks left")
+              f"{len(chain) - 1 - len(results)} tasks left"
+              + (f"; freed {freed / 1e9:.1f} GB of checkpoints" if freed else ""))
 
     return results
+
+
+def _prune_checkpoints(written: list[Path], keep: int) -> int:
+    """Delete all but the newest ``keep`` checkpoints. Returns bytes freed.
+
+    A resumed run needs the checkpoint a task starts from and the one it wrote,
+    and nothing older — the metrics of every earlier task are already on disk.
+    Keeping all of them costs 478 MB each, which is what fills a free Drive
+    somewhere in the third arm and stops the chain for a reason that has nothing
+    to do with the research.
+    """
+
+    if keep <= 0:
+        return 0
+    freed = 0
+    for path in written[:-keep]:
+        if path.exists():
+            freed += path.stat().st_size
+            path.unlink()
+    return freed
 
 
 def _write_rows(results: Sequence[TaskResult], path: Path) -> None:

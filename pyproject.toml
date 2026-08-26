@@ -22,3 +22,6 @@ target-version = "py310"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: executes every notebook cell with PROB and Colab faked (a few minutes)",
+]

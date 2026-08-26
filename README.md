@@ -25,9 +25,17 @@ láncig.
 
 ```bash
 pip install -e ".[dev]"
-pytest -q                                  # 30 állítás, ~90 másodperc
+pytest -q -m "not slow"                    # 53 állítás, ~80 másodperc
+pytest -q -m slow                          # a notebook minden cellája, ~4 perc
 python tools/run_experiments.py --seeds 3  # minden szám újraszámolva
+python tools/dry_run_notebook.py           # a notebook minden cellája, hamis PROB-bal
 ```
+
+Az utolsó sor a lényeges: a notebook **teljes GPU-ága végigfut itt**, GPU nélkül —
+`google.colab`, a hálózat és a PROB-bridge kicserélve, minden más a valódi kód a valódi
+adaton. Két olyan hiba, ami különben csak egy élő Colab-sessionben derült ki, itt derül ki
+másodpercek alatt: mind a kettő a *notebook* hibája volt, nem valamelyik modulé, és ezért
+egyetlen unit teszt sem látta őket.
 
 Azért fut GPU nélkül, mert a detektor **egyszer** futott le, offline: a commitolt
 `data/pool/sowodb_t1_frozen_pool.npz` a PROB `t1.pth` checkpointjának egyetlen
