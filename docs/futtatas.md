@@ -155,4 +155,5 @@ húsz-osztályos felállás **2931**-et fizetett — ezért van most taszkonkén
 | a Drive megtelt | a lánc taszkonként csak a két legutolsó checkpointot tartja meg (`keep_checkpoints`), armonként ~1 GB. Ha régebbi futásból maradtak, töröld a `MyDrive/OWL/work/` alatti régi arm-mappákat |
 | `NameError` a környezet-cellában | az előellenőrző cella nem futott le, vagy nem ment át. Görgess vissza a kimenetéhez: ott áll, mi hiányzik |
 | minden `new_mAP50` nulla | ez volt a régi baj. Ellenőrizd, hogy `LEARNING_RATE = 2e-4` és `EPOCHS = 5` — 2e-5-tel nem tanul |
+| `FileNotFoundError: .../ImageSets/OWDETR/owod_all_task_test.txt` | a PROB a saját alapértelmezett teszt-splitjét kereste. Javítva: a `train` most átadja a közös teszthalmazt. Ha mégis előjön, régi klónból fut — **Runtime → Restart session**, Run all |
 | `FileNotFoundError: .../JPEGImages/xxx.jpg` a `predict` alatt | egy jelöltkép nem töltődött le. A lánc taszkonként szedi le őket, és a nem elérhetőket kidobja — ha ez mégis előjön, a hálózat állt el a futás közben; Run all újra, folytatja |

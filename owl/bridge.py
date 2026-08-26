@@ -46,9 +46,11 @@ class Bridge:
     dataset: str = "OWDETR"
     device: str = "cuda"
     num_workers: int = 2
+    seed: int = 0
     log_dir: Path | None = None
     dry_run: bool = False
     calls: list[dict] = field(default_factory=list, repr=False)
+    commands: list[list[str]] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         self.prob_root = Path(self.prob_root)
@@ -126,11 +128,14 @@ class Bridge:
         output_dir: Path,
         n_prev: int,
         n_current: int,
+        test_set: str,
         replay_ids: Sequence[str] = (),
         supervision_mode: str = "ft",
         epochs: int = 5,
         learning_rate: float = 2e-4,
         batch_size: int = 2,
+        eval_every: int = 10**6,
+        freeze_prob_model: bool = True,
     ) -> Path:
         """One incremental step. Cached on ``output_checkpoint``.
 
@@ -138,6 +143,27 @@ class Bridge:
         present in the selected images. The alternative, ``'train'``, drops them
         — which is what made forgetting look catastrophic in the earlier work,
         and is kept only so that comparison can be re-run.
+
+        **Two PROB defaults must not be left alone, and both are required here
+        rather than optional.**
+
+        ``test_set`` — PROB builds a validation dataset while training and its
+        default names ``owod_all_task_test``, a split file this protocol never
+        writes. Leaving it unset fails with a ``FileNotFoundError`` from inside
+        PROB's dataset constructor, after the training images have been loaded.
+
+        ``eval_every`` — PROB's default is **1**, so it evaluates after every
+        epoch. Evaluation is the expensive half of this protocol; five epochs
+        would mean five unwanted evaluations per task and roughly five times the
+        wall clock. Evaluation here is a separate, deliberate call, so this
+        defaults to a number the training loop cannot reach.
+
+        ``freeze_prob_model`` keeps PROB's probabilistic-objectness head fixed
+        while the rest of the detector adapts, which is what PROB's own
+        fine-tuning stage does. It agrees with PROB's default, and it is passed
+        explicitly anyway: it decides whether "unknown" means the same thing
+        after an incremental step as before it, and a choice that consequential
+        should be visible on the command line rather than inherited.
         """
 
         output_checkpoint = Path(output_checkpoint)
@@ -151,9 +177,12 @@ class Bridge:
             "--output-checkpoint", str(output_checkpoint),
             "--output-dir", str(output_dir),
             "--supervision-mode", supervision_mode,
+            "--test-set", test_set,
             "--epochs", str(epochs),
             "--learning-rate", str(learning_rate),
             "--batch-size", str(batch_size),
+            "--eval-every", str(eval_every),
+            "--freeze-prob-model" if freeze_prob_model else "--no-freeze-prob-model",
         ]
         if len(replay_ids):
             replay_file = self._write_ids(replay_ids, Path(output_dir) / "replay_ids.txt")
@@ -210,8 +239,10 @@ class Bridge:
             "--current-introduced-classes", str(n_current),
             "--device", self.device,
             "--num-workers", str(self.num_workers),
+            "--seed", str(self.seed),
             *arguments,
         ]
+        self.commands.append(command)
         if self.dry_run:
             self._note(verb, Path(label), cached=False, dry=True, command=command)
             return

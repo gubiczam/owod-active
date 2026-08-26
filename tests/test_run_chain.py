@@ -62,8 +62,14 @@ class FakeBridge:
         return output
 
     def train(self, labelled_ids, *, previous_checkpoint, output_checkpoint, output_dir,
-              n_prev, n_current, replay_ids=(), supervision_mode="ft", epochs=1,
-              learning_rate=2e-4, batch_size=1):
+              n_prev, n_current, test_set, replay_ids=(), supervision_mode="ft",
+              epochs=1, learning_rate=2e-4, batch_size=1, eval_every=10**6):
+        # PROB reads a validation split during training and its default names a
+        # file this protocol never writes, so a caller that omits this is broken.
+        assert test_set, "train was not told which test set to build the val loader from"
+        assert eval_every > epochs, (
+            "PROB would evaluate inside the training loop; evaluation is the "
+            "expensive half of this protocol and is a separate call here")
         self.calls.append({
             "verb": "train", "images": list(labelled_ids), "replay": list(replay_ids),
             "n_prev": n_prev, "n_current": n_current, "supervision": supervision_mode,

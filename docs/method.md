@@ -125,6 +125,14 @@ tail-objektum 47%-os aránynál.
 6. **Finomhangolás** (`bridge.train`). `--supervision-mode ft` megtartja az előző taszkok
    dobozait a kiválasztott képeken; `train` eldobja őket. A `box_only` szabály a `train`-re
    képződik le, a másik kettő az `ft`-re.
+
+   Öt PROB-alapértéket **nem** hagyunk magára, és a `tests/test_bridge_flags.py` rögzíti,
+   hogy melyiket miért: a `--test-set` alapból egy olyan split-fájlt nevez meg, amit ez a
+   protokoll soha nem ír; az `--eval-every` alapból **1**, vagyis minden epoch után
+   kiértékelne, holott a kiértékelés a protokoll drága fele és itt külön, szándékos hívás;
+   a `--learning-rate` alapból 2e-5, amivel a korábbi munka 0,010 új-osztály mAP50-et mért;
+   az `--epochs` alapból 1; a `--seed` pedig egyáltalán nem jutott át, tehát a
+   `SEED = 1`-es futás is 0-val keveredett volna.
 7. **Kiértékelés** (`bridge.evaluate`) a közös, csökkentett teszthalmazon.
 
 Minden hívás újraindítható: ha a kimenet létezik, a hívás kimarad.

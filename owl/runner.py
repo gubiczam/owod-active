@@ -313,6 +313,7 @@ def run_chain(
             output_checkpoint=task_dir / "checkpoint.pth",
             output_dir=task_dir / "train",
             n_prev=task.n_prev, n_current=task.n_new,
+            test_set=test_set,
             replay_ids=memory.image_ids,
             supervision_mode=supervision,
             epochs=config.epochs, learning_rate=config.learning_rate,

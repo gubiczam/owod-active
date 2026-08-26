@@ -94,7 +94,13 @@ class FakeBridge:
         return output
 
     def train(self, labelled_ids, *, previous_checkpoint, output_checkpoint, output_dir,
-              n_prev, n_current, replay_ids=(), supervision_mode="ft", **_):
+              n_prev, n_current, test_set, replay_ids=(), supervision_mode="ft",
+              eval_every=10**6, **_):
+        assert test_set, "train was not told which test set to build the val loader from"
+        split = self.data_root / "ImageSets" / "OWDETR" / f"{test_set}.txt"
+        assert split.exists(), (
+            f"PROB train would fail: it builds a validation dataset from {split}, "
+            "which does not exist")
         assert Path(previous_checkpoint).exists(), (
             f"PROB train would fail: no checkpoint at {previous_checkpoint}")
         for image_id in list(labelled_ids) + list(replay_ids):
@@ -102,7 +108,8 @@ class FakeBridge:
                 f"PROB train would fail: no annotation for {image_id}")
         self.calls.append({"verb": "train", "images": list(labelled_ids),
                            "replay": list(replay_ids), "n_prev": n_prev,
-                           "n_current": n_current, "supervision": supervision_mode})
+                           "n_current": n_current, "supervision": supervision_mode,
+                           "test_set": test_set})
         output_checkpoint = Path(output_checkpoint)
         output_checkpoint.parent.mkdir(parents=True, exist_ok=True)
         Path(output_dir).mkdir(parents=True, exist_ok=True)
