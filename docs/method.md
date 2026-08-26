@@ -156,6 +156,17 @@ Minden hívás újraindítható: ha a kimenet létezik, a hívás kimarad.
 
 A PROB saját `OWEvaluator`-a. Taszkonként kiírt számok:
 
+**A per-osztály AP50 ott van, csak nem kézenfekvő helyen.** A bridge nem ír
+`per_class_AP50` kulcsot — viszont ír `coco_eval_bbox`-ot, és az a vektor
+`[mAP, mAP, <80 osztály a kiértékelő sorrendjében>, unknown]`, összesen 83 elem. Ez azért
+számít, mert a **head/medium/tail bontás a kutatási terv megkülönböztető eleme**, és
+per-osztály számok nélkül egyáltalán nem számolható. Az igazítás három commitolt
+GPU-futáson ellenőrizve: a `CLASS_ORDER[:prev]` átlaga pontosan visszaadja a
+`previous_known_AP50`-t, a `CLASS_ORDER[prev:prev+curr]` átlaga a `current_known_AP50`-t,
+az utolsó elem pedig az `unknown_AP50`-t. Rossz hosszú vektorra a
+`metrics.per_class_ap50` üres szótárat ad, nem tippel: egy elcsúszott per-osztály tábla az
+egyik osztály pontszámát a másiknak tulajdonítaná, és a csoportbontás csendben hibás lenne.
+
 | metrika | mit válaszol meg |
 |---|---|
 | `known_mAP50` | mennyit tud összesen |
@@ -164,6 +175,7 @@ A PROB saját `OWEvaluator`-a. Taszkonként kiírt számok:
 | `U_Recall50` | felismeri-e egyáltalán, hogy valami ismeretlen |
 | `forgetting` | `prev_mAP50` esése az előző taszk mérése óta |
 | `exchange_rate` | **hány régi mAP-pontot fizettünk egy új pontért** |
+| `mAP50_head` / `_medium` / `_tail` | **melyik gyakorisági csoportot veszíti el** — a terv megkülönböztető mérése |
 
 A csereárfolyam a döntő szám. A teljes t2-felügyelet 0,20-at fizet. Egy futás, ami 74-et
 fizet, nem cserél, hanem veszít.

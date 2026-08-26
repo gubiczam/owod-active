@@ -233,11 +233,7 @@ def from_bridge_metrics(path, *, class_names=None) -> Evaluation:
 
     payload = json.loads(_Path(path).read_text(encoding="utf-8"))
     official = payload.get("official_metrics", {})
-    per_class = {
-        name: float(value)
-        for name, value in payload.get("per_class_AP50", {}).items()
-        if class_names is None or name in class_names
-    }
+    per_class = per_class_ap50(payload, class_names=class_names)
     return Evaluation(
         known_map50=float(payload.get("known_AP50", payload.get("known_mAP", 0.0))),
         unknown_recall50=float(payload.get("U_Recall", 0.0)),
@@ -253,6 +249,57 @@ def from_bridge_metrics(path, *, class_names=None) -> Evaluation:
 
 def _optional(value) -> float | None:
     return None if value is None else float(value)
+
+
+#: Where per-class AP50 actually lives. The bridge writes no ``per_class_AP50``
+#: key, but it does write ``coco_eval_bbox``, and that vector is
+#: ``[mAP, mAP, <80 classes in the evaluator's order>, unknown]`` — 83 entries.
+#:
+#: This matters more than it looks: the head/medium/tail decomposition is the
+#: research plan's distinguishing form of evaluation, and without per-class
+#: numbers it cannot be computed at all. It was available in every metrics file
+#: already. Verified against three committed GPU runs: the mean over
+#: ``CLASS_ORDER[:prev]`` reproduces ``previous_known_AP50`` exactly, the mean
+#: over ``CLASS_ORDER[prev:prev + current]`` reproduces ``current_known_AP50``,
+#: and the last entry reproduces ``unknown_AP50``.
+COCO_EVAL_BBOX_OFFSET = 2
+COCO_EVAL_BBOX_CLASSES = 80
+
+
+def per_class_ap50(payload: Mapping[str, object], *, class_names=None) -> dict[str, float]:
+    """AP50 per class name, read out of ``coco_eval_bbox``.
+
+    Falls back to a ``per_class_AP50`` mapping if a future bridge writes one.
+    Returns an empty mapping rather than guessing when the vector is the wrong
+    length, because a misaligned per-class table is worse than none: it would
+    attribute one class's score to another and the head/medium/tail split would
+    be quietly wrong.
+    """
+
+    explicit = payload.get("per_class_AP50")
+    if isinstance(explicit, Mapping) and explicit:
+        return {
+            str(name): float(value) for name, value in explicit.items()
+            if class_names is None or name in class_names
+        }
+
+    from owl.protocol import CLASS_ORDER
+
+    vector = payload.get("coco_eval_bbox") or []
+    expected = COCO_EVAL_BBOX_OFFSET + COCO_EVAL_BBOX_CLASSES + 1
+    if len(vector) != expected:
+        return {}
+
+    start = COCO_EVAL_BBOX_OFFSET
+    values = vector[start : start + COCO_EVAL_BBOX_CLASSES]
+    result = {
+        name: float(value)
+        for name, value in zip(CLASS_ORDER, values)
+        if class_names is None or name in class_names
+    }
+    if class_names is None or "unknown" in class_names:
+        result["unknown"] = float(vector[-1])
+    return result
 
 
 # ------------------------------------------------- the chain's reporting row ---

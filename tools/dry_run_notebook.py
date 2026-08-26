@@ -178,7 +178,8 @@ class FakeBridge:
         output.write_text(json.dumps({
             "known_AP50": 60.0 - step, "U_Recall": 20.0 - step,
             "previous_known_AP50": 70.0 - 2 * step, "current_known_AP50": 3.0 + step,
-            "unknown_AP50": 0.4, "WI": 0.03, "A_OSE": 1200, "per_class_AP50": {},
+            "unknown_AP50": 0.4, "WI": 0.03, "A_OSE": 1200,
+            "coco_eval_bbox": [30.0, 30.0, *[float(i % 40) for i in range(80)], 0.4],
         }), encoding="utf-8")
         return output
 

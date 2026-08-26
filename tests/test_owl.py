@@ -392,3 +392,67 @@ def test_the_exchange_rate_reproduces_the_measured_gpu_runs():
     )
     assert full_rate == pytest.approx(0.203, abs=0.01)
     assert random_rate > 1000
+
+
+def test_per_class_ap50_is_read_out_of_the_vector_the_bridge_actually_writes():
+    """The bridge writes no per_class_AP50 key. It writes coco_eval_bbox.
+
+    Without per-class numbers the head/medium/tail decomposition — the research
+    plan's distinguishing form of evaluation — cannot be computed at all. It was
+    available in every metrics file already, in a vector shaped
+    ``[mAP, mAP, <80 classes>, unknown]``.
+    """
+
+    import json
+
+    root = protocol.GROUPS_PATH.parent / "measured"
+    payload = json.loads(
+        (root / "full_t2_supervision_metrics.json").read_text(encoding="utf-8")
+    )
+    assert "per_class_AP50" not in payload
+    per_class = metrics.per_class_ap50(payload)
+    assert len(per_class) == 81                      # 80 classes plus unknown
+    assert per_class["unknown"] == pytest.approx(payload["unknown_AP50"], abs=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("filename", "n_prev", "n_current"),
+    [
+        ("full_t2_supervision_metrics.json", 19, 21),
+        ("random_b600_metrics.json", 19, 21),
+        ("objectness_prior_b600_metrics.json", 19, 21),
+    ],
+)
+def test_the_per_class_vector_reproduces_the_reported_aggregates(filename, n_prev, n_current):
+    """The alignment check. A misaligned table would attribute one class's score
+    to another and the head/medium/tail split would be quietly wrong."""
+
+    import json
+    from statistics import mean
+
+    root = protocol.GROUPS_PATH.parent / "measured"
+    payload = json.loads((root / filename).read_text(encoding="utf-8"))
+    per_class = metrics.per_class_ap50(payload)
+    scores = [per_class[name] for name in protocol.CLASS_ORDER]
+
+    assert mean(scores[:n_prev]) == pytest.approx(payload["previous_known_AP50"], abs=1e-3)
+    assert mean(scores[n_prev : n_prev + n_current]) == pytest.approx(
+        payload["current_known_AP50"], abs=1e-3
+    )
+    assert mean(scores[: n_prev + n_current]) == pytest.approx(payload["known_AP50"], abs=1e-3)
+
+
+def test_a_wrong_length_vector_yields_nothing_rather_than_a_guess():
+    assert metrics.per_class_ap50({"coco_eval_bbox": [1.0, 2.0, 3.0]}) == {}
+    assert metrics.per_class_ap50({}) == {}
+
+
+def test_the_frequency_split_of_a_real_run_is_computable():
+    """The plan's headline evaluation, on a measured checkpoint."""
+
+    root = protocol.GROUPS_PATH.parent / "measured"
+    evaluation = metrics.from_bridge_metrics(root / "full_t2_supervision_metrics.json")
+    membership = metrics.group_membership(protocol.CLASS_ORDER[:40], protocol.load_groups())
+    grouped = metrics.grouped_map(evaluation, membership)
+    assert set(grouped) == {"head", "medium", "tail"}
+    assert all(value is not None and value > 0 for value in grouped.values())

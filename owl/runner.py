@@ -212,6 +212,7 @@ def run_chain(
     """
 
     chain = chain or protocol.build_chain(config.n_tasks)
+    groups = protocol.load_groups()
     workspace = Path(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "config.json").write_text(json.dumps(config.describe(), indent=2), encoding="utf-8")
@@ -391,9 +392,13 @@ def run_chain(
             n_prev=task.n_prev, n_current=task.n_new,
         )
         evaluation = metrics.from_bridge_metrics(metrics_path)
+        # The head/medium/tail split is the research plan's distinguishing form
+        # of evaluation, and it needs per-class AP50 — which lives in the metrics
+        # file's coco_eval_bbox vector. See owl.metrics.per_class_ap50.
         row = metrics.task_row(
             evaluation, task=task.name, new_class=task.new_class,
             previous_baseline=previous_baseline,
+            groups=metrics.group_membership(task.known_classes, groups),
         )
         row["exchange_rate"] = metrics.exchange_rate(row)
         previous_baseline = evaluation.known_map50

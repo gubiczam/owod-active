@@ -95,7 +95,10 @@ class FakeBridge:
         output.write_text(json.dumps({
             "known_AP50": 40.0, "U_Recall": 20.0, "WI": 0.03, "A_OSE": 1000,
             "previous_known_AP50": 60.0, "current_known_AP50": 5.0,
-            "unknown_AP50": 0.5, "per_class_AP50": {},
+            "unknown_AP50": 0.5,
+            # the real bridge writes no per_class_AP50; it writes this vector,
+            # shaped [mAP, mAP, <80 classes>, unknown]
+            "coco_eval_bbox": [30.0, 30.0, *[float(i % 40) for i in range(80)], 0.5],
         }), encoding="utf-8")
         return output
 
@@ -442,6 +445,20 @@ def test_the_time_budget_stops_the_chain_and_says_what_it_skipped(tmp_path, inde
     )
     assert len(results) < 3
     assert "Not run:" in capsys.readouterr().out
+
+
+def test_the_frequency_split_reaches_the_reported_row(tmp_path, index, config):
+    """head/medium/tail is the plan's distinguishing evaluation; it must be in the table."""
+
+    fake = FakeBridge()
+    results = runner.run_chain(
+        fake, config, workspace=tmp_path, candidate_index=index,
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+    )
+    for row in results:
+        flat = row.flat()
+        assert any(key.startswith("mAP50_") for key in flat), flat.keys()
 
 
 def test_the_chain_writes_its_rows_as_it_goes(tmp_path, index, config):
