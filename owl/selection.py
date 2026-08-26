@@ -30,7 +30,6 @@ from owl import scoring
 from owl.proposals import Candidates
 from owl.scoring import ScoreConfig, Terms
 
-
 #: How many candidates per budget slot compete in the greedy batch-diversity
 #: pass. Twenty is enough room for redundancy to reorder a batch and small
 #: enough that the pass costs seconds rather than minutes.

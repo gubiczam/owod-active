@@ -110,6 +110,7 @@ def build(
     alpha: float = 0.0,
     seed: int = 0,
     selector: str = "greedy",
+    priority: Sequence[str] | None = None,
 ) -> Memory:
     """Choose the images that satisfy the allocation as closely as possible.
 
@@ -120,6 +121,10 @@ def build(
     ``greedy`` repeatedly takes the image that covers the most still-unmet
     demand, which is a set-cover heuristic and reaches the target with far fewer
     images than sampling per class. ``random`` is the control.
+
+    ``priority`` optionally orders the images before selection — pass the output
+    of :func:`herding_order` to get iCaRL's criterion instead of set cover. The
+    allocation rule is unchanged either way, so the two are one variable apart.
     """
 
     counts: dict[str, int] = {name: 0 for name in known_classes}
@@ -134,6 +139,9 @@ def build(
 
     generator = np.random.default_rng(seed)
     image_ids = sorted(per_image_classes)
+    if priority is not None:
+        ranked = {str(name): rank for rank, name in enumerate(priority)}
+        image_ids = sorted(image_ids, key=lambda name: ranked.get(name, len(ranked)))
 
     if selector == "random":
         chosen = generator.permutation(np.asarray(image_ids, dtype=object))
@@ -156,6 +164,19 @@ def build(
 
     remaining = dict(demand)
     picked = []
+    if priority is not None:
+        # the order is the decision; walk it and keep whatever still helps
+        for image in image_ids:
+            if not any(remaining.get(name, 0) > 0 for name in per_image_classes[image]):
+                continue
+            picked.append(image)
+            for name, number in per_image_classes[image].items():
+                if name in remaining:
+                    remaining[name] = max(0, remaining[name] - number)
+            if not any(remaining.values()):
+                break
+        return Memory(tuple(picked), demand, alpha, total)
+
     order = generator.permutation(len(image_ids))  # break ties without bias
     pool = [image_ids[i] for i in order]
     while any(value > 0 for value in remaining.values()):
@@ -176,6 +197,40 @@ def build(
                 remaining[name] = max(0, remaining[name] - number)
 
     return Memory(tuple(picked), demand, alpha, total)
+
+
+def herding_order(embeddings: np.ndarray) -> np.ndarray:
+    """iCaRL's exemplar criterion: keep the set whose mean tracks the class mean.
+
+    Repeatedly take the item that moves the running mean of what is already kept
+    closest to the class mean. The result is an *ordering*, so a memory of any
+    size is a prefix of it — which is the property iCaRL relies on when the
+    per-class budget shrinks as new classes arrive.
+
+    This is the one place where a standard incremental-learning method is
+    reproduced rather than referenced. It is the exemplar-*selection* half of
+    iCaRL; the nearest-mean-of-exemplars classifier is not applicable here,
+    because the detector's own head does the classifying.
+    """
+
+    embeddings = np.asarray(embeddings, dtype=np.float64)
+    if embeddings.shape[0] == 0:
+        return np.empty(0, dtype=np.int64)
+
+    target = embeddings.mean(axis=0)
+    running = np.zeros_like(target)
+    remaining = np.ones(embeddings.shape[0], dtype=bool)
+    order: list[int] = []
+    for step in range(1, embeddings.shape[0] + 1):
+        # distance from the class mean if each remaining item were taken next
+        candidate = (running + embeddings) / step
+        distance = np.linalg.norm(candidate - target, axis=1)
+        distance[~remaining] = np.inf
+        pick = int(np.argmin(distance))
+        order.append(pick)
+        remaining[pick] = False
+        running = running + embeddings[pick]
+    return np.asarray(order, dtype=np.int64)
 
 
 def carry_forward(previous: Memory, new_images: Sequence[str], *, reallocate: bool) -> tuple[str, ...]:
@@ -199,4 +254,6 @@ ARMS: dict[str, dict] = {
     "tail_favouring": {"total": 400, "alpha": -0.5},
     "tail_inverted": {"total": 400, "alpha": -1.0},
     "random_images": {"total": 400, "alpha": 0.0, "selector": "random"},
+    "herding": {"total": 400, "alpha": 0.0, "selector": "herding"},
+    "herding_tail": {"total": 400, "alpha": -0.5, "selector": "herding"},
 }

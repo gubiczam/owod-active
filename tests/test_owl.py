@@ -5,8 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from owl import clustering, labelling, metrics, protocol, proposals, replay, scoring, selection
-
+from owl import clustering, labelling, metrics, proposals, protocol, replay, scoring, selection
 
 # ------------------------------------------------------------------ protocol ---
 
@@ -273,6 +272,31 @@ def test_greedy_memory_covers_the_allocation_with_fewer_images_than_random():
     greedy = replay.build(per_image, ("a", "b", "c"), total=60, alpha=0.0, selector="greedy")
     sampled = replay.build(per_image, ("a", "b", "c"), total=60, alpha=0.0, selector="random")
     assert 0 < len(greedy) <= len(sampled)
+
+
+def test_herding_tracks_the_class_mean_better_than_sampling():
+    """iCaRL's exemplar criterion, reproduced here rather than cited."""
+    generator = np.random.default_rng(0)
+    points = np.vstack([generator.normal(0, 1, (50, 8)), generator.normal(5, 1, (50, 8))])
+    order = replay.herding_order(points)
+    assert sorted(order.tolist()) == list(range(100))       # it is a permutation
+
+    target = points.mean(axis=0)
+    for size in (5, 10, 20):
+        herded = np.linalg.norm(points[order[:size]].mean(axis=0) - target)
+        sampled = np.mean([
+            np.linalg.norm(points[generator.choice(100, size, replace=False)].mean(0) - target)
+            for _ in range(100)
+        ])
+        assert herded < sampled / 2, size
+
+
+def test_herding_prefixes_are_nested():
+    """A shrinking per-class budget has to be a prefix, not a re-selection."""
+    generator = np.random.default_rng(1)
+    points = generator.normal(0, 1, (40, 6))
+    order = replay.herding_order(points)
+    assert order[:5].tolist() == order[:10].tolist()[:5]
 
 
 def test_memory_carry_forward_versus_reallocation():

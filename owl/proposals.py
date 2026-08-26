@@ -86,7 +86,7 @@ class Candidates:
     def has_oracle(self) -> bool:
         return self._oracle is not None
 
-    def take(self, index: np.ndarray) -> "Candidates":
+    def take(self, index: np.ndarray) -> Candidates:
         """A sub-pool. ``index`` may be a boolean mask or an integer array."""
         oracle = None
         if self._oracle is not None:

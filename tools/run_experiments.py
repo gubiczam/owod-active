@@ -25,7 +25,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from owl import clustering, labelling, protocol, proposals, selection  # noqa: E402
+from owl import clustering, labelling, proposals, protocol, selection
 
 RESULTS = Path(__file__).resolve().parent.parent / "data" / "results"
 

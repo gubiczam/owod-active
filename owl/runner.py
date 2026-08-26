@@ -24,12 +24,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 
-from owl import clustering, labelling, metrics, protocol, proposals, replay, selection
+from owl import clustering, labelling, metrics, proposals, protocol, replay, selection
 from owl.bridge import Bridge
 
 

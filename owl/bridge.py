@@ -255,7 +255,7 @@ class Bridge:
 
     @staticmethod
     def _run_capture(command: list[str]) -> str:
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             raise BridgeError(f"{' '.join(command)} failed:\n{result.stdout}\n{result.stderr}")
         return result.stdout

@@ -90,7 +90,7 @@ def build(
     required = sorted({image_id for ids in by_class.values() for image_id in ids})
     if not required:
         raise EvaluationSubsetError("No test image contains a declared class.")
-    remaining = sorted(set(str(value) for value in annotations) - set(required))
+    remaining = sorted({str(value) for value in annotations} - set(required))
     sample_count = min(len(remaining), len(required) * remainder_multiplier)
     sampled = sorted(random.Random(seed).sample(remaining, sample_count))
     image_ids = tuple(sorted([*required, *sampled]))

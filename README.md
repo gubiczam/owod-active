@@ -19,7 +19,7 @@ kérdésén. Magyar magyarázat, angol kód.
 
 ```bash
 pip install -e ".[dev]"
-pytest -q                                  # 28 állítás, ~5 perc
+pytest -q                                  # 30 állítás, ~90 másodperc
 python tools/run_experiments.py --seeds 3  # minden szám újraszámolva
 ```
 
@@ -108,6 +108,20 @@ saját ismert osztályait 0,83 pontossággal maga felcímkézi — és utólag e
 | 1600 | 50 | 0,028 | 0,116 |
 | 3200 | 25 | 0,016 | 0,093 |
 
+### Mihez mérjük magunkat
+
+A replay-oldali inkrementális módszerek mind ugyanazon a protokollon futnak itt, egyik sem
+másik cikk jelentett számából van átemelve: naiv fine-tune (alsó korlát), megtartott
+annotációval, random exemplar-replay, **iCaRL herding**
+(`replay.herding_order` — az exemplar-válogatás fele, implementálva és tesztelve),
+egyenletes allokáció (a mai standard), és a mi eloszlás-tudatos allokációnk. Felső korlát
+a PROB saját teljes t2-tanítása.
+
+Ami **nincs kész, és ezt ki is mondjuk**: LwF, EWC és BiC a PROB veszteségfüggvényébe
+nyúlna; a WA (Weight Aligning) tiszta checkpoint-műtét és a következő lépés, de csak azután,
+hogy egy valódi GPU-futáson ellenőriztük a fej szerkezetét.
+A teljes tábla: [`docs/inkrementalis_baselinek.md`](docs/inkrementalis_baselinek.md).
+
 ---
 
 ## Miért taszkonként egy osztály
@@ -148,7 +162,7 @@ owl/                 tíz modul, modulonként egy fogalom
   scoring.py         s(x) négy tagja és maga a pontszám
   selection.py       a keret elköltése: körök, batch-diverzitás, a regisztrált armok
   labelling.py       mit címkéztetünk egy kiválasztott képen, és mibe kerül
-  replay.py          az exemplar-memória és az eloszlás-tudatos allokációja
+  replay.py          az exemplar-memória, az eloszlás-tudatos allokáció és iCaRL herding
   metrics.py         a PROB kiértékelője; felejtés, tanulás, csereárfolyam
   bridge.py          a PROB hívása — az egyetlen modul, ami tud a GPU-ról
   runner.py          a ciklus: szimulálva vagy élesben
@@ -156,6 +170,8 @@ owl/                 tíz modul, modulonként egy fogalom
 
 notebooks/owod_active.ipynb   EGY notebook, mind a két üzemmóddal
 docs/konzultacio_2026-08-25_lefedettseg.md   a konzultáció pontról pontra: hol van, mi jött ki
+docs/method.md                a specifikáció: minden tag, minden súly, egy taszk lépésről lépésre
+docs/inkrementalis_baselinek.md   mihez mérjük magunkat, és mi az, ami még nincs kész
 data/pool/                    a commitolt PROB-átfutás (60 MB)
 data/results/                 minden jelentett szám ide generálódik
 data/reference/measured/      korábbi valódi GPU-futások metrikái, hivatkozási pontnak

@@ -220,9 +220,8 @@ def tune(
         eligible = (
             report["unknown_recall"] >= min_unknown_recall and mean_size >= min_mean_size
         )
-        if eligible:
-            if best is None or report["contamination"] < best[0]:
-                best = (report["contamination"], partition)
+        if eligible and (best is None or report["contamination"] < best[0]):
+            best = (report["contamination"], partition)
     if best is None:
         raise ValueError(
             f"No configuration reached unknown_recall >= {min_unknown_recall}. "

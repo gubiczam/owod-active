@@ -16,7 +16,7 @@ Ten modules, one concept each. Read them in this order:
 
 __version__ = "0.1.0"
 
-from owl import (  # noqa: F401
+from owl import (
     bridge,
     clustering,
     labelling,
