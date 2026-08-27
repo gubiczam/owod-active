@@ -289,6 +289,12 @@ def run_chain(
     results: list[TaskResult] = []
     written: list[Path] = []
     previous_baseline: float | None = None
+    #: ``bridge.cost_report()['total']`` is cumulative over everything that bridge
+    #: object has ever run, and the notebook drives every arm through *one*
+    #: bridge while handing each the budget that is left. Comparing that lifetime
+    #: total against this call's own budget compares two different clocks, and
+    #: stops every arm after the first one at its first task. Measure from here.
+    started_at = bridge.cost_report()["total"]
     elapsed = 0.0
 
     for task in chain[1:]:
@@ -565,7 +571,7 @@ def run_chain(
             "evaluation_row": result.evaluation_row,
         }, indent=2), encoding="utf-8")
 
-        elapsed = bridge.cost_report()["total"]
+        elapsed = bridge.cost_report()["total"] - started_at
         _write_rows(results, workspace / f"results_{config.arm}.csv")
         written.append(Path(checkpoint))
         freed = _prune_checkpoints(written, config.keep_checkpoints)

@@ -492,6 +492,48 @@ def test_the_time_budget_stops_the_chain_and_says_what_it_skipped(tmp_path, inde
     assert "Not run:" in capsys.readouterr().out
 
 
+def test_a_second_arm_gets_the_whole_time_budget_it_was_handed(
+    tmp_path, index, config, capsys
+):
+    """The notebook drives every arm through ONE bridge, and that is the trap.
+
+    ``Bridge.cost_report()['total']`` is cumulative over everything that bridge
+    object has ever run. The notebook loop hands each arm the budget that is
+    *left* — ``TIME_BUDGET_MINUTES - spent``. So comparing the running total
+    against the remaining budget compares two different clocks, and the second
+    arm stops after one task while there is still budget for four.
+
+    That is exactly the signature of a workspace where the first arm finished
+    and the rest hold one task each. So this drives two arms through one bridge
+    the way the notebook does, and asserts the second one is not cut short.
+    """
+
+    from dataclasses import replace
+
+    fake = FakeBridge()
+    chain = protocol.build_chain(4)          # three incremental tasks
+    per_task = 3                             # predict + train + evaluate
+    budget = float((len(chain) - 1) * per_task * 2)   # room for both arms in full
+
+    finished = {}
+    spent = 0.0
+    for arm in ("prior_consult_batch", "random"):
+        finished[arm] = len(runner.run_chain(
+            fake, replace(config, arm=arm), workspace=tmp_path / arm,
+            candidate_index=index, start_checkpoint=tmp_path / "t1.pth",
+            test_set="owl_shared_test", chain=chain,
+            time_budget_minutes=budget - spent, prepare_images=lambda ids: ids,
+        ))
+        spent = fake.cost_report()["total"]
+
+    assert finished["prior_consult_batch"] == len(chain) - 1
+    assert finished["random"] == len(chain) - 1, (
+        "the second arm stopped early: run_chain measured the bridge's lifetime "
+        f"total against this call's own budget. Finished: {finished}"
+    )
+    assert "Not run:" not in capsys.readouterr().out
+
+
 def test_the_frequency_split_reaches_the_reported_row(tmp_path, index, config):
     """head/medium/tail is the plan's distinguishing evaluation; it must be in the table."""
 
