@@ -68,39 +68,86 @@ def allocate(
     alpha: float = 0.0,
     minimum: int = 1,
 ) -> dict[str, int]:
-    """Split ``total`` exemplars across classes by ``n_c ** alpha``.
+    """Split a fixed exemplar budget across classes by ``n_c ** alpha``.
 
-    ``minimum`` guarantees every known class survives at all, which matters at
-    ``alpha = 1`` where a tail class would otherwise round to zero and be
-    forgotten completely — the failure the plan predicts for head-favouring
-    allocation.
+    The requested allocation is capacity-aware: if one class does not contain
+    enough available exemplars to use its weighted share, the unused budget is
+    redistributed among classes that still have capacity.
+
+    Therefore, whenever the available pool contains at least ``total`` objects,
+
+        sum(m_c) == total
+
+    while no class is ever allocated more exemplars than are available.
     """
 
     classes = [name for name, count in class_counts.items() if count > 0]
     if not classes or total <= 0:
         return {}
-    counts = np.array([class_counts[name] for name in classes], dtype=np.float64)
 
-    weights = np.power(counts, alpha)
-    weights = weights / weights.sum()
-    raw = weights * total
+    capacities = np.asarray(
+        [int(class_counts[name]) for name in classes],
+        dtype=np.int64,
+    )
+    target = min(int(total), int(capacities.sum()))
 
-    allocation = np.maximum(np.floor(raw), minimum).astype(np.int64)
-    allocation = np.minimum(allocation, counts.astype(np.int64))
+    allocation = np.zeros(len(classes), dtype=np.int64)
 
-    # hand the rounding remainder to whoever was cut hardest, largest first
-    while allocation.sum() > total and (allocation > minimum).any():
-        victim = int(np.argmax(allocation - minimum))
-        allocation[victim] -= 1
-    remainder = total - int(allocation.sum())
-    if remainder > 0:
-        order = np.argsort(-(raw - allocation))
-        for index in order[:remainder]:
-            if allocation[index] < counts[index]:
-                allocation[index] += 1
+    # Preserve every represented class when the budget makes that possible.
+    requested_minimum = np.minimum(capacities, max(int(minimum), 0))
+    minimum_total = int(requested_minimum.sum())
 
-    return {name: int(value) for name, value in zip(classes, allocation) if value > 0}
+    if minimum_total <= target:
+        allocation[:] = requested_minimum
+    else:
+        # The requested minimum itself does not fit. Allocate one exemplar at a
+        # time in weighted order instead of silently exceeding the total.
+        weights = np.power(capacities.astype(np.float64), alpha)
+        order = np.argsort(-weights, kind="stable")
+        remaining = target
+        for index in order:
+            take = min(int(requested_minimum[index]), remaining)
+            allocation[index] += take
+            remaining -= take
+            if remaining == 0:
+                break
 
+    weights = np.power(capacities.astype(np.float64), alpha)
+
+    while int(allocation.sum()) < target:
+        remaining_budget = target - int(allocation.sum())
+        free_capacity = capacities - allocation
+        active = free_capacity > 0
+
+        if not active.any():
+            break
+
+        active_weights = np.where(active, weights, 0.0)
+        weight_sum = float(active_weights.sum())
+
+        if weight_sum <= 0:
+            break
+
+        raw = active_weights / weight_sum * remaining_budget
+        grant = np.floor(raw).astype(np.int64)
+        grant = np.minimum(grant, free_capacity)
+        grant[~active] = 0
+
+        if int(grant.sum()) > 0:
+            allocation += grant
+            continue
+
+        # With a small remainder every proportional share can be below one.
+        # Largest-remainder allocation makes progress deterministically.
+        fractional = np.where(active, raw - np.floor(raw), -np.inf)
+        index = int(np.argmax(fractional))
+        allocation[index] += 1
+
+    return {
+        name: int(value)
+        for name, value in zip(classes, allocation)
+        if value > 0
+    }
 
 def build(
     per_image_classes: Mapping[str, Mapping[str, int]],

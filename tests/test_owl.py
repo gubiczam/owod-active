@@ -326,11 +326,51 @@ def test_no_class_is_ever_allocated_to_zero():
     assert allocation["tail"] >= 1
 
 
-def test_allocation_respects_the_total():
+def test_allocation_uses_the_whole_budget_when_enough_examples_exist():
     counts = protocol.load_train_counts()
     subset = {name: counts[name] for name in protocol.TASK1}
+
     for alpha in (-1.0, -0.5, 0.0, 1.0):
-        assert sum(replay.allocate(subset, total=400, alpha=alpha).values()) <= 400
+        allocation = replay.allocate(subset, total=400, alpha=alpha)
+
+        assert sum(allocation.values()) == 400
+        assert all(allocation[name] <= subset[name] for name in allocation)
+
+def test_allocation_redistributes_budget_from_an_exhausted_class():
+    """A capped rare class must not make the rest of M disappear."""
+    counts = {
+        "rare": 2,
+        "medium": 100,
+        "head": 100,
+    }
+
+    allocation = replay.allocate(
+        counts,
+        total=50,
+        alpha=-1.0,
+    )
+
+    assert allocation["rare"] == 2
+    assert sum(allocation.values()) == 50
+    assert allocation["medium"] <= counts["medium"]
+    assert allocation["head"] <= counts["head"]
+
+
+def test_allocation_cannot_exceed_the_available_pool():
+    counts = {
+        "a": 2,
+        "b": 3,
+        "c": 4,
+    }
+
+    allocation = replay.allocate(
+        counts,
+        total=400,
+        alpha=0.0,
+    )
+
+    assert sum(allocation.values()) == 9
+    assert allocation == counts
 
 
 def test_greedy_memory_covers_the_allocation_with_fewer_images_than_random():
