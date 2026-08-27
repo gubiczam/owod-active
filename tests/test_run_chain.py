@@ -178,13 +178,21 @@ def config():
     )
 
 
-def test_the_chain_asks_for_its_images_before_the_detector_runs(tmp_path, index, config):
-    """The bug this file was written for."""
+def test_the_chain_asks_for_its_images_before_the_detector_and_before_training(
+    tmp_path, index, config
+):
+    """Twice per task, and both calls matter.
+
+    The first covers the candidate pool the detector is about to read. The second
+    covers what training and replay are about to read, which is a different and
+    smaller set — and which a resumed run needs even when the detector pass is
+    cached, because Drive keeps the proposals and /content keeps nothing.
+    """
 
     asked: list[list[str]] = []
 
     def prepare(image_ids):
-        asked.append(list(image_ids))
+        asked.append([str(i) for i in image_ids])
         return image_ids
 
     fake = FakeBridge()
@@ -194,9 +202,23 @@ def test_the_chain_asks_for_its_images_before_the_detector_runs(tmp_path, index,
         chain=protocol.build_chain(4), prepare_images=prepare,
     )
 
-    assert len(asked) == 3, "prepare_images must be called once per incremental task"
-    for requested, call in zip(asked, fake.of("predict")):
-        assert requested == call["images"], "the detector got images nobody fetched"
+    assert len(asked) == 6, "two calls per incremental task"
+
+    offered: set[str] = set()
+    for index_of_task, call in enumerate(fake.of("predict")):
+        candidates, training = asked[2 * index_of_task], asked[2 * index_of_task + 1]
+        assert candidates == call["images"], "the detector got images nobody fetched"
+
+        offered |= set(candidates)
+        # Training reads the selected images plus the replay memory, and the
+        # memory holds images from *earlier* tasks' pools — so it is not a subset
+        # of this task's pool, and at a later task it can even be larger than it.
+        # The invariant that does hold: nothing is read that was never offered.
+        assert set(training) <= offered, (
+            f"task {index_of_task + 2} would read images from no pool: "
+            f"{sorted(set(training) - offered)[:3]}"
+        )
+        assert training, "training asked for nothing"
 
 
 def test_an_unavailable_image_is_dropped_rather_than_killing_the_run(tmp_path, index, config):
@@ -663,3 +685,89 @@ def test_turning_the_grouped_recall_off_skips_the_second_forward_pass(tmp_path, 
     )
     assert not any("_detections.json" in p.name for p in tmp_path.rglob("*.json"))
     assert "U_Recall_tail" not in results[0].flat()
+
+
+def test_a_cached_detector_pass_does_not_imply_the_images_are_still_there(
+    tmp_path, index, config
+):
+    """The bug that killed a live GPU session, twice removed from its cause.
+
+    Drive persists between Colab sessions; ``/content`` does not. So a resumed
+    run finds ``proposals.npz`` on Drive, skips the detector pass — and then
+    trains on JPEGs that were downloaded into a ``/content`` that no longer
+    exists. The failure surfaces as ``FileNotFoundError`` inside a DataLoader
+    worker, long after the cause.
+
+    Gating the download on "is the detector pass cached" was the mistake: what
+    reads the images is the training, not the caching.
+    """
+
+    class DemandsImages(FakeBridge):
+        """A bridge that fails the way PROB fails when a JPEG is missing."""
+
+        def __init__(self, present: set[str]):
+            super().__init__()
+            self.present = present
+
+        def train(self, labelled_ids, **kwargs):
+            missing = [i for i in list(labelled_ids) + list(kwargs.get("replay_ids", ()))
+                       if i not in self.present]
+            if missing:
+                raise FileNotFoundError(
+                    f"No such file or directory: JPEGImages/{missing[0]}.jpg"
+                )
+            return super().train(labelled_ids, **kwargs)
+
+    # first session: everything is fetched, and the run is cut short
+    fetched: set[str] = set()
+
+    def fetch(ids):
+        fetched.update(str(i) for i in ids)
+        return ids
+
+    first = DemandsImages(fetched)
+    runner.run_chain(
+        first, config, workspace=tmp_path, candidate_index=index,
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(4), prepare_images=fetch,
+        time_budget_minutes=4,
+    )
+    assert first.of("predict"), "the first session must have run the detector"
+
+    # second session: Drive kept the proposals, /content kept nothing
+    survives_restart: set[str] = set()
+
+    def fetch_again(ids):
+        survives_restart.update(str(i) for i in ids)
+        return ids
+
+    second = DemandsImages(survives_restart)
+    results = runner.run_chain(
+        second, config, workspace=tmp_path, candidate_index=index,
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(4), prepare_images=fetch_again,
+    )
+    assert len(results) == 3, "the resumed chain must finish"
+    assert any(call["verb"] == "predict" and False for call in second.calls) is False
+    # the point: training images were fetched even though the detector was cached
+    trained = {i for call in second.of("train") for i in call["images"] + call["replay"]}
+    assert trained, "nothing was trained on"
+    assert trained <= survives_restart, "trained on images nobody fetched this session"
+
+
+def test_the_run_stops_clearly_when_the_training_downloads_fail(tmp_path, index, config):
+    """The candidate pool arrives, the training subset does not. Say which."""
+
+    calls = {"n": 0}
+
+    def flaky(ids):
+        calls["n"] += 1
+        return ids if calls["n"] % 2 else []     # the pool works, training does not
+
+    fake = FakeBridge()
+    with pytest.raises(RuntimeError, match="training images on disk"):
+        runner.run_chain(
+            fake, config, workspace=tmp_path, candidate_index=index,
+            start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+            chain=protocol.build_chain(4), prepare_images=flaky,
+        )

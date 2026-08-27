@@ -222,13 +222,19 @@ def run_chain(
     ``time_budget_minutes`` stops the chain cleanly before the runtime is lost
     and prints which tasks were not run. Nothing is silently truncated.
 
-    ``prepare_images`` is called with each task's candidate image ids before the
-    detector runs, and returns the ids that are actually usable. The detector
-    reads JPEGs off disk and dies on the first one that is missing, so something
-    has to put them there; on Colab that is a download from COCO, and only the
-    images a task actually offers the selector are worth fetching. Returning a
-    shorter list is how an unavailable image is dropped instead of killing the
-    run. It is not called when the task's detector pass is already cached.
+    ``prepare_images`` is called with the ids that are about to be read off disk
+    and returns the ones that actually arrived; on Colab it downloads them from
+    COCO. It is called **twice** per task, and the second call is not redundant.
+
+    **Why twice.** Drive persists between sessions and ``/content`` does not. So a
+    resumed run finds ``proposals.npz`` on Drive, skips the detector pass, and
+    then trains on images that were downloaded into a ``/content`` that no longer
+    exists — ``FileNotFoundError`` inside a DataLoader worker, after the
+    annotations were extracted and the kernel built. Gating the download on "is
+    the detector pass cached" was the mistake: what needs the images is the
+    training, not the caching. So the candidate pool is fetched only when the
+    detector actually has to run, and whatever training and replay are about to
+    read is fetched every time.
     """
 
     chain = chain or protocol.build_chain(config.n_tasks)
@@ -452,6 +458,31 @@ def run_chain(
                 image_ids=carried,
                 per_class=fresh.per_class, alpha=fresh.alpha, total=fresh.total,
             )
+
+        # ---- 5b. the images training is about to read must be on disk -----
+        #
+        # Unconditionally, not only when the detector ran: Drive keeps the
+        # proposals between sessions, /content keeps nothing, so a resumed task
+        # can have a cached detector pass and no images at all.
+        if prepare_images is not None:
+            wanted = sorted({*trainable, *memory.image_ids})
+            present = {str(value) for value in prepare_images(wanted)}
+            lost = len(wanted) - len(present)
+            if lost:
+                print(f"  [{task.name}] {lost} of {len(wanted)} training images could "
+                      "not be fetched; dropped")
+            trainable = [image for image in trainable if image in present]
+            memory = replay.Memory(
+                image_ids=tuple(i for i in memory.image_ids if i in present),
+                per_class=memory.per_class, alpha=memory.alpha, total=memory.total,
+            )
+            if len(trainable) < config.batch_size:
+                raise RuntimeError(
+                    f"{task.name} has only {len(trainable)} training images on disk "
+                    f"and PROB drops the last partial batch, so it needs "
+                    f"{config.batch_size}. The downloads failed — check the runtime's "
+                    "network."
+                )
 
         # ---- 6. fine-tune -------------------------------------------------
         supervision = "train" if config.labelling_policy == "box_only" else "ft"

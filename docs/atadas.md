@@ -179,7 +179,14 @@ hibák, és mindegyikhez tartozik teszt.
    `[mAP, mAP, 80 osztály, unknown]` = 83 elem. Három futáson ellenőrizve. Enélkül a
    head/medium/tail bontás — a terv megkülönböztető mérése — nem számolható.
 
-8. **A `MultiScaleDeformableAttention` CUDA-kernel.** Ha nem fordul le, a PROB tiszta
+8. **A Drive megmarad, a `/content` nem.** Egy folytatott futás megtalálja a
+   `proposals.npz`-t a Drive-on, kihagyja a detektor-passzt — és olyan képeken tanítana,
+   amiket egy már nem létező `/content`-be töltöttünk le. A hiba `FileNotFoundError`-ként
+   jelenik meg egy DataLoader-workerben, jóval az oka után. **Soha ne következtess arra,
+   hogy „a képek megvannak", abból, hogy egy Drive-artefakt létezik.** A lánc ezért a
+   tanítás előtt mindig letölti, amit a tanítás olvasni fog.
+
+9. **A `MultiScaleDeformableAttention` CUDA-kernel.** Ha nem fordul le, a PROB tiszta
    PyTorch-tartalékon fut: **~3× lassabb** (mért: 2000 képes predict 23,1 perc a
    tartalékon, ~8 perc fordítva). A notebook most kiírja a valódi buildhibát és ennek
    megfelelően árazza a sessiont.
