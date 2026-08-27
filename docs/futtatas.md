@@ -206,3 +206,43 @@ húsz-osztályos felállás **2931**-et fizetett — ezért van most taszkonkén
 | `FileNotFoundError: .../ImageSets/OWDETR/owod_all_task_test.txt` | a PROB a saját alapértelmezett teszt-splitjét kereste. Javítva: a `train` most átadja a közös teszthalmazt. Ha mégis előjön, régi klónból fut — **Runtime → Restart session**, Run all |
 | `FileNotFoundError: .../JPEGImages/xxx.jpg` a `train` alatt, cache-elt `predict` után | ez volt a hiba: a Drive megtartja a `proposals.npz`-t, a `/content` viszont semmit. Javítva: a lánc a tanítás előtt **mindig** letölti, amit a tanítás olvasni fog, függetlenül attól, hogy a detektor futott-e |
 | `FileNotFoundError: .../JPEGImages/xxx.jpg` a `predict` alatt | egy jelöltkép nem töltődött le. A lánc taszkonként szedi le őket, és a nem elérhetőket kidobja — ha ez mégis előjön, a hálózat állt el a futás közben; Run all újra, folytatja |
+
+---
+
+## 5. lépés — Az eredményekből táblázat és ábra (laptopon, 10 másodperc)
+
+A lánc a Colab kimenetébe írja a táblázatait, de a session nem eredményfejezet: a
+kimenet a runtime-mal együtt eltűnik, a terv fő végpontja pedig nem táblázat, hanem
+**görbe** — a tail-U-Recall az orákulum-költség függvényében.
+
+A számok ettől függetlenül megvannak: a lánc taszkonként kiírja őket a Drive-ra,
+`MyDrive/OWL/work/<arm>/results_<arm>.csv`. Töltsd le a `work` mappát (elég a CSV-k),
+és futtasd rá:
+
+```bash
+python tools/analyze_chain.py ~/Downloads/work --reference random
+```
+
+Ez kiírja a képernyőre, és `data/results/chain/` alá lementi:
+
+| fájl | mi van benne |
+|---|---|
+| `tail_recall_vs_cost.png` / `.pdf` | **az ábra**: tail-U-Recall a valódi orákulum-költség függvényében, armonként egy vonal |
+| `comparison.csv` / `.md` / `.tex` | az armok egymás mellett, azonos költségen, addig a taszkig, ameddig **mindegyik** eljutott |
+| `efficiency.csv` / `.md` / `.tex` | **a terv állítása számként**: mennyi annotációból éri el az egyes armok ugyanazt a tail-szintet, amit a `random` |
+| `arm_<arm>.csv` / `.md` / `.tex` | armonként a teljes taszksor |
+| `depth.csv` | melyik arm meddig jutott, és mit kellett kihagyni az összehasonlításból |
+
+A `.md` és a `.tex` beilleszthető a dolgozatba; semmit nem kell kézzel átgépelni.
+
+**Amit a kiírás elején nézz meg.** Ha megjelenik egy `oracle_cost_so_far overstates the
+real cost` szakasz, akkor volt olyan taszk, ahol elfogytak a jelöltek, és a lánc által
+felírt költség (keret × taszkindex) **több, mint amit az orákulum valójában kapott**. Az
+eszköz ilyenkor is a valódi költséggel — a ténylegesen megkérdezett régiók összegével —
+számol mindenhol. **A dolgozatba ezt idézd, ne a `oracle_cost_so_far` oszlopot.**
+
+Az ábrához `matplotlib` kell (`pip install -e '.[plots]'`); enélkül a `--no-plot`
+kapcsolóval a táblázatok ugyanúgy elkészülnek.
+
+Részleges lánc is elemezhető: az összehasonlítás ott áll meg, ahol a legrövidebb arm, és
+kiírja, melyik armból hány taszkot kellett emiatt kihagyni.

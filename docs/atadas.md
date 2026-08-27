@@ -94,6 +94,11 @@ A notebook kiírja `U_Recall_tail / _medium / _head / _all` + `oracle_cost_so_fa
 oszlopokban, és a végén a három arm hasonlító táblázatát. **Ez a dolgozat
 eredményfejezete. Ezt kell lefuttatni.**
 
+A lánc taszkonként kiírja a sorokat a Drive-ra (`work/<arm>/results_<arm>.csv`),
+és ezekből a `tools/analyze_chain.py` állítja elő az ábrát meg a beilleszthető
+táblázatokat — a terv fő végpontja görbe, nem táblázat. Lásd `docs/futtatas.md`
+5. lépés. Az eszköz csak olvas, a futó lánchoz nem nyúl.
+
 ### (2) `new_mAP50 = 0` — a plaszticitás, és miért nincs
 
 A kiválasztás **nem tudja, melyik a bevezetendő osztály**, és nagyjából a véletlen szintjén
@@ -191,6 +196,19 @@ hibák, és mindegyikhez tartozik teszt.
    tartalékon, ~8 perc fordítva). A notebook most kiírja a valódi buildhibát és ennek
    megfelelően árazza a sessiont.
 
+10. **A felírt orákulum-költség nem a valódi.** A `runner.py` az `oracle_cost_so_far`-t
+    `(taszkindex + 1) × budget_per_task`-ként írja fel, tehát feltételezi, hogy minden
+    taszk elkölti a teljes keretet. A `selection.select` viszont levágja a kvótát az
+    éppen elérhető jelöltekre (`quota = min(quota, int(available.sum()))`), és az
+    `exclude` maszk taszkról taszkra nő — egy kimerülő jelöltkészleten kevesebb régió
+    kel el, **armonként eltérő mértékben**, mert az armok más régiókat vesznek meg. Ez
+    a fő eredmény x-tengelye, tehát nem feltételezhető. A ténylegesen megkérdezett
+    régiók száma az `asked` oszlopban van; a `tools/analyze_chain.py` ebből számol, és
+    kiírja, ha a kettő eltér. **A `runner.py:530` javítása a lánc befejezése utáni első
+    dolog** — futó lánc közben nem szabad, mert akkor egy láncon belül a korábbi és a
+    későbbi taszkok sorai más szabály szerint készülnének, ami rosszabb, mint az ismert
+    torzítás.
+
 ---
 
 ## 5b. HA KÖZBEN FUT EGY GPU-LÁNC — koordináció
@@ -222,7 +240,7 @@ fut-e lánc**, és ha igen, várd meg vagy adj neki új munkakönyvtárnevet.
 
 ```bash
 python tools/dry_run_notebook.py      # a TELJES notebook, hamis PROB-bal, ~4 perc
-pytest -q -m "not slow"               # 99 teszt, ~55 s
+pytest -q -m "not slow"               # 117 teszt, ~55 s
 pytest -q -m slow                     # a notebook végigfuttatása tesztként
 ruff check owl tools tests
 ```
@@ -243,7 +261,8 @@ egyetlen bizonyíték, hogy a teszt ér valamit.
 **1–3. nap: futtasd le a fő mérést.** A notebook készen áll: nyisd meg a Colab-linket és
 Run all. Három arm (`prior_consult_batch`, `random`, `objectness`), közös időkeretből,
 újraindíthatóan. A `MINIMAL_CHAIN = True` felezi, ha a CUDA-kernel nem fordul.
-**Amíg ez nincs meg, nincs eredményfejezet.**
+**Amíg ez nincs meg, nincs eredményfejezet.** Amint egy arm végzett, a
+`tools/analyze_chain.py` már részleges láncon is megmutatja, hol tart a görbe.
 
 **4–5. nap: döntsd el a (2) pontot** (plaszticitás). A védhető minimum a (c): kimondjuk,
 hogy ezen a kereten az új-osztály tanulás nem elérhető, és megmutatjuk, mennyi kellene
