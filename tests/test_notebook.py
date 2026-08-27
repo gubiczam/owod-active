@@ -148,7 +148,16 @@ def test_the_whole_notebook_runs_with_prob_and_colab_faked(capsys):
     import dry_run_notebook
 
     dry_run_notebook.run(run_gpu=True, verbose=False)
-    assert "GPU branch: 3 tasks, 9 PROB calls" in capsys.readouterr().out
+
+    # What this asserts is that the GPU branch ran at all — everything the branch
+    # had to *achieve* (both arms, three tasks each, eighteen PROB calls, every
+    # metric column present) is asserted inside ``run`` itself, which raises.
+    # Retyping its summary sentence here was trap 6 applied to the test suite:
+    # the sentence changed when the chain grew a second arm, and the copy in this
+    # file went red for a reason that had nothing to do with the notebook.
+    output = capsys.readouterr().out
+    assert "GPU branch:" in output, output
+    assert "grouped recall" in output, output
 
 
 @pytest.mark.slow
