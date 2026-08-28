@@ -15,12 +15,13 @@ and the arguments of the calls.
 from __future__ import annotations
 
 import json
+import zlib
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from owl import protocol, runner
+from owl import exemplars, protocol, replay, runner
 from owl.evaluation_subset import check_split_name
 
 
@@ -45,7 +46,19 @@ class FakeBridge:
         if output.exists():
             return output
         output.parent.mkdir(parents=True, exist_ok=True)
-        generator = np.random.default_rng(len(self.calls))
+        # Seeded from the *inputs*, the way PROB is: the same checkpoint over the
+        # same images returns the same proposals. Seeding from the call counter
+        # instead made the fake's output depend on how many calls this bridge had
+        # already served, so a resumed session got different proposals from an
+        # unbroken one for reasons that exist only in the fake.
+        # Not the checkpoint *path*: two workspaces hold the same chain under
+        # different directory names, and PROB's output depends on the weights,
+        # not on where they are stored. The class counts stand in for the
+        # checkpoint, since they advance with it.
+        digest = zlib.crc32(
+            "|".join([*map(str, image_ids), str(n_prev), str(n_current)]).encode("utf-8")
+        )
+        generator = np.random.default_rng(digest)
         rows = max(len(image_ids) * 4, 8)
         ids = np.asarray([image_ids[i % len(image_ids)] for i in range(rows)], dtype=object)
         n_known = max(n_current, 1)
@@ -85,13 +98,15 @@ class FakeBridge:
     def evaluate(self, *, checkpoint, test_set, output, n_prev, n_current,
                  batch_size=4, detections=True):
         check_split_name(test_set, purpose="test")
+        output = Path(output)
+        if output.exists():
+            # a cached artefact is not work; the resume tests read `calls` as
+            # "what this session actually paid for"
+            return output
         self.calls.append({
             "verb": "evaluate", "n_prev": n_prev, "n_current": n_current,
             "test_set": test_set,
         })
-        output = Path(output)
-        if output.exists():
-            return output
         output.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "known_AP50": 40.0, "U_Recall": 20.0, "WI": 0.03, "A_OSE": 1000,
@@ -113,9 +128,9 @@ class FakeBridge:
             truth, found = [], []
             for index, name in enumerate(unknown):
                 box = [10.0 * index, 0.0, 10.0 * index + 8.0, 8.0]
-                truth.append({"image_id": "img0", "class_name": name, "box": box})
+                truth.append({"image_id": "000000000000", "class_name": name, "box": box})
                 if index % 2 == 0:                      # half of them recalled
-                    found.append({"image_id": "img0", "class_name": "unknown",
+                    found.append({"image_id": "000000000000", "class_name": "unknown",
                                   "score": 0.9, "box": box})
             artefact.write_text(json.dumps({
                 "schema": "daowod_detections_v1", "unknown_class_name": "unknown",
@@ -137,12 +152,73 @@ class FakeBridge:
         return [call for call in self.calls if call["verb"] == verb]
 
 
+#: The old-data pool: what existed before the chain started, which for this
+#: protocol is the split PROB's ``t1.pth`` was trained on. Disjoint from the
+#: candidate pool by construction, so a replay object can never be mistaken for
+#: something an arm bought. The ids are twelve digits because
+#: ``OWDetection.convert_image_id`` casts an image id to ``int`` — and none of
+#: them starts with nine, which is what ``owl.exemplars.alias_id`` reserves.
+OLD_DATA = {
+    f"{500000 + i:012d}": {protocol.TASK1[i % len(protocol.TASK1)]: 1 + (i % 4)}
+    for i in range(600)
+}
+
+
+def prob_data_root(tmp_path, *indices):
+    """A PROB-shaped ``data_root``: one VOC annotation and one JPEG per image.
+
+    The exemplar memory is materialised by filtering real annotations, so the
+    tests need real ones. Objects are written grouped by class name in sorted
+    order, which is the document order ``owl.exemplars`` counts ordinals in.
+    """
+
+    root = tmp_path / "prob_data"
+    annotations, images = root / "Annotations", root / "JPEGImages"
+    annotations.mkdir(parents=True, exist_ok=True)
+    images.mkdir(parents=True, exist_ok=True)
+    for index in indices:
+        for image_id, counts in index.items():
+            target = annotations / f"{image_id}.xml"
+            if target.exists():
+                continue
+            boxes, offset = [], 0
+            for name in sorted(counts):
+                for _ in range(int(counts[name])):
+                    offset += 10
+                    boxes.append(
+                        f"<object><name>{name}</name><difficult>0</difficult>"
+                        f"<bndbox><xmin>{offset}</xmin><ymin>{offset}</ymin>"
+                        f"<xmax>{offset + 8}</xmax><ymax>{offset + 8}</ymax>"
+                        "</bndbox></object>"
+                    )
+            target.write_text(
+                "<annotation><folder>OWOD</folder>"
+                f"<filename>{image_id}.jpg</filename>"
+                "<size><width>640</width><height>480</height><depth>3</depth></size>"
+                "<segmented>0</segmented>" + "".join(boxes) + "</annotation>",
+                encoding="utf-8",
+            )
+            (images / f"{image_id}.jpg").write_bytes(b"not-a-real-jpeg")
+    return root
+
+
+def replay_sources(train_call) -> set[str]:
+    """The physical images behind a training call's replay ids.
+
+    PROB is handed *aliases* — a second id per source image whose annotation
+    holds only the selected exemplar boxes. Every assertion about which images
+    were rehearsed has to resolve them back.
+    """
+
+    return {exemplars.source_id(alias) for alias in train_call["replay"]}
+
+
 @pytest.fixture
 def index():
     """A candidate index: 400 images, each holding one of the declared classes."""
     declared = [task.new_class for task in protocol.build_chain(4)[1:]]
     return {
-        f"img{i:04d}": {declared[i % len(declared)]: 1 + (i % 3),
+        f"{i:012d}": {declared[i % len(declared)]: 1 + (i % 3),
                         protocol.TASK1[i % len(protocol.TASK1)]: 1}
         for i in range(400)
     }
@@ -162,9 +238,9 @@ def index_with_barren_images():
     pool = {}
     for i in range(400):
         if i % 2:
-            pool[f"img{i:04d}"] = {future: 2}
+            pool[f"{i:012d}"] = {future: 2}
         else:
-            pool[f"img{i:04d}"] = {declared[i % len(declared)]: 1,
+            pool[f"{i:012d}"] = {declared[i % len(declared)]: 1,
                                    protocol.TASK1[i % len(protocol.TASK1)]: 1}
     return pool
 
@@ -197,7 +273,8 @@ def test_the_chain_asks_for_its_images_before_the_detector_and_before_training(
 
     fake = FakeBridge()
     runner.run_chain(
-        fake, config, workspace=tmp_path, candidate_index=index,
+        fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=prepare,
     )
@@ -211,10 +288,11 @@ def test_the_chain_asks_for_its_images_before_the_detector_and_before_training(
 
         offered |= set(candidates)
         # Training reads the selected images plus the replay memory, and the
-        # memory holds images from *earlier* tasks' pools — so it is not a subset
-        # of this task's pool, and at a later task it can even be larger than it.
-        # The invariant that does hold: nothing is read that was never offered.
-        assert set(training) <= offered, (
+        # memory is drawn from the old-data pool and from earlier tasks — so it
+        # is not a subset of this task's pool, and at a later task it can even be
+        # larger than it. The invariant that does hold: nothing is read that was
+        # never offered, by either pool.
+        assert set(training) <= offered | set(OLD_DATA), (
             f"task {index_of_task + 2} would read images from no pool: "
             f"{sorted(set(training) - offered)[:3]}"
         )
@@ -225,11 +303,15 @@ def test_an_unavailable_image_is_dropped_rather_than_killing_the_run(tmp_path, i
     """COCO occasionally will not serve an image. That must cost one image, not the chain."""
 
     def prepare(image_ids):
-        return list(image_ids)[:-5]        # five could not be fetched
+        # the low ids are candidate images; the memory's sources are the high
+        # ones, and a memory that cannot be put on disk is a separate failure
+        # with its own test below
+        return list(image_ids)[5:]         # five could not be fetched
 
     fake = FakeBridge()
     runner.run_chain(
-        fake, config, workspace=tmp_path, candidate_index=index,
+        fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=prepare,
     )
@@ -241,7 +323,8 @@ def test_the_chain_refuses_to_predict_on_nothing(tmp_path, index, config):
     fake = FakeBridge()
     with pytest.raises(RuntimeError, match="no usable candidate images"):
         runner.run_chain(
-            fake, config, workspace=tmp_path, candidate_index=index,
+            fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
             start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
             chain=protocol.build_chain(4), prepare_images=lambda ids: [],
         )
@@ -254,15 +337,18 @@ def test_images_with_no_currently_known_object_are_not_trained_on(
 
     fake = FakeBridge()
     results = runner.run_chain(
-        fake, config, workspace=tmp_path, candidate_index=index_with_barren_images,
+        fake, config, workspace=tmp_path, candidate_index=index_with_barren_images, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index_with_barren_images, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     known_by_task = {t.name: set(t.known_classes) for t in protocol.build_chain(4)[1:]}
     for row, call in zip(results, fake.of("train")):
         known = known_by_task[row.task]
-        for image in call["images"] + call["replay"]:
-            assert any(name in known for name in index_with_barren_images[image]), (
+        physical = list(call["images"]) + sorted(replay_sources(call))
+        for image in physical:
+            counts = index_with_barren_images.get(image) or OLD_DATA[image]
+            assert any(name in known for name in counts), (
                 f"{image} would arrive at PROB with zero boxes")
 
 
@@ -273,7 +359,8 @@ def test_the_wasted_half_of_the_budget_is_reported_not_hidden(
 
     fake = FakeBridge()
     results = runner.run_chain(
-        fake, config, workspace=tmp_path, candidate_index=index_with_barren_images,
+        fake, config, workspace=tmp_path, candidate_index=index_with_barren_images, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index_with_barren_images, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
@@ -298,12 +385,13 @@ def test_a_label_paid_for_early_is_used_when_its_class_becomes_declarable(
     early = chain[1].new_class
     pool = {}
     for i in range(400):
-        pool[f"img{i:04d}"] = {late: 2} if i % 2 else {early: 1}
+        pool[f"{i:012d}"] = {late: 2} if i % 2 else {early: 1}
 
     banked = FakeBridge()
     results = runner.run_chain(
         banked, replace(config, reuse_deferred_labels=True), workspace=tmp_path / "on",
-        candidate_index=pool, start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        candidate_index=pool, start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test", replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, pool, OLD_DATA),
         chain=chain, prepare_images=lambda ids: ids,
     )
     reused = [row.selection_row["images_from_earlier_tasks"] for row in results]
@@ -314,7 +402,8 @@ def test_a_label_paid_for_early_is_used_when_its_class_becomes_declarable(
     discarded = FakeBridge()
     off = runner.run_chain(
         discarded, replace(config, reuse_deferred_labels=False), workspace=tmp_path / "off",
-        candidate_index=pool, start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        candidate_index=pool, start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test", replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, pool, OLD_DATA),
         chain=chain, prepare_images=lambda ids: ids,
     )
     assert all(row.selection_row["images_from_earlier_tasks"] == 0 for row in off)
@@ -326,7 +415,8 @@ def test_a_label_paid_for_early_is_used_when_its_class_becomes_declarable(
 def test_no_image_is_trained_on_twice_through_the_ledger(tmp_path, index, config):
     fake = FakeBridge()
     runner.run_chain(
-        fake, config, workspace=tmp_path, candidate_index=index,
+        fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
@@ -342,12 +432,14 @@ def test_a_task_with_too_little_trainable_content_says_so(tmp_path, config):
 
     from dataclasses import replace
 
-    barren = {f"img{i:04d}": {"toothbrush": 1} for i in range(400)}
+    barren = {f"{i:012d}": {"toothbrush": 1} for i in range(400)}
     fake = FakeBridge()
     with pytest.raises(RuntimeError, match="trainable images"):
         runner.run_chain(
             fake, replace(config, batch_size=2), workspace=tmp_path,
-            candidate_index=barren, start_checkpoint=tmp_path / "t1.pth",
+            candidate_index=barren, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, barren, OLD_DATA),
+            start_checkpoint=tmp_path / "t1.pth",
             test_set="owl_shared_test", chain=protocol.build_chain(4),
             prepare_images=lambda ids: ids,
         )
@@ -359,7 +451,8 @@ def test_the_class_counts_follow_probs_convention_end_to_end(tmp_path, index, co
     fake = FakeBridge()
     chain = protocol.build_chain(4)
     runner.run_chain(
-        fake, config, workspace=tmp_path, candidate_index=index,
+        fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=chain, prepare_images=lambda ids: ids,
     )
@@ -369,18 +462,24 @@ def test_the_class_counts_follow_probs_convention_end_to_end(tmp_path, index, co
     for task, call in zip(chain[1:], fake.of("train")):
         assert call["n_prev"] + call["n_current"] == task.n_current
         assert call["n_current"] == 1
-    for task, call in zip(chain[1:], fake.of("evaluate")):
+    # the first evaluate is the anchor: the starting checkpoint on its own 19
+    # classes, which is what task 2 measures its forgetting against
+    anchor, *per_task = fake.of("evaluate")
+    assert anchor["n_prev"] + anchor["n_current"] == chain[0].n_current
+    for task, call in zip(chain[1:], per_task):
         assert call["n_prev"] + call["n_current"] == task.n_current
 
 
 def test_the_calls_happen_in_the_only_order_that_makes_sense(tmp_path, index, config):
     fake = FakeBridge()
     runner.run_chain(
-        fake, config, workspace=tmp_path, candidate_index=index,
+        fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
-    assert fake.verbs() == ["predict", "train", "evaluate"] * 3
+    # the anchor is scored once, before anything is trained; then the cycle
+    assert fake.verbs() == ["evaluate"] + ["predict", "train", "evaluate"] * 3
 
 
 def test_each_task_trains_from_the_previous_tasks_checkpoint(tmp_path, index, config):
@@ -388,7 +487,8 @@ def test_each_task_trains_from_the_previous_tasks_checkpoint(tmp_path, index, co
 
     fake = FakeBridge()
     runner.run_chain(
-        fake, config, workspace=tmp_path, candidate_index=index,
+        fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
@@ -397,19 +497,219 @@ def test_each_task_trains_from_the_previous_tasks_checkpoint(tmp_path, index, co
     assert len(set(used)) == 3, "every task must predict with its own predecessor"
 
 
-def test_replay_grows_and_never_holds_a_future_class(tmp_path, index, config):
+def test_a_task_never_rehearses_on_its_own_fresh_data(tmp_path, index, config):
+    """The invariant the whole replay experiment rests on.
+
+    Replay is rehearsal of what was known *before* a step. The previous version
+    put the task's own freshly labelled images into the pool and then drew the
+    memory from it, so at task 2 the memory was a subset of the images being
+    trained on — a 100% intersection — and every later task rehearsed a third of
+    its own acquisition. An arm measured that way is not being compared on how
+    well it retains old knowledge.
+    """
+
     fake = FakeBridge()
-    results = runner.run_chain(
-        fake, config, workspace=tmp_path, candidate_index=index,
+    runner.run_chain(
+        fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(5), prepare_images=lambda ids: ids,
+    )
+
+    trains = fake.of("train")
+    assert len(trains) >= 3, "the chain has to run far enough to have a history"
+
+    for step, call in enumerate(trains, start=2):
+        current, replayed = set(call["images"]), replay_sources(call)
+        assert not (replayed & current), (
+            f"t{step} rehearsed on {len(replayed & current)} of the images it was "
+            "learning from in the same step"
+        )
+        # and the aliases are never the physical ids, so nothing can be handed to
+        # PROB twice under two names
+        assert not (set(call["replay"]) & current)
+
+    # t2 has no earlier task to draw on, so its memory must come from the
+    # declared old-data pool and from nowhere else
+    assert trains[0]["replay"], "t2 got no rehearsal at all"
+    assert replay_sources(trains[0]) <= set(OLD_DATA), (
+        "t2 rehearsed on something that is not old data"
+    )
+
+
+def test_an_image_the_selector_just_bought_is_not_also_rehearsed(tmp_path, config):
+    """The two pools overlap in reality, so the invariant must not rest on luck.
+
+    Measured on the committed indices: 1,800 of the 12,000 old-data images are
+    also in the candidate pool. When the selector buys one of those, nothing
+    stops the memory from drawing it as well, and PROB would receive the same
+    image twice in one step. Here the candidate pool is *entirely* inside the
+    old-data pool, so the collision is certain rather than occasional.
+    """
+
+    declared = [task.new_class for task in protocol.build_chain(4)[1:]]
+    shared = {
+        f"{i:012d}": {declared[i % len(declared)]: 1 + (i % 3),
+                        protocol.TASK1[i % len(protocol.TASK1)]: 2}
+        for i in range(400)
+    }
+
+    fake = FakeBridge()
+    runner.run_chain(
+        fake, config, workspace=tmp_path, candidate_index=shared,
+        replay_index=shared,                      # the pools are the same pool
+        replay_root=prob_data_root(tmp_path, shared),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
-    sizes = [row.replay_row["images"] for row in results]
-    assert sizes == sorted(sizes), f"the memory shrank: {sizes}"
-    # every replayed image is one an earlier task actually opened
-    opened = {image for call in fake.of("train") for image in call["images"]}
-    for call in fake.of("train")[1:]:
-        assert set(call["replay"]) <= opened
+
+    for step, call in enumerate(fake.of("train"), start=2):
+        overlap = set(call["images"]) & replay_sources(call)
+        assert not overlap, (
+            f"t{step} was handed {len(overlap)} image(s) as both new supervision "
+            f"and rehearsal: {sorted(overlap)[:3]}"
+        )
+        assert call["replay"], f"t{step} got no rehearsal at all"
+
+
+def test_what_a_task_learned_becomes_rehearsable_only_afterwards(
+    tmp_path, index, config
+):
+    """The other half of the temporal rule, and the one a weak test would miss.
+
+    Excluding the current task is not enough on its own: a memory that only ever
+    held the task-1 pool would also pass that check while quietly never
+    rehearsing anything the chain itself acquired. What t2 learned has to be
+    eligible from t3 onward.
+    """
+
+    fake = FakeBridge()
+    runner.run_chain(
+        fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(5), prepare_images=lambda ids: ids,
+    )
+
+    trains = fake.of("train")
+    learned_at_t2 = set(trains[0]["images"])
+    eligible_later = set()
+    for call in trains[1:]:
+        eligible_later |= replay_sources(call)
+
+    assert learned_at_t2 & eligible_later, (
+        "nothing t2 learned ever became rehearsable; the memory is frozen on the "
+        "old-data pool instead of following the chain"
+    )
+
+
+def test_the_memory_holds_its_object_budget_instead_of_growing(
+    tmp_path, index, config
+):
+    """M is an object budget (docs/method.md, step 5), and it must not drift.
+
+    The earlier implementation unioned each task's memory with the last one, so
+    the memory grew every task and by a different amount per arm — which meant
+    two alpha values differed in how much rehearsal they received as well as in
+    how it was distributed, and no comparison between them meant anything.
+    """
+
+    fake = FakeBridge()
+    results = runner.run_chain(
+        fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(5), prepare_images=lambda ids: ids,
+    )
+
+    budget = replay.ARMS[config.replay_arm]["total"]
+    allocated = [row.replay_row["delivered_objects"] for row in results]
+    assert allocated == [budget] * len(results), (
+        f"the object budget drifted across tasks: {allocated}, expected {budget}"
+    )
+
+
+def test_two_alpha_arms_differ_in_composition_not_in_size(tmp_path, index, config):
+    """The comparison is only valid if the total is held equal."""
+
+    from dataclasses import replace
+
+    composition = {}
+    for arm in ("head_favouring", "tail_favouring"):
+        fake = FakeBridge()
+        results = runner.run_chain(
+            fake, replace(config, replay_arm=arm), workspace=tmp_path / arm,
+            candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
+            start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+            chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+        )
+        composition[arm] = [row.replay_row for row in results]
+
+    budget = replay.ARMS["head_favouring"]["total"]
+    for arm, rows in composition.items():
+        assert [r["delivered_objects"] for r in rows] == [budget] * len(rows), arm
+
+    head = composition["head_favouring"][0]
+    tail = composition["tail_favouring"][0]
+    assert head["delivered_objects"] == tail["delivered_objects"]
+    assert head["per_class"] != tail["per_class"], (
+        "the two allocation rules produced an identical class composition")
+
+
+def test_a_replay_arm_without_an_old_data_pool_is_refused(tmp_path, index, config):
+    """The candidate pool is not a stand-in for old data, and must not become one."""
+
+    with pytest.raises(ValueError, match="replay_index"):
+        runner.run_chain(
+            FakeBridge(), config, workspace=tmp_path, candidate_index=index,
+            replay_root=prob_data_root(tmp_path, index, OLD_DATA),
+            start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+            chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+        )
+
+
+def test_a_replay_arm_without_a_place_to_write_aliases_is_refused(
+    tmp_path, index, config
+):
+    """An object budget is only real if the filtered annotations get written."""
+
+    with pytest.raises(ValueError, match="replay_root"):
+        runner.run_chain(
+            FakeBridge(), config, workspace=tmp_path, candidate_index=index,
+            replay_index=OLD_DATA,
+            start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+            chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
+        )
+
+
+def test_a_memory_that_cannot_be_put_on_disk_stops_the_run(tmp_path, index, config):
+    """Silently rehearsing on 340 of 400 objects would break the comparison."""
+
+    def prepare(image_ids):
+        # the memory's source images are the high ids and never arrive
+        return [i for i in image_ids if not str(i).startswith("00000050")]
+
+    with pytest.raises(RuntimeError, match="exemplar objects on disk"):
+        runner.run_chain(
+            FakeBridge(), config, workspace=tmp_path, candidate_index=index,
+            replay_index=OLD_DATA,
+            replay_root=prob_data_root(tmp_path, index, OLD_DATA),
+            start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+            chain=protocol.build_chain(4), prepare_images=prepare,
+        )
+
+
+def test_running_without_replay_needs_no_old_data_pool(tmp_path, index, config):
+    from dataclasses import replace
+
+    results = runner.run_chain(
+        FakeBridge(), replace(config, replay_arm="none"), workspace=tmp_path,
+        candidate_index=index, start_checkpoint=tmp_path / "t1.pth",
+        test_set="owl_shared_test", chain=protocol.build_chain(4),
+        prepare_images=lambda ids: ids,
+    )
+    assert all(row.replay_row["images"] == 0 for row in results)
 
 
 def test_the_labelling_policy_reaches_probs_supervision_flag(tmp_path, index, config):
@@ -423,7 +723,8 @@ def test_the_labelling_policy_reaches_probs_supervision_flag(tmp_path, index, co
         fake = FakeBridge()
         runner.run_chain(
             fake, replace(config, labelling_policy=policy),
-            workspace=tmp_path / policy, candidate_index=index,
+            workspace=tmp_path / policy, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
             start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
             chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
         )
@@ -436,6 +737,8 @@ def test_a_resumed_run_refetches_nothing_and_retrains_nothing(tmp_path, index, c
     arguments = {
         "workspace": tmp_path,
         "candidate_index": index,
+        "replay_index": OLD_DATA,
+        "replay_root": prob_data_root(tmp_path, index, OLD_DATA),
         "start_checkpoint": tmp_path / "t1.pth",
         "test_set": "owl_shared_test",
         "chain": protocol.build_chain(4),
@@ -451,6 +754,259 @@ def test_a_resumed_run_refetches_nothing_and_retrains_nothing(tmp_path, index, c
     assert fetches == [], "a cached detector pass must not trigger a download"
 
 
+def test_a_resumed_chain_rehearses_on_exactly_what_an_unbroken_one_did(
+    tmp_path, index, config
+):
+    """Replay state has to survive a lost Colab runtime, or arms are not comparable.
+
+    The memory is rebuilt from the eligible pool at the top of every task rather
+    than carried in a variable, so the thing that has to be restored is *which
+    tasks have finished*. If that were restored wrongly the resumed half of a
+    chain would rehearse on a different memory from the first half, inside one
+    results table.
+    """
+
+    arguments = {
+        "candidate_index": index,
+        "replay_index": OLD_DATA,
+        "replay_root": prob_data_root(tmp_path, index, OLD_DATA),
+        "start_checkpoint": tmp_path / "t1.pth",
+        "test_set": "owl_shared_test",
+        "chain": protocol.build_chain(5),
+        "prepare_images": lambda ids: ids,
+    }
+
+    unbroken = FakeBridge()
+    runner.run_chain(unbroken, config, workspace=tmp_path / "whole", **arguments)
+
+    # the same chain, cut off after one task and continued in a new session
+    broken = FakeBridge()
+    runner.run_chain(broken, config, workspace=tmp_path / "cut",
+                     time_budget_minutes=1, **arguments)
+    resumed = FakeBridge()
+    runner.run_chain(resumed, config, workspace=tmp_path / "cut", **arguments)
+
+    straight = [sorted(call["replay"]) for call in unbroken.of("train")]
+    interrupted = [sorted(call["replay"])
+                   for call in broken.of("train") + resumed.of("train")]
+
+    assert len(interrupted) == len(straight) > 2, (
+        f"the interrupted run did not cover the chain: {len(interrupted)} vs "
+        f"{len(straight)}"
+    )
+    assert interrupted == straight, "a resumed chain rehearsed on a different memory"
+
+
+def test_every_replay_arm_delivers_the_same_number_of_objects(tmp_path, index, config):
+    """A: the claim Replay Protocol V3 exists to support.
+
+    ``requested == allocated == delivered == M`` for every arm and every task.
+    Under V2 the same three arms delivered 464, 768 and 1,240 objects at t6 for a
+    budget of 400, because the memory was stored as images and PROB reads whole
+    images.
+    """
+
+    from dataclasses import replace
+
+    budget = replay.ARMS["uniform"]["total"]
+    per_arm = {}
+    for arm in ("head_favouring", "uniform", "tail_favouring"):
+        fake = FakeBridge()
+        results = runner.run_chain(
+            fake, replace(config, replay_arm=arm, n_tasks=6),
+            workspace=tmp_path / arm, candidate_index=index, replay_index=OLD_DATA,
+            replay_root=prob_data_root(tmp_path, index, OLD_DATA),
+            start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+            chain=protocol.build_chain(6), prepare_images=lambda ids: ids,
+        )
+        assert len(results) == 5, arm
+        per_arm[arm] = results
+        for row in results:
+            diagnostics = row.replay_row
+            assert diagnostics["requested_objects"] == budget, (arm, row.task)
+            assert diagnostics["allocated_objects"] == budget, (arm, row.task)
+            assert diagnostics["delivered_objects"] == budget, (arm, row.task)
+            # B: the per-class breakdown sums to the budget and is the allocation
+            counts = dict(
+                pair.split(":") for pair in diagnostics["per_class"].split(";")
+            )
+            assert sum(int(v) for v in counts.values()) == budget, (arm, row.task)
+            # one alias per source image, so nothing was handed over twice
+            assert diagnostics["images"] == diagnostics["unique_source_images"]
+
+    # and the arms really are different memories, not the same one relabelled
+    compositions = {
+        arm: [row.replay_row["per_class"] for row in rows]
+        for arm, rows in per_arm.items()
+    }
+    assert compositions["head_favouring"] != compositions["tail_favouring"]
+
+
+def test_a_discarded_exemplar_cannot_come_back_from_the_canonical_pool(tmp_path, config):
+    """F: the memory is bounded by E_(k-1) and the immediately previous task.
+
+    The pool here is built so that resurrection would be *attractive*: the
+    old-data index is full of a rare class the candidate images never contain, so
+    from t3 onward the allocator would happily draw more of it — and may only use
+    the ones the memory itself kept. If the canonical pool were reopened, t3
+    would hold rare-class objects that t2 had discarded.
+    """
+
+    from dataclasses import replace
+
+    rare = "bear"
+    declared = [task.new_class for task in protocol.build_chain(5)[1:]]
+    assert rare not in declared
+
+    # the candidate pool: the declared classes plus one common previous class,
+    # and never the rare one
+    candidates = {
+        f"{i:012d}": {declared[i % len(declared)]: 1, "person": 2}
+        for i in range(400)
+    }
+    # the old-data pool: mostly the rare class, on images the selector cannot buy
+    old = {
+        f"{700000 + i:012d}": ({rare: 2} if i % 2 else {rare: 1, "person": 1})
+        for i in range(300)
+    }
+
+    fake = FakeBridge()
+    runner.run_chain(
+        fake, replace(config, replay_arm="tail_favouring", n_tasks=5),
+        workspace=tmp_path, candidate_index=candidates, replay_index=old,
+        replay_root=prob_data_root(tmp_path, candidates, old),
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=protocol.build_chain(5), prepare_images=lambda ids: ids,
+    )
+
+    stored = []
+    for task in ("t2", "t3", "t4", "t5"):
+        state = json.loads(
+            (tmp_path / f"{task}_{config.arm}" / "state.json").read_text()
+        )
+        stored.append((
+            task,
+            {tuple(row) for row in state["exemplars"]},
+            set(state["previous_task_images"]),
+        ))
+
+    assert stored[0][1], "t2 stored no exemplars"
+    for index in range(1, len(stored)):
+        task, current, _ = stored[index]
+        _, previous_memory, previous_labelled = stored[index - 1]
+        outside = {
+            item for item in current
+            if item not in previous_memory and item[0] not in previous_labelled
+        }
+        assert not outside, (
+            f"{task} holds {len(outside)} exemplar(s) that were neither in the "
+            f"previous memory nor acquired at the previous task: "
+            f"{sorted(outside)[:3]}"
+        )
+
+    # and the rare class really was discarded between tasks, so the test had
+    # something to catch rather than passing vacuously
+    evicted = [
+        json.loads((tmp_path / f"{task}_{config.arm}" / "state.json").read_text())
+        for task in ("t3", "t4", "t5")
+    ]
+    assert any(state["replay_row"]["evicted"] > 0 for state in evicted), (
+        "nothing was ever evicted, so resurrection was never possible anyway"
+    )
+
+
+def test_a_resumed_chain_stores_bit_identical_exemplars(tmp_path, index, config):
+    """I: object identities, aliases and diagnostics all survive a lost runtime."""
+
+    arguments = {
+        "candidate_index": index,
+        "replay_index": OLD_DATA,
+        "replay_root": prob_data_root(tmp_path, index, OLD_DATA),
+        "start_checkpoint": tmp_path / "t1.pth",
+        "test_set": "owl_shared_test",
+        "chain": protocol.build_chain(5),
+        "prepare_images": lambda ids: ids,
+    }
+
+    whole = FakeBridge()
+    runner.run_chain(whole, config, workspace=tmp_path / "whole", **arguments)
+
+    cut = FakeBridge()
+    runner.run_chain(cut, config, workspace=tmp_path / "cut",
+                     time_budget_minutes=1, **arguments)
+    resumed = FakeBridge()
+    runner.run_chain(resumed, config, workspace=tmp_path / "cut", **arguments)
+
+    def state_of(root, task):
+        return json.loads((root / f"{task}_{config.arm}" / "state.json").read_text())
+
+    for task in ("t2", "t3", "t4", "t5"):
+        straight = state_of(tmp_path / "whole", task)
+        interrupted = state_of(tmp_path / "cut", task)
+        assert straight["exemplars"] == interrupted["exemplars"], task
+        assert straight["previous_task_images"] == interrupted["previous_task_images"], task
+        assert straight["replay_row"] == interrupted["replay_row"], task
+
+    straight_aliases = [sorted(call["replay"]) for call in whole.of("train")]
+    interrupted_aliases = [sorted(call["replay"])
+                           for call in cut.of("train") + resumed.of("train")]
+    assert interrupted_aliases == straight_aliases
+
+
+def test_an_old_workspace_cannot_resume_under_the_new_replay_meaning(
+    tmp_path, index, config
+):
+    """Version 1 built the memory after the fact; version 2 builds it before.
+
+    The arm name is identical in both, so nothing in the stored fingerprint would
+    otherwise stop a version-1 workspace from being continued as version 2 and
+    the two halves ending up in one table.
+    """
+
+    stored = config.fingerprint()
+    del stored["replay_protocol_version"]          # a workspace from before the field
+    (tmp_path).mkdir(parents=True, exist_ok=True)
+    (tmp_path / "config.json").write_text(json.dumps(stored), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="replay_protocol_version"):
+        runner.run_chain(
+            FakeBridge(), config, workspace=tmp_path, candidate_index=index,
+            replay_index=OLD_DATA, start_checkpoint=tmp_path / "t1.pth",
+            replay_root=prob_data_root(tmp_path, index, OLD_DATA),
+            test_set="owl_shared_test", chain=protocol.build_chain(4),
+            prepare_images=lambda ids: ids,
+        )
+
+
+def test_the_first_incremental_task_reports_forgetting_against_the_anchor(
+    tmp_path, index, config
+):
+    """t2 moves the weights furthest, and used to be the one task with no number.
+
+    Forgetting is measured against the previous task's known mAP50, and task 2
+    has no previous task inside the chain — so without scoring the starting
+    checkpoint the column was empty exactly where it matters most.
+    """
+
+    fake = FakeBridge()
+    results = runner.run_chain(
+        fake, config, workspace=tmp_path, candidate_index=index,
+        replay_index=OLD_DATA, start_checkpoint=tmp_path / "t1.pth",
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
+        test_set="owl_shared_test", chain=protocol.build_chain(4),
+        prepare_images=lambda ids: ids,
+    )
+
+    first = results[0].flat()
+    assert first["task"] == "t2"
+    assert first["forgetting"] is not None, "t2 still has no forgetting baseline"
+    assert first["drop_from_anchor"] is not None
+
+    # and the anchor is scored on the starting checkpoint, before any training
+    assert (tmp_path / "anchor_metrics.json").exists()
+    assert fake.of("evaluate")[0]["n_prev"] + fake.of("evaluate")[0]["n_current"] == 19
+
+
 def test_old_checkpoints_are_pruned_so_drive_does_not_fill(tmp_path, index, config):
     """478 MB each x nine tasks x three arms fills a free Drive."""
 
@@ -459,7 +1015,8 @@ def test_old_checkpoints_are_pruned_so_drive_does_not_fill(tmp_path, index, conf
     fake = FakeBridge()
     runner.run_chain(
         fake, replace(config, keep_checkpoints=2), workspace=tmp_path,
-        candidate_index=index, start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        candidate_index=index, start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test", replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     surviving = sorted(p.name for p in tmp_path.rglob("checkpoint.pth"))
@@ -474,7 +1031,8 @@ def test_keeping_every_checkpoint_is_still_possible(tmp_path, index, config):
     fake = FakeBridge()
     runner.run_chain(
         fake, replace(config, keep_checkpoints=0), workspace=tmp_path,
-        candidate_index=index, start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        candidate_index=index, start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test", replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     assert len(list(tmp_path.rglob("checkpoint.pth"))) == 3
@@ -483,7 +1041,8 @@ def test_keeping_every_checkpoint_is_still_possible(tmp_path, index, config):
 def test_the_time_budget_stops_the_chain_and_says_what_it_skipped(tmp_path, index, config, capsys):
     fake = FakeBridge()
     results = runner.run_chain(
-        fake, config, workspace=tmp_path, candidate_index=index,
+        fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
         time_budget_minutes=1,      # one fake call's worth
@@ -520,7 +1079,8 @@ def test_a_second_arm_gets_the_whole_time_budget_it_was_handed(
     for arm in ("prior_consult_batch", "random"):
         finished[arm] = len(runner.run_chain(
             fake, replace(config, arm=arm), workspace=tmp_path / arm,
-            candidate_index=index, start_checkpoint=tmp_path / "t1.pth",
+            candidate_index=index, start_checkpoint=tmp_path / "t1.pth", replay_index=OLD_DATA,
+            replay_root=prob_data_root(tmp_path, index, OLD_DATA),
             test_set="owl_shared_test", chain=chain,
             time_budget_minutes=budget - spent, prepare_images=lambda ids: ids,
         ))
@@ -539,7 +1099,8 @@ def test_the_frequency_split_reaches_the_reported_row(tmp_path, index, config):
 
     fake = FakeBridge()
     results = runner.run_chain(
-        fake, config, workspace=tmp_path, candidate_index=index,
+        fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
@@ -553,7 +1114,8 @@ def test_the_chain_writes_its_rows_as_it_goes(tmp_path, index, config):
 
     fake = FakeBridge()
     runner.run_chain(
-        fake, config, workspace=tmp_path, candidate_index=index,
+        fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
@@ -576,13 +1138,15 @@ def test_a_workspace_from_a_different_configuration_is_refused(tmp_path, index, 
 
     smoke = replace(config, budget_per_task=10, epochs=1)
     runner.run_chain(
-        FakeBridge(), smoke, workspace=tmp_path, candidate_index=index,
+        FakeBridge(), smoke, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     with pytest.raises(RuntimeError, match="different configuration") as caught:
         runner.run_chain(
-            FakeBridge(), config, workspace=tmp_path, candidate_index=index,
+            FakeBridge(), config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
             start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
             chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
         )
@@ -594,13 +1158,15 @@ def test_a_workspace_from_a_different_configuration_is_refused(tmp_path, index, 
 def test_the_same_configuration_still_resumes(tmp_path, index, config):
     first = FakeBridge()
     runner.run_chain(
-        first, config, workspace=tmp_path, candidate_index=index,
+        first, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     second = FakeBridge()
     runner.run_chain(
-        second, config, workspace=tmp_path, candidate_index=index,
+        second, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
@@ -613,13 +1179,15 @@ def test_bookkeeping_only_changes_do_not_block_a_resume(tmp_path, index, config)
     from dataclasses import replace
 
     runner.run_chain(
-        FakeBridge(), config, workspace=tmp_path, candidate_index=index,
+        FakeBridge(), config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
     runner.run_chain(
         FakeBridge(), replace(config, keep_checkpoints=0), workspace=tmp_path,
-        candidate_index=index, start_checkpoint=tmp_path / "t1.pth",
+        candidate_index=index, start_checkpoint=tmp_path / "t1.pth", replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         test_set="owl_shared_test", chain=protocol.build_chain(4),
         prepare_images=lambda ids: ids,
     )
@@ -639,7 +1207,8 @@ def test_a_resumed_chain_restores_what_it_had_already_bought(tmp_path, index, co
     stop_early = replace(config, n_tasks=4)
     first = FakeBridge()
     partial = runner.run_chain(
-        first, stop_early, workspace=tmp_path, candidate_index=index,
+        first, stop_early, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
         time_budget_minutes=4,      # two tasks' worth of fake calls
@@ -649,7 +1218,8 @@ def test_a_resumed_chain_restores_what_it_had_already_bought(tmp_path, index, co
 
     second = FakeBridge()
     complete = runner.run_chain(
-        second, stop_early, workspace=tmp_path, candidate_index=index,
+        second, stop_early, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
@@ -671,7 +1241,8 @@ def test_resuming_does_not_retrain_a_task_whose_checkpoint_was_pruned(tmp_path, 
 
     tight = replace(config, keep_checkpoints=1)
     runner.run_chain(
-        FakeBridge(), tight, workspace=tmp_path, candidate_index=index,
+        FakeBridge(), tight, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
@@ -679,7 +1250,8 @@ def test_resuming_does_not_retrain_a_task_whose_checkpoint_was_pruned(tmp_path, 
 
     again = FakeBridge()
     runner.run_chain(
-        again, tight, workspace=tmp_path, candidate_index=index,
+        again, tight, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
@@ -698,7 +1270,8 @@ def test_the_plans_headline_endpoint_reaches_the_table(tmp_path, index, config):
 
     fake = FakeBridge()
     results = runner.run_chain(
-        fake, config, workspace=tmp_path, candidate_index=index,
+        fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=lambda ids: ids,
     )
@@ -721,7 +1294,8 @@ def test_turning_the_grouped_recall_off_skips_the_second_forward_pass(tmp_path, 
     fake = FakeBridge()
     results = runner.run_chain(
         fake, replace(config, measure_grouped_recall=False), workspace=tmp_path,
-        candidate_index=index, start_checkpoint=tmp_path / "t1.pth",
+        candidate_index=index, start_checkpoint=tmp_path / "t1.pth", replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         test_set="owl_shared_test", chain=protocol.build_chain(4),
         prepare_images=lambda ids: ids,
     )
@@ -752,8 +1326,12 @@ def test_a_cached_detector_pass_does_not_imply_the_images_are_still_there(
             self.present = present
 
         def train(self, labelled_ids, **kwargs):
-            missing = [i for i in list(labelled_ids) + list(kwargs.get("replay_ids", ()))
-                       if i not in self.present]
+            # PROB reads JPEGImages/<id>.jpg for every id in the split. The
+            # labelled ids were fetched; the replay ids are aliases, which exist
+            # only as links onto a fetched source.
+            missing = [i for i in labelled_ids if i not in self.present]
+            missing += [i for i in kwargs.get("replay_ids", ())
+                        if exemplars.source_id(i) not in self.present]
             if missing:
                 raise FileNotFoundError(
                     f"No such file or directory: JPEGImages/{missing[0]}.jpg"
@@ -769,7 +1347,8 @@ def test_a_cached_detector_pass_does_not_imply_the_images_are_still_there(
 
     first = DemandsImages(fetched)
     runner.run_chain(
-        first, config, workspace=tmp_path, candidate_index=index,
+        first, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=fetch,
         time_budget_minutes=4,
@@ -785,14 +1364,16 @@ def test_a_cached_detector_pass_does_not_imply_the_images_are_still_there(
 
     second = DemandsImages(survives_restart)
     results = runner.run_chain(
-        second, config, workspace=tmp_path, candidate_index=index,
+        second, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
         start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
         chain=protocol.build_chain(4), prepare_images=fetch_again,
     )
     assert len(results) == 3, "the resumed chain must finish"
     assert any(call["verb"] == "predict" and False for call in second.calls) is False
     # the point: training images were fetched even though the detector was cached
-    trained = {i for call in second.of("train") for i in call["images"] + call["replay"]}
+    trained = {i for call in second.of("train") for i in call["images"]}
+    trained |= {i for call in second.of("train") for i in replay_sources(call)}
     assert trained, "nothing was trained on"
     assert trained <= survives_restart, "trained on images nobody fetched this session"
 
@@ -809,7 +1390,8 @@ def test_the_run_stops_clearly_when_the_training_downloads_fail(tmp_path, index,
     fake = FakeBridge()
     with pytest.raises(RuntimeError, match="training images on disk"):
         runner.run_chain(
-            fake, config, workspace=tmp_path, candidate_index=index,
+            fake, config, workspace=tmp_path, candidate_index=index, replay_index=OLD_DATA,
+        replay_root=prob_data_root(tmp_path, index, OLD_DATA),
             start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
             chain=protocol.build_chain(4), prepare_images=flaky,
         )

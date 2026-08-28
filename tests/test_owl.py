@@ -409,10 +409,29 @@ def test_herding_prefixes_are_nested():
     assert order[:5].tolist() == order[:10].tolist()[:5]
 
 
-def test_memory_carry_forward_versus_reallocation():
-    previous = replay.Memory(("a", "b"), {}, 0.0, 10)
-    assert replay.carry_forward(previous, ["b", "c"], reallocate=False) == ("a", "b", "c")
-    assert replay.carry_forward(previous, ["b", "c"], reallocate=True) == ("b", "c")
+def test_keeping_the_previous_memory_does_not_enlarge_it():
+    """Both memory policies satisfy the same object budget.
+
+    The point of ``replay_reallocate`` is *composition*, not size: preserving the
+    exemplars we already had must not turn the budget into a running total. The
+    helper this replaces unioned the two image lists, so the memory grew every
+    task and by a different amount per arm — which confounded every alpha
+    comparison with how much rehearsal each arm happened to receive.
+    """
+
+    pool = {f"img{i:02d}": {"a": 1 + i % 3, "b": 1 + i % 2, "c": 1} for i in range(40)}
+    classes = ("a", "b", "c")
+
+    first = replay.build(pool, classes, total=30, alpha=0.0)
+    rebuilt = replay.build(pool, classes, total=30, alpha=0.0)
+    preserved = replay.build(pool, classes, total=30, alpha=0.0,
+                             priority=first.image_ids)
+
+    for memory in (first, rebuilt, preserved):
+        assert sum(memory.per_class.values()) == 30
+
+    # preserving reuses what it can rather than starting over
+    assert set(preserved.image_ids) & set(first.image_ids)
 
 
 # ------------------------------------------------------------------- metrics ---

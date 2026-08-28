@@ -30,6 +30,7 @@ from pathlib import Path
 import numpy as np
 
 from owl import clustering, labelling, metrics, proposals, protocol, replay, selection
+from owl import exemplars as exemplar_memory
 from owl.bridge import Bridge
 
 
@@ -51,6 +52,24 @@ class CycleConfig:
     labelling_policy: str = "known_plus_selected"   # owl.labelling.POLICIES
     replay_arm: str = "tail_favouring"  # owl.replay.ARMS
     replay_reallocate: bool = False     # re-size the memory every task
+
+    #: What "replay" means in this run, and the arm name does not say it — so it
+    #: is part of the fingerprint and an older workspace is refused rather than
+    #: continued under a new meaning.
+    #:
+    #: 1. the memory was built *after* the task's own images had joined the pool,
+    #:    so a task rehearsed on its own fresh data;
+    #: 2. built from data that existed before the task, but stored as *images*
+    #:    chosen to cover an object allocation — and PROB trains on whole images,
+    #:    so the delivered rehearsal ran from 464 to 1,240 objects for a 400
+    #:    budget depending on ``alpha``;
+    #: 3. stored as **objects**. The memory is a set of exemplar boxes, each
+    #:    materialised through an alias annotation holding only itself, so
+    #:    ``sum m_c == |E_k| == delivered == M`` exactly for every arm. The pool
+    #:    an exemplar may be drawn from is bounded by ``E_(k-1)`` plus the
+    #:    immediately preceding task's objects, so a discarded exemplar cannot
+    #:    return and the memory is genuinely fixed-size.
+    replay_protocol_version: int = 3
 
     # --- training ---------------------------------------------------------
     epochs: int = 5
@@ -90,8 +109,8 @@ class CycleConfig:
     RESULT_AFFECTING = (
         "n_tasks", "budget_per_task", "rounds_per_task", "candidate_images_per_task",
         "proposals_per_image", "arm", "labelling_policy", "replay_arm",
-        "replay_reallocate", "reuse_deferred_labels", "epochs", "learning_rate",
-        "batch_size", "n_clusters", "seed",
+        "replay_reallocate", "replay_protocol_version", "reuse_deferred_labels",
+        "epochs", "learning_rate", "batch_size", "n_clusters", "seed",
     )
 
     def fingerprint(self) -> dict[str, object]:
@@ -212,8 +231,20 @@ def run_chain(
     chain: Sequence[protocol.Task] | None = None,
     time_budget_minutes: float | None = None,
     prepare_images: Callable[[Sequence[str]], Sequence[str]] | None = None,
+    replay_index: Mapping[str, Mapping[str, int]] | None = None,
+    replay_root: Path | None = None,
 ) -> list[TaskResult]:
     """Run the task chain on the GPU, one checkpoint per task, resumable.
+
+    ``replay_index`` is the **old-data pool**: image id to per-class object
+    counts for data that already existed before the chain started, which for
+    this protocol is the split PROB's ``t1.pth`` was trained on. It is required
+    whenever a replay arm is active, and it is deliberately a separate argument
+    from ``candidate_index``: the candidate pool is what the *selector* buys
+    from, and rehearsing on it would make the memory a function of the arm's own
+    acquisitions rather than of old knowledge. Passing ``candidate_index`` here
+    is possible but is then an explicit, documented choice — the runner will not
+    make it silently.
 
     Every artefact is keyed by ``workspace / task / arm``, and the bridge skips
     any call whose output already exists — so a Colab session that is cut off
@@ -254,10 +285,14 @@ def run_chain(
     if stamp.exists():
         stored = json.loads(stamp.read_text(encoding="utf-8"))
         current = config.fingerprint()
+        # A field the stored fingerprint never carried is *not* evidence of
+        # agreement: it is a workspace written before that field existed, by code
+        # that meant something different. Treating "absent" as "matches" is how
+        # a version marker fails to do its one job, so absent counts as differing.
         differing = {
-            name: (stored.get(name), value)
+            name: (stored.get(name, "(absent)"), value)
             for name, value in current.items()
-            if name in stored and stored[name] != value
+            if name not in stored or stored[name] != value
         }
         if differing:
             lines = "\n".join(
@@ -274,9 +309,30 @@ def run_chain(
 
     arm = selection.ARMS[config.arm]
     replay_spec = dict(replay.ARMS[config.replay_arm])
-    replay_selector = replay_spec.pop("selector", "greedy")
+    replay_spec.pop("selector", None)
+    replay_budget = int(replay_spec["total"])
+    replay_alpha = float(replay_spec["alpha"])
+    if replay_budget > 0 and replay_root is None:
+        raise ValueError(
+            f"replay_arm={config.replay_arm!r} stores exemplar objects, and each "
+            "one is materialised as an alias annotation holding only itself — "
+            "PROB reads every <object> of the one XML it resolves per image id, "
+            "so an object budget cannot be honoured any other way. `replay_root` "
+            "is the directory holding Annotations/ and JPEGImages/ (PROB's "
+            "--data-root); the aliases are written there and the originals are "
+            "never modified."
+        )
+    if replay_budget > 0 and replay_index is None:
+        raise ValueError(
+            f"replay_arm={config.replay_arm!r} rehearses on old data, and no "
+            "`replay_index` was given. The candidate pool is not a substitute: "
+            "it is what the selector buys from, so a memory drawn from it would "
+            "measure the arm's own acquisitions rather than old knowledge.\n"
+            "Build the old-data index once with\n"
+            "    python tools/build_replay_index.py --help\n"
+            "or pass replay_arm='none' to run without rehearsal."
+        )
 
-    generator = np.random.default_rng(config.seed)
     all_images = np.asarray(sorted(candidate_index), dtype=object)
     used_images: set[str] = set()
     labelled_history: dict[str, list[str]] = {}
@@ -284,7 +340,13 @@ def run_chain(
     #: trained on yet. An entry that is not yet trainable is not lost.
     ledger: set[str] = set()
     trained_on: set[str] = set()
-    memory = replay.Memory((), {}, 0.0, 0)
+    #: ``E_(k-1)``: the exemplar objects stored after the previous task. Empty
+    #: before t2, where the pool is the canonical old-data index itself.
+    exemplars: tuple[exemplar_memory.Exemplar, ...] = ()
+    #: ``L_(k-1)``: the images the *immediately preceding* task trained on. Only
+    #: these join the eligible pool, so the memory cannot reach back into a task
+    #: further behind, and a discarded exemplar cannot be resurrected.
+    previous_task_images: tuple[str, ...] = ()
     checkpoint = Path(start_checkpoint)
     results: list[TaskResult] = []
     written: list[Path] = []
@@ -296,6 +358,30 @@ def run_chain(
     #: stops every arm after the first one at its first task. Measure from here.
     started_at = bridge.cost_report()["total"]
     elapsed = 0.0
+
+    # ---- the anchor -------------------------------------------------------
+    #
+    # Forgetting at task 2 is "what did this step cost", and that needs a number
+    # measured on the checkpoint the step started from. Without it the first
+    # incremental task — the one that moves the weights furthest — reports no
+    # forgetting at all. One evaluation of the starting checkpoint on the same
+    # split fixes that, and it is cached like every other bridge call, so a
+    # resumed session does not pay for it twice. `detections` is off: the
+    # baseline needs known mAP50 and the per-class vector, both of which are in
+    # the metrics file, and the per-box artefact would cost a second pass.
+    anchor_known_map50: float | None = None
+    if chain and chain[0].is_anchor:
+        anchor_path = bridge.evaluate(
+            checkpoint=Path(start_checkpoint), test_set=test_set,
+            output=workspace / "anchor_metrics.json",
+            n_prev=chain[0].n_prev, n_current=chain[0].n_new,
+            detections=False,
+        )
+        anchor = metrics.from_bridge_metrics(anchor_path)
+        anchor_known_map50 = anchor.known_map50
+        previous_baseline = anchor_known_map50
+        print(f"  [anchor] {chain[0].n_current} known classes, "
+              f"mAP50 {anchor_known_map50:.2f} — t2 forgetting is measured from here")
 
     for task in chain[1:]:
         task_dir = workspace / f"{task.name}_{config.arm}"
@@ -317,10 +403,10 @@ def run_chain(
             ledger.update(saved["ledger"])
             trained_on.update(saved["trained_on"])
             labelled_history[task.name] = saved["labelled"]
-            memory = replay.Memory(
-                image_ids=tuple(saved["memory"]), per_class=saved["memory_per_class"],
-                alpha=saved["memory_alpha"], total=saved["memory_total"],
+            exemplars = tuple(
+                exemplar_memory.Exemplar.from_row(row) for row in saved["exemplars"]
             )
+            previous_task_images = tuple(saved["previous_task_images"])
             previous_baseline = saved["known_map50"]
             restored = Path(saved["checkpoint"])
             if restored.exists():
@@ -343,6 +429,15 @@ def run_chain(
         known_now = set(task.known_classes)
 
         # ---- 1. this task's candidate images ----------------------------
+        # Seeded per task, not drawn from one advancing generator. A resumed
+        # chain restores a finished task from disk and `continue`s, so a shared
+        # generator is never advanced for it — and every task after the break
+        # draws the sample that belonged to the task before it. Measured: an
+        # interrupted chain and an unbroken one agree at t2 and diverge from t3
+        # onwards, which means no arm run across two Colab sessions reproduces
+        # itself. Keying the draw on (seed, task) makes it independent of where
+        # the session happened to stop.
+        generator = np.random.default_rng([config.seed, task.index])
         pool = np.asarray([i for i in all_images if i not in used_images], dtype=object)
         take = min(config.candidate_images_per_task, pool.size)
         candidate_ids = [
@@ -437,51 +532,116 @@ def run_chain(
 
         found = sum(candidate_index.get(image, {}).get(task.new_class, 0) for image in opened)
         with_target = sum(1 for image in opened if task.new_class in candidate_index.get(image, {}))
-        labelled_history[task.name] = trainable
-        trained_on.update(trainable)
+        # ---- 5. the exemplar memory: E_k, in objects ----------------------
+        #
+        # Rehearsal is only rehearsal if it is of old knowledge, and a *fixed*
+        # memory only if what it may draw from is bounded. Both are enforced here
+        # rather than hoped for.
+        #
+        #   E_1 subset of the canonical old-data pool
+        #   E_k subset of E_(k-1) union L_(k-1),   k >= 2
+        #
+        # `previous_task_images` is L_(k-1) — the immediately preceding task's
+        # images, not the whole history. So an exemplar this memory evicted is
+        # gone: the pool it came from is no longer offered, and it can only
+        # return if the same object genuinely re-enters through current data.
+        #
+        # The pool is enumerated as *objects*, because that is the unit the
+        # budget is in, and capacities come from the pool actually being selected
+        # from — never from discarded history.
+        previous = set(task.previous_classes)
 
-        # ---- 5. the exemplar memory --------------------------------------
-        if replay_spec["total"] > 0:
-            history = {
-                image: candidate_index.get(image, {})
-                for images in labelled_history.values() for image in images
+        # Bound as defaults, not captured: these are per-task values and a
+        # closure over the loop variable would read whatever the last iteration
+        # left behind if it were ever called later.
+        def eligible_objects(
+            available: set[str] | None = None,
+            *,
+            _held: tuple[exemplar_memory.Exemplar, ...] = exemplars,
+            _incoming_ids: tuple[str, ...] = previous_task_images,
+            _previous: frozenset = frozenset(previous),
+            _spent: frozenset = frozenset(trainable),
+        ) -> tuple[exemplar_memory.Exemplar, ...]:
+            """``E_(k-1)`` plus ``L_(k-1)``, as objects, optionally on-disk only.
+
+            ``_spent`` is what this task just bought. The two pools are not
+            disjoint — measured: 1,800 of the canonical old-data images are also
+            in the candidate pool — so without this an image could be handed to
+            PROB as new supervision and, under its alias, as rehearsal in the
+            same step. It rejoins the pool at the next task as part of
+            ``L_(k-1)``.
+            """
+
+            incoming = {
+                image: dict(candidate_index.get(image, {})) for image in _incoming_ids
             }
-            fresh = replay.build(
-                history, task.previous_classes,
-                total=replay_spec["total"], alpha=replay_spec["alpha"],
-                seed=config.seed, selector=replay_selector,
-            )
-            carried = replay.carry_forward(
-                memory, fresh.image_ids, reallocate=config.replay_reallocate
-            )
-            # same loader constraint: a replay image with no currently-known
-            # object arrives empty and fails the collate
-            carried = tuple(
-                image for image in carried
-                if any(name in known_now for name in candidate_index.get(image, {}))
-            )
-            memory = replay.Memory(
-                image_ids=carried,
-                per_class=fresh.per_class, alpha=fresh.alpha, total=fresh.total,
+            pool = tuple(dict.fromkeys([
+                *_held,
+                *exemplar_memory.enumerate_pool(
+                    incoming if _held else (replay_index or {}), _previous
+                ),
+            ]))
+            return tuple(
+                item for item in pool
+                if item.class_name in _previous
+                and item.image_id not in _spent
+                and (available is None or item.image_id in available)
             )
 
-        # ---- 5b. the images training is about to read must be on disk -----
+        def build_memory(
+            pool: tuple[exemplar_memory.Exemplar, ...],
+            *,
+            _held: tuple[exemplar_memory.Exemplar, ...] = exemplars,
+        ):
+            """Allocate over ``pool``'s capacities and take exactly that many."""
+
+            capacity = exemplar_memory.capacities(pool)
+            demand = replay.allocate(capacity, total=replay_budget, alpha=replay_alpha)
+            chosen = exemplar_memory.select(
+                pool, demand, incumbent=_held,
+                reallocate=config.replay_reallocate, seed=config.seed,
+            )
+            return chosen, demand
+
+        replay_diagnostics: dict[str, object] = {
+            "alpha": replay_alpha, "reallocated": config.replay_reallocate,
+            "requested_objects": 0, "allocated_objects": 0, "delivered_objects": 0,
+            "images": 0, "unique_source_images": 0, "per_class": "",
+            "from_previous_memory": 0, "from_new_task": 0, "evicted": 0, "added": 0,
+            "eligible_objects": 0, "eligible_classes": 0,
+        }
+        held = set(exemplars)
+        chosen: tuple[exemplar_memory.Exemplar, ...] = ()
+        pool = ()
+        if replay_budget > 0:
+            pool = eligible_objects()
+            chosen, demand = build_memory(pool)
+
+        # ---- 5b. what training is about to read must be on disk ------------
         #
         # Unconditionally, not only when the detector ran: Drive keeps the
         # proposals between sessions, /content keeps nothing, so a resumed task
         # can have a cached detector pass and no images at all.
+        #
+        # A memory image that does not arrive would silently shrink the budget,
+        # so the memory is re-selected from the pool minus whatever was lost and
+        # the budget is met again. `prepare_images` is asked for the *source*
+        # ids — the aliases are links made afterwards, and COCO knows nothing
+        # about them.
         if prepare_images is not None:
-            wanted = sorted({*trainable, *memory.image_ids})
-            present = {str(value) for value in prepare_images(wanted)}
-            lost = len(wanted) - len(present)
-            if lost:
-                print(f"  [{task.name}] {lost} of {len(wanted)} training images could "
-                      "not be fetched; dropped")
-            trainable = [image for image in trainable if image in present]
-            memory = replay.Memory(
-                image_ids=tuple(i for i in memory.image_ids if i in present),
-                per_class=memory.per_class, alpha=memory.alpha, total=memory.total,
-            )
+            for _ in range(3):
+                sources = {item.image_id for item in chosen}
+                wanted = sorted({*trainable, *sources})
+                present = {str(value) for value in prepare_images(wanted)}
+                lost = len(wanted) - len(present)
+                if lost:
+                    print(f"  [{task.name}] {lost} of {len(wanted)} images could not "
+                          "be fetched; dropped")
+                trainable = [image for image in trainable if image in present]
+                if replay_budget <= 0 or sources <= present:
+                    break
+                pool = eligible_objects(available=present)
+                chosen, demand = build_memory(pool)
             if len(trainable) < config.batch_size:
                 raise RuntimeError(
                     f"{task.name} has only {len(trainable)} training images on disk "
@@ -489,6 +649,49 @@ def run_chain(
                     f"{config.batch_size}. The downloads failed — check the runtime's "
                     "network."
                 )
+            if replay_budget > 0 and len(chosen) != replay_budget:
+                raise RuntimeError(
+                    f"{task.name} could only put {len(chosen)} of {replay_budget} "
+                    "exemplar objects on disk. Rehearsing on a short memory would "
+                    "make this arm incomparable with the others, which is the one "
+                    "thing the object budget exists to prevent — so the run stops "
+                    "here. The images the memory needs are not arriving; check the "
+                    "runtime's network."
+                )
+
+        # ---- 5c. materialise the memory as alias annotations ---------------
+        #
+        # One alias per source image, holding only the selected boxes. This is
+        # what makes the object budget real: PROB reads every <object> of the one
+        # XML it resolves per image id, so a filtered annotation under a second
+        # id is the only way to hand it 400 boxes and not 1,240.
+        replay_aliases: tuple[str, ...] = ()
+        if replay_budget > 0:
+            mapping = exemplar_memory.write_aliases(chosen, data_root=Path(replay_root))
+            replay_aliases = tuple(sorted(mapping))
+            # what the immediately preceding task contributed, for the ledger
+            fresh = set(exemplar_memory.enumerate_pool(
+                {i: dict(candidate_index.get(i, {})) for i in previous_task_images},
+                previous,
+            ))
+            replay_diagnostics |= {
+                "requested_objects": replay_budget,
+                "allocated_objects": int(sum(demand.values())),
+                "delivered_objects": len(chosen),
+                "images": len(replay_aliases),
+                "unique_source_images": len({item.image_id for item in chosen}),
+                "per_class": ";".join(
+                    f"{name}:{count}" for name, count in sorted(
+                        exemplar_memory.delivered_per_class(chosen).items())
+                ),
+                "from_previous_memory": len(set(chosen) & held),
+                "from_new_task": len(set(chosen) & fresh),
+                "evicted": len(held - set(chosen)),
+                "added": len(set(chosen) - held),
+                "eligible_objects": len(pool),
+                "eligible_classes": len({item.class_name for item in pool}),
+            }
+            exemplars = chosen
 
         # ---- 6. fine-tune -------------------------------------------------
         supervision = "train" if config.labelling_policy == "box_only" else "ft"
@@ -499,7 +702,7 @@ def run_chain(
             output_dir=task_dir / "train",
             n_prev=task.n_prev, n_current=task.n_new,
             test_set=test_set,
-            replay_ids=memory.image_ids,
+            replay_ids=replay_aliases,
             supervision_mode=supervision,
             epochs=config.epochs, learning_rate=config.learning_rate,
             batch_size=config.batch_size,
@@ -519,6 +722,7 @@ def run_chain(
         row = metrics.task_row(
             evaluation, task=task.name, new_class=task.new_class,
             previous_baseline=previous_baseline,
+            anchor_known_map50=anchor_known_map50,
             groups=metrics.group_membership(task.known_classes, groups),
         )
         row["exchange_rate"] = metrics.exchange_rate(row)
@@ -536,6 +740,18 @@ def run_chain(
             row["oracle_cost_so_far"] = (len(results) + 1) * config.budget_per_task
         previous_baseline = evaluation.known_map50
 
+        # ---- 8. only now does this task's data become old data -------------
+        #
+        # After the step has trained and been scored, and after 5b has cut the
+        # images that never arrived, so the pool records what was really learned
+        # from. Everything above ran on a `trained_on` that held earlier tasks
+        # only, which is what keeps a task out of its own rehearsal.
+        labelled_history[task.name] = trainable
+        trained_on.update(trainable)
+        # L_(k-1) for the next task. Only this task's images, not the history:
+        # that bound is what makes the memory fixed-size.
+        previous_task_images = tuple(trainable)
+
         result = TaskResult(
                 task=task.name, new_class=task.new_class,
                 selection_row={
@@ -549,7 +765,7 @@ def run_chain(
                 },
                 annotation_row={"policy": config.labelling_policy,
                                 "supervision": supervision},
-                replay_row=memory.summary(),
+                replay_row=dict(replay_diagnostics),
                 evaluation_row=row,
         )
         results.append(result)
@@ -559,10 +775,12 @@ def run_chain(
             "ledger": sorted(ledger),
             "trained_on": sorted(trained_on),
             "labelled": labelled_history[task.name],
-            "memory": list(memory.image_ids),
-            "memory_per_class": dict(memory.per_class),
-            "memory_alpha": memory.alpha,
-            "memory_total": memory.total,
+            # E_k, as objects: the identities this task rehearsed on and the
+            # only pool the next task may add to. L_k is stored beside it, so a
+            # resumed chain reconstructs the same bounded pool rather than the
+            # whole history.
+            "exemplars": [item.as_row() for item in exemplars],
+            "previous_task_images": list(trainable),
             "known_map50": evaluation.known_map50,
             "checkpoint": str(checkpoint),
             "selection_row": result.selection_row,

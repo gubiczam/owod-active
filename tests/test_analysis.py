@@ -21,7 +21,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_run_chain import FakeBridge
+from test_run_chain import FakeBridge, prob_data_root
 
 from owl import analysis, protocol, runner
 
@@ -34,8 +34,8 @@ def index():
 
     declared = [task.new_class for task in protocol.build_chain(4)[1:]]
     return {
-        f"img{i:04d}": {declared[i % len(declared)]: 1 + (i % 3),
-                        protocol.TASK1[i % len(protocol.TASK1)]: 1}
+        f"{i:012d}": {declared[i % len(declared)]: 1 + (i % 3),
+                      protocol.TASK1[i % len(protocol.TASK1)]: 1}
         for i in range(400)
     }
 
@@ -49,11 +49,14 @@ def workspace(tmp_path, index):
         candidate_images_per_task=40, proposals_per_image=4,
         n_clusters=8, replay_arm="tail_favouring",
     )
+    old_data = {f"{500000 + i:012d}": {protocol.TASK1[i % 19]: 2} for i in range(200)}
     root = tmp_path / "work"
     for arm in ("random", "prior_consult_batch"):
         runner.run_chain(
             FakeBridge(), replace(config, arm=arm), workspace=root / arm,
-            candidate_index=index, start_checkpoint=tmp_path / "t1.pth",
+            candidate_index=index, replay_index=old_data,
+            replay_root=prob_data_root(tmp_path, index, old_data),
+            start_checkpoint=tmp_path / "t1.pth",
             test_set="owl_shared_test", chain=protocol.build_chain(4),
             prepare_images=lambda ids: ids,
         )

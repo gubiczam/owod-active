@@ -32,6 +32,7 @@ import tempfile
 import types
 from contextlib import redirect_stdout
 from pathlib import Path
+from xml.etree import ElementTree as _ET
 
 import numpy as np
 
@@ -331,16 +332,64 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
         by_arm = namespace["by_arm"]
         assert set(by_arm) == {"prior_consult_batch", "random"}, sorted(by_arm)
         verbs = [call["verb"] for call in fake.calls]
-        assert verbs == ["predict", "train", "evaluate"] * 6, verbs
+        # each arm scores the starting checkpoint once — that is what task 2
+        # measures its forgetting against — and then runs the cycle per task
+        assert verbs == (["evaluate"] + ["predict", "train", "evaluate"] * 3) * 2, verbs
+        # The notebook falls back to REPLAY_ARM="none" when there is no old-data
+        # index, which is the right refusal but is also invisible in a table. If
+        # the index is on disk, the run must actually have rehearsed — otherwise
+        # a silent fallback would ship a no-replay chain labelled as a replay one.
+        index_path = ROOT / "data" / "reference" / "t1_replay_class_counts.json"
+        if index_path.exists():
+            assert namespace["replay_index"], "the replay index exists but was not loaded"
+            assert namespace["REPLAY_ARM"] != "none", (
+                "the replay index is on disk, yet the notebook fell back to "
+                "REPLAY_ARM='none'")
+            from owl import exemplars as _exemplars
+            from owl import replay as _replay
+
+            budget = _replay.ARMS[namespace["REPLAY_ARM"]]["total"]
+            for call in [c for c in fake.calls if c["verb"] == "train"]:
+                assert call["replay"], (
+                    "a training step received no replay images although a replay "
+                    "arm was configured")
+                # the aliases must be aliases, not the physical images
+                assert all(str(i).startswith("9") for i in call["replay"])
+            for arm, rows in by_arm.items():
+                for row in rows:
+                    diagnostics = row.replay_row
+                    assert (
+                        diagnostics["requested_objects"]
+                        == diagnostics["allocated_objects"]
+                        == diagnostics["delivered_objects"]
+                        == budget
+                    ), f"{arm} {row.task}: object budget not held: {diagnostics}"
+            # and the filtered annotations really were written
+            written = list((namespace["DATA"] / "Annotations").glob("9*.xml"))
+            assert written, "no replay alias annotation was written"
+            boxes = sum(
+                len(_ET.parse(path).getroot().findall("object")) for path in written
+            )
+            print(f"replay branch exercised: {len(namespace['replay_index'])} "
+                  f"old-data images, arm '{namespace['REPLAY_ARM']}', "
+                  f"{len(written)} alias annotations holding {boxes} boxes; "
+                  f"budget held at {budget} objects every task")
+            assert _exemplars.source_id(written[0].stem).startswith("0")
+        else:
+            assert namespace["REPLAY_ARM"] == "none", (
+                "no replay index on disk, so the run must not claim to rehearse")
+            print("no replay index on disk: the no-rehearsal branch was exercised")
+
         for arm, results in by_arm.items():
             assert len(results) == 3, f"{arm}: expected three tasks, got {len(results)}"
             for row in results:
                 flat = row.flat()
                 for column in ("known_mAP50", "prev_mAP50", "new_mAP50", "U_Recall50",
-                               "U_Recall_tail", "oracle_cost_so_far"):
+                               "U_Recall_tail", "oracle_cost_so_far", "forgetting",
+                               "drop_from_anchor"):
                     assert flat.get(column) is not None, f"{arm} {row.task}: no {column}"
-        print("\nGPU branch: 2 arms x 3 tasks, 18 PROB calls, every metric present "
-              "including the grouped recall.")
+        print("\nGPU branch: 2 arms x (1 anchor + 3 tasks), 20 PROB calls, every "
+              "metric present including the grouped recall and t2 forgetting.")
     else:
         assert namespace["gpu_results"] == []
         print("\nCPU branch: complete, GPU chain correctly skipped.")

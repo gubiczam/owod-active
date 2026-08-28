@@ -280,17 +280,15 @@ def herding_order(embeddings: np.ndarray) -> np.ndarray:
     return np.asarray(order, dtype=np.int64)
 
 
-def carry_forward(previous: Memory, new_images: Sequence[str], *, reallocate: bool) -> tuple[str, ...]:
-    """Between-task bookkeeping.
-
-    ``reallocate=False`` is the usual thing: keep last task's memory and add to
-    it. ``reallocate=True`` is what the consultation asked to test — throw the
-    old memory away and size a new one for the classes that are known *now*.
-    """
-
-    if reallocate:
-        return tuple(new_images)
-    return tuple(dict.fromkeys([*previous.image_ids, *new_images]))
+#: Between tasks the memory is not patched, it is rebuilt: :func:`build` is
+#: called again with the class set known now, so the object budget is re-satisfied
+#: from scratch every task and cannot drift. ``replay_reallocate`` chooses only
+#: *how* it is rebuilt — pass the previous memory as ``priority`` to keep the
+#: exemplars we already had wherever they still serve the new allocation, or pass
+#: nothing to re-derive it by set cover. An earlier ``carry_forward`` helper
+#: unioned the image lists instead, which meant the memory grew every task and by
+#: a different amount per arm; that made ``alpha`` arms differ in size as well as
+#: in composition, so it was removed rather than fixed.
 
 
 #: The registered replay arms, one per row of the consultation's table.
