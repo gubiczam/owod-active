@@ -248,32 +248,96 @@ def test_the_presets_resolve_the_way_the_run_guide_says(
 def test_the_notebook_runs_every_arm_from_one_press():
     """A single arm's numbers have nothing to be measured against.
 
-    The method, the floor and the learning-free control all have to run on the
-    same protocol, so the notebook loops them rather than asking the user to
-    edit a name and press Run all three times.
+    The arms of the current study are the *replay* arms: selection is held fixed
+    at random so that what varies is the class composition of a fixed rehearsal
+    budget. The notebook loops them rather than asking the user to edit a name
+    and press Run all once per arm — which is what produced the mixed
+    ``REPLAY_ARM`` / ``REPLAY_ARMS`` state this test now guards against.
     """
 
     parameters = cell_containing("# ============================== PARAMETERS")
     namespace: dict = {}
     exec(compile(parameters, "parameters", "exec"), namespace)  # noqa: S102
+
+    from owl import replay, selection
+
     arms = namespace["ARMS"]
-    assert arms[0] == "prior_consult_batch", "the method comes first"
-    assert "random" in arms, "the floor must be measured, not assumed"
-    assert "objectness" in arms, "the learning-free control is the bar to beat"
-
-    from owl import selection
-
+    replay_arms = namespace["REPLAY_ARMS"]
+    assert arms == ("random",), "the replay study holds selection fixed"
+    assert len(replay_arms) > 1, "one replay arm has nothing to be compared with"
     for arm in arms:
-        assert arm in selection.ARMS, f"{arm} is not a registered arm"
+        assert arm in selection.ARMS, f"{arm} is not a registered selection arm"
+    for replay_arm in replay_arms:
+        assert replay_arm in replay.ARMS, f"{replay_arm} is not a registered replay arm"
 
 
-def test_the_arms_share_one_time_budget_and_say_what_did_not_run():
-    """The session is what runs out, so the budget cannot be per arm."""
+def test_no_cell_reaches_for_a_singular_replay_arm():
+    """The failure this guards: a Run all that dies on a CPU diagnostic.
+
+    The parameter cell was edited to sweep ``REPLAY_ARMS`` while three later
+    cells still read a singular ``REPLAY_ARM``, so a fresh runtime raised
+    ``NameError`` on the simulation cell — after the CPU sections had already
+    spent minutes. Every cell must take its replay arm from the sweep, either by
+    naming one explicitly or by looping.
+    """
+
+    for index, source in enumerate(code_cells()):
+        for number, line in enumerate(source.splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("#") or "REPLAY_ARM" not in line:
+                continue
+            assert "REPLAY_ARMS" in line, (
+                f"cell {index} line {number} reads a singular REPLAY_ARM, which "
+                f"the parameter cell no longer defines: {stripped}"
+            )
+
+
+def test_the_experiment_audit_names_what_the_run_will_do():
+    """Requirement of the overnight run: the configuration is visible up front."""
+
+    parameters = cell_containing("# ============================== PARAMETERS")
+    namespace: dict = {}
+    exec(compile(parameters, "parameters", "exec"), namespace)  # noqa: S102
+    assert callable(namespace["describe_experiment"])
+
+    import io
+    from contextlib import redirect_stdout
+
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        namespace["describe_experiment"]()
+    printed = buffer.getvalue()
+
+    for expected in ("selection arm", "replay arm", "tasks", "candidate images",
+                     "annotation budget", "selection rounds", "epochs", "seed",
+                     "workspaces", "max time"):
+        assert expected in printed, f"the audit does not report {expected!r}"
+    for arm in namespace["ARMS"]:
+        for replay_arm in namespace["REPLAY_ARMS"]:
+            assert f"work/{arm}__{replay_arm}" in printed, (
+                f"the audit does not name the workspace for {arm}__{replay_arm}")
+
+
+def test_each_run_gets_its_own_time_budget_and_skips_are_named():
+    """Sharing one budget truncates whichever run goes second.
+
+    At the measured V3 cost a five-task chain is about 263 minutes, so a single
+    420-minute pot leaves the second run 157 and it stops after three tasks —
+    producing two arms that cannot be compared with each other. Each run gets
+    its own cap; the session ceiling is what stops scheduling, and a run that
+    never started has to be named rather than silently missing.
+    """
 
     chain = cell_containing("for arm in ARMS:")
-    assert "TIME_BUDGET_MINUTES - spent" in chain, "each arm would get a full budget"
-    assert "not started" in chain, "an arm that never ran must be named"
+    assert "for replay_arm in REPLAY_ARMS:" in chain, "the replay arms must be swept"
+    assert "remaining = TIME_BUDGET_MINUTES" in chain, "the cap must be per run"
+    assert "TIME_BUDGET_MINUTES - spent" not in chain, "that is the shared budget again"
+    assert "session_ceiling = TIME_BUDGET_MINUTES * len(planned)" in chain
+    assert "not started" in chain, "a run that never ran must be named"
     assert "Run all again" in chain, "the user must be told it resumes"
+    assert 'workspace=WORK / run' in chain, "each run needs its own workspace"
+    assert 'replace(base_config, arm=arm, replay_arm=replay_arm)' in chain, (
+        "the singular config field is what the loop must fill")
 
 
 def test_the_notebook_is_committed_ready_to_run():

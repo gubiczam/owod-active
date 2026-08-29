@@ -383,6 +383,161 @@ def per_class_ap50(payload: Mapping[str, object], *, class_names=None) -> dict[s
     return result
 
 
+
+def validate_per_class_ap50(
+    payload: Mapping[str, object], *, tolerance: float = 1e-3
+) -> dict[str, object]:
+    """Check the per-class vector against the aggregates the evaluator itself reported.
+
+    ``coco_eval_bbox`` is not labelled as a per-class table anywhere in the
+    metrics file — its neighbours are scalars, and the key looks like a COCO
+    summary. So rather than trusting the offsets, this recomputes the evaluator's
+    own ``previous_known_AP50``, ``current_known_AP50`` and ``unknown_AP50`` from
+    the vector and compares. If the three agree, the vector is the per-class
+    table and the offsets are right; if they do not, something about the layout
+    changed and the caller must be told rather than handed a plausible-looking
+    table of the wrong classes.
+
+    Verified on every committed GPU metrics file: the reconstruction matches to
+    six significant figures.
+    """
+
+    per_class = per_class_ap50(payload)
+    if not per_class:
+        vector = payload.get("coco_eval_bbox") or []
+        return {
+            "usable": False,
+            "reason": (
+                f"coco_eval_bbox has {len(vector)} entries, not the "
+                f"{COCO_EVAL_BBOX_OFFSET + COCO_EVAL_BBOX_CLASSES + 1} this reader "
+                "understands, and no per_class_AP50 mapping was written"
+            ),
+            "checks": [],
+        }
+
+    from owl.protocol import CLASS_ORDER
+
+    # Absent is not the same as zero. The anchor is evaluated with
+    # `prev=0, current=19` — zero previous classes is the truth there, not a
+    # missing field — while the older committed files carry neither key and do
+    # need the chain's default split. Conflating the two compared the wrong
+    # slices and made the anchor look corrupt.
+    declared_prev = payload.get("previous_introduced_classes")
+    declared_current = payload.get("current_introduced_classes")
+    if declared_prev is None and declared_current is None:
+        n_prev, n_current = 19, 0
+    else:
+        n_prev = int(declared_prev or 0)
+        n_current = int(declared_current or 0)
+
+    checks: list[dict] = []
+
+    def compare(label: str, names: Sequence[str], reported: object) -> None:
+        values = [per_class[name] for name in names if name in per_class]
+        if not values or reported is None:
+            return
+        rebuilt = sum(values) / len(values)
+        checks.append({
+            "quantity": label,
+            "rebuilt": rebuilt,
+            "reported": float(reported),
+            "agrees": abs(rebuilt - float(reported)) <= tolerance,
+        })
+
+    if n_prev:
+        compare("previous_known_AP50", CLASS_ORDER[:n_prev],
+                payload.get("previous_known_AP50"))
+    if n_current:
+        compare("current_known_AP50", CLASS_ORDER[n_prev:n_prev + n_current],
+                payload.get("current_known_AP50"))
+    unknown = payload.get("unknown_AP50")
+    if unknown is not None and "unknown" in per_class:
+        checks.append({
+            "quantity": "unknown_AP50",
+            "rebuilt": per_class["unknown"],
+            "reported": float(unknown),
+            "agrees": abs(per_class["unknown"] - float(unknown)) <= tolerance,
+        })
+
+    disagreed = [c["quantity"] for c in checks if not c["agrees"]]
+    return {
+        "usable": not disagreed,
+        "reason": (
+            "" if not disagreed else
+            f"the per-class vector does not reproduce {disagreed}; the layout of "
+            "coco_eval_bbox is not what this reader assumes"
+        ),
+        "checks": checks,
+        "n_classes": len(per_class),
+    }
+
+
+def per_class_recall(
+    artifact: Mapping[str, object] | str,
+    *,
+    classes: Sequence[str],
+    iou_threshold: float = 0.5,
+    minimum_score: float = 0.0,
+) -> dict[str, dict[str, float]]:
+    """Per-class recall at ``iou_threshold`` from the detections artefact.
+
+    This is **not** a second AP implementation and must not be reported as AP:
+    AP integrates precision over recall and depends on the score ranking of every
+    detection, which is exactly the part a hand-rolled reimplementation gets
+    subtly wrong. What the artefact supports without that risk is recall, and it
+    is computed with the same greedy, score-ordered, one-detection-per-object
+    matching :func:`unknown_recall_by_group` already uses.
+
+    Its purpose is a cross-check: a class whose AP50 collapsed should also lose
+    recall, and a class the evaluator says is fine should still be found. When
+    the two disagree, the per-class AP table is the one to distrust.
+    """
+
+    if isinstance(artifact, (str, Path)):
+        artifact = json.loads(Path(artifact).read_text(encoding="utf-8"))
+    if artifact.get("schema") != "daowod_detections_v1":
+        raise MetricsError(
+            f"Unexpected detections schema {artifact.get('schema')!r}; this reader "
+            "understands 'daowod_detections_v1'."
+        )
+
+    wanted = set(classes)
+    truth: dict[tuple[str, str], list[list[float]]] = {}
+    for record in artifact["ground_truth"]:
+        name = record["class_name"]
+        if name in wanted:
+            truth.setdefault((record["image_id"], name), []).append(record["box"])
+
+    found: dict[tuple[str, str], list[tuple[float, list[float]]]] = {}
+    for record in artifact["detections"]:
+        name = record["class_name"]
+        if name in wanted and record["score"] >= minimum_score:
+            found.setdefault((record["image_id"], name), []).append(
+                (record["score"], record["box"]))
+
+    tally = {name: [0, 0] for name in wanted}
+    for (image_id, name), boxes in truth.items():
+        matrix = np.asarray(boxes, dtype=float)
+        claimed = np.zeros(len(boxes), dtype=bool)
+        for _, box in sorted(found.get((image_id, name), ()), key=lambda item: -item[0]):
+            overlaps = _iou(np.asarray(box, dtype=float), matrix)
+            overlaps[claimed] = -1.0
+            best = int(np.argmax(overlaps)) if overlaps.size else -1
+            if best >= 0 and overlaps[best] >= iou_threshold:
+                claimed[best] = True
+        tally[name][0] += int(claimed.sum())
+        tally[name][1] += len(boxes)
+
+    return {
+        name: {
+            "recalled": recalled,
+            "objects": total,
+            "recall": 100.0 * recalled / total if total else None,
+        }
+        for name, (recalled, total) in tally.items()
+    }
+
+
 # ------------------------------------------------- the chain's reporting row ---
 
 

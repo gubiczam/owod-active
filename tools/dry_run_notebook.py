@@ -179,8 +179,17 @@ class FakeBridge:
         step = len([c for c in self.calls if c["verb"] == "evaluate"])
         payload = {
             "known_AP50": 60.0 - step, "U_Recall": 20.0 - step,
-            "previous_known_AP50": 70.0 - 2 * step, "current_known_AP50": 3.0 + step,
+            # derived from the vector below, the way the real bridge's are: the
+            # per-class provenance check rebuilds these and refuses a file whose
+            # aggregates disagree with its own coco_eval_bbox
+            "previous_known_AP50": (
+                sum(float(i % 40) for i in range(n_prev)) / n_prev if n_prev else 0.0),
+            "current_known_AP50": (
+                sum(float(i % 40) for i in range(n_prev, n_prev + n_current))
+                / n_current if n_current else 0.0),
             "unknown_AP50": 0.4, "WI": 0.03, "A_OSE": 1200,
+            "previous_introduced_classes": n_prev,
+            "current_introduced_classes": n_current,
             "coco_eval_bbox": [30.0, 30.0, *[float(i % 40) for i in range(80)], 0.4],
                 }
         output.write_text(json.dumps(payload), encoding="utf-8")
@@ -293,9 +302,12 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
                     "\nCANDIDATE_IMAGES, PROPOSALS_PER_IMAGE = 60, 4"
                     "\nEVAL_MAX_PER_CLASS, EVAL_REMAINDER_RATIO = 3, 0"
                     "\nN_CLUSTERS, TIME_BUDGET_MINUTES = 64, 10_000"
-                    # two arms, not three: enough to exercise the loop and the
-                    # cross-arm comparison, cheap enough to run on every commit
-                    "\nARMS = ('prior_consult_batch', 'random')\n"
+                    # one selection arm and both replay arms: the shape the
+                    # replay study actually runs, which exercises the nested
+                    # loop, the per-run workspace and the cross-run comparison,
+                    # and is cheap enough to run on every commit
+                    "\nARMS = ('random',)"
+                    "\nREPLAY_ARMS = ('uniform', 'tail_favouring')\n"
                 )
 
             for before, after in substitutions(workspace):
@@ -330,32 +342,35 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
     if run_gpu:
         fake = namespace["prob_bridge"]
         by_arm = namespace["by_arm"]
-        assert set(by_arm) == {"prior_consult_batch", "random"}, sorted(by_arm)
+        assert set(by_arm) == {"random__uniform", "random__tail_favouring"}, sorted(by_arm)
         verbs = [call["verb"] for call in fake.calls]
         # each arm scores the starting checkpoint once — that is what task 2
         # measures its forgetting against — and then runs the cycle per task
         assert verbs == (["evaluate"] + ["predict", "train", "evaluate"] * 3) * 2, verbs
-        # The notebook falls back to REPLAY_ARM="none" when there is no old-data
-        # index, which is the right refusal but is also invisible in a table. If
-        # the index is on disk, the run must actually have rehearsed — otherwise
-        # a silent fallback would ship a no-replay chain labelled as a replay one.
+        # The notebook falls back to REPLAY_ARMS=("none",) when there is no
+        # old-data index, which is the right refusal but is also invisible in a
+        # table. If the index is on disk, the run must actually have rehearsed —
+        # otherwise a silent fallback would ship a no-replay chain labelled as a
+        # replay one.
         index_path = ROOT / "data" / "reference" / "t1_replay_class_counts.json"
         if index_path.exists():
             assert namespace["replay_index"], "the replay index exists but was not loaded"
-            assert namespace["REPLAY_ARM"] != "none", (
+            assert tuple(namespace["REPLAY_ARMS"]) != ("none",), (
                 "the replay index is on disk, yet the notebook fell back to "
-                "REPLAY_ARM='none'")
+                "REPLAY_ARMS=('none',)")
             from owl import exemplars as _exemplars
             from owl import replay as _replay
 
-            budget = _replay.ARMS[namespace["REPLAY_ARM"]]["total"]
             for call in [c for c in fake.calls if c["verb"] == "train"]:
                 assert call["replay"], (
                     "a training step received no replay images although a replay "
                     "arm was configured")
                 # the aliases must be aliases, not the physical images
                 assert all(str(i).startswith("9") for i in call["replay"])
-            for arm, rows in by_arm.items():
+            for run, rows in by_arm.items():
+                # the run's name carries its replay arm, so the budget it must
+                # hold is looked up per run rather than assumed shared
+                budget = _replay.ARMS[run.rsplit("__", 1)[1]]["total"]
                 for row in rows:
                     diagnostics = row.replay_row
                     assert (
@@ -363,7 +378,7 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
                         == diagnostics["allocated_objects"]
                         == diagnostics["delivered_objects"]
                         == budget
-                    ), f"{arm} {row.task}: object budget not held: {diagnostics}"
+                    ), f"{run} {row.task}: object budget not held: {diagnostics}"
             # and the filtered annotations really were written
             written = list((namespace["DATA"] / "Annotations").glob("9*.xml"))
             assert written, "no replay alias annotation was written"
@@ -371,12 +386,12 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
                 len(_ET.parse(path).getroot().findall("object")) for path in written
             )
             print(f"replay branch exercised: {len(namespace['replay_index'])} "
-                  f"old-data images, arm '{namespace['REPLAY_ARM']}', "
+                  f"old-data images, arms {tuple(namespace['REPLAY_ARMS'])}, "
                   f"{len(written)} alias annotations holding {boxes} boxes; "
-                  f"budget held at {budget} objects every task")
+                  "every run held its own object budget on every task")
             assert _exemplars.source_id(written[0].stem).startswith("0")
         else:
-            assert namespace["REPLAY_ARM"] == "none", (
+            assert tuple(namespace["REPLAY_ARMS"]) == ("none",), (
                 "no replay index on disk, so the run must not claim to rehearse")
             print("no replay index on disk: the no-rehearsal branch was exercised")
 
@@ -388,7 +403,7 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
                                "U_Recall_tail", "oracle_cost_so_far", "forgetting",
                                "drop_from_anchor"):
                     assert flat.get(column) is not None, f"{arm} {row.task}: no {column}"
-        print("\nGPU branch: 2 arms x (1 anchor + 3 tasks), 20 PROB calls, every "
+        print("\nGPU branch: 2 runs x (1 anchor + 3 tasks), 20 PROB calls, every "
               "metric present including the grouped recall and t2 forgetting.")
     else:
         assert namespace["gpu_results"] == []

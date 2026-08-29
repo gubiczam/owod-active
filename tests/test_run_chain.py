@@ -108,13 +108,24 @@ class FakeBridge:
             "test_set": test_set,
         })
         output.parent.mkdir(parents=True, exist_ok=True)
+        # The real bridge writes no per_class_AP50 key. It writes this vector,
+        # shaped [mAP, mAP, <80 classes>, unknown], and the scalars beside it are
+        # means over slices of that same vector. Deriving them here rather than
+        # hard-coding them is what lets the provenance check be exercised: a fake
+        # whose aggregates disagree with its own vector is a fake that cannot
+        # test whether the reader is reading the right offsets.
+        per_class = [float(i % 40) for i in range(80)]
+        unknown_ap = 0.5
+        previous = per_class[:n_prev]
+        current = per_class[n_prev:n_prev + n_current]
         payload = {
             "known_AP50": 40.0, "U_Recall": 20.0, "WI": 0.03, "A_OSE": 1000,
-            "previous_known_AP50": 60.0, "current_known_AP50": 5.0,
-            "unknown_AP50": 0.5,
-            # the real bridge writes no per_class_AP50; it writes this vector,
-            # shaped [mAP, mAP, <80 classes>, unknown]
-            "coco_eval_bbox": [30.0, 30.0, *[float(i % 40) for i in range(80)], 0.5],
+            "previous_known_AP50": sum(previous) / len(previous) if previous else 0.0,
+            "current_known_AP50": sum(current) / len(current) if current else 0.0,
+            "unknown_AP50": unknown_ap,
+            "previous_introduced_classes": n_prev,
+            "current_introduced_classes": n_current,
+            "coco_eval_bbox": [30.0, 30.0, *per_class, unknown_ap],
                 }
         output.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -132,6 +143,14 @@ class FakeBridge:
                 if index % 2 == 0:                      # half of them recalled
                     found.append({"image_id": "000000000000", "class_name": "unknown",
                                   "score": 0.9, "box": box})
+            # the known classes are in the artefact too — that is what makes the
+            # per-class recall cross-check on the previous classes possible
+            for index, name in enumerate(_protocol.CLASS_ORDER[:n_prev]):
+                box = [5.0 * index, 100.0, 5.0 * index + 4.0, 104.0]
+                truth.append({"image_id": "000000000001", "class_name": name, "box": box})
+                if index % 3:                           # two thirds recalled
+                    found.append({"image_id": "000000000001", "class_name": name,
+                                  "score": 0.8, "box": box})
             artefact.write_text(json.dumps({
                 "schema": "daowod_detections_v1", "unknown_class_name": "unknown",
                 "ground_truth": truth, "detections": found,
