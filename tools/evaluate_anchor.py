@@ -165,10 +165,6 @@ def main() -> int:
         return 1
 
     output = workspace / "anchor_metrics.json"
-    if output.exists():
-        print(f"{output} already exists — nothing to do. Delete it deliberately if "
-              "you want it recomputed.")
-        return 0
     if not arguments.checkpoint.is_file():
         print(f"error: checkpoint {arguments.checkpoint} is missing", file=sys.stderr)
         return 1
@@ -251,22 +247,31 @@ def main() -> int:
     print("annotations    exact byte match with the committed archive")
 
     first_train_metadata = workspace / f"t2_{selection_arm}" / "checkpoint.train.json"
-    if first_train_metadata.exists():
-        trained = json.loads(first_train_metadata.read_text(encoding="utf-8"))
-        recorded_checkpoint = trained.get("previous_checkpoint")
-        print(f"chain started  {recorded_checkpoint}")
-        if recorded_checkpoint and Path(recorded_checkpoint).resolve() != \
-                arguments.checkpoint.resolve():
-            print("\n*** The supplied checkpoint path differs from the one recorded "
-                  "for t2. A path is not a content hash, but this mismatch is enough "
-                  "to refuse the anchor.", file=sys.stderr)
-            return 1
-    else:
-        print("checkpoint     no t2 training metadata; exact historical checkpoint "
-              "identity cannot be proven from this workspace")
+    if not first_train_metadata.exists():
+        print("\n*** The t2 training metadata is missing, so the exact historical "
+              "checkpoint cannot be proven. Refusing to create or bless an anchor.",
+              file=sys.stderr)
+        return 1
+    trained = json.loads(first_train_metadata.read_text(encoding="utf-8"))
+    recorded_checkpoint = trained.get("previous_checkpoint")
+    print(f"chain started  {recorded_checkpoint}")
+    if not recorded_checkpoint:
+        print("\n*** The t2 training metadata does not record previous_checkpoint. "
+              "Refusing to create or bless an anchor.", file=sys.stderr)
+        return 1
+    if Path(recorded_checkpoint).resolve() != arguments.checkpoint.resolve():
+        print("\n*** The supplied checkpoint path differs from the one recorded "
+              "for t2. A path is not a content hash, but this mismatch is enough "
+              "to refuse the anchor.", file=sys.stderr)
+        return 1
 
     if arguments.dry_run:
         print("\n--dry-run: inputs are verified; PROB was not called and nothing was written.")
+        return 0
+
+    if output.exists():
+        print(f"{output} already exists and its inputs were re-verified — nothing "
+              "to do. Delete it deliberately if you want it recomputed.")
         return 0
 
     # ---- one evaluation, and nothing else ----------------------------------

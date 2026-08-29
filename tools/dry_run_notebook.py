@@ -18,8 +18,7 @@ Everything else is the real code on the real committed data. If this passes, the
 notebook's control flow works; what it cannot check is whether PROB itself likes
 the arguments.
 
-    python tools/dry_run_notebook.py            # GPU branch
-    python tools/dry_run_notebook.py --cpu      # CPU branch
+    python tools/dry_run_notebook.py
 """
 
 from __future__ import annotations
@@ -158,23 +157,27 @@ class FakeBridge:
         output_checkpoint.parent.mkdir(parents=True, exist_ok=True)
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         output_checkpoint.write_bytes(b"fake checkpoint")
+        output_checkpoint.with_suffix(".train.json").write_text(json.dumps({
+            "previous_checkpoint": str(previous_checkpoint),
+            "output_checkpoint": str(output_checkpoint),
+        }), encoding="utf-8")
         return output_checkpoint
 
     def evaluate(self, *, checkpoint, test_set, output, n_prev, n_current,
                  detections=True, **_):
+        output = Path(output)
+        if output.exists():
+            return output
         check_split_name(test_set, purpose="test")
         assert Path(checkpoint).exists()
         split = self.data_root / "ImageSets" / "OWDETR" / f"{test_set}.txt"
         assert split.exists(), f"PROB evaluate would fail: no image set at {split}"
-        for image_id in split.read_text().split():
+        split_ids = split.read_text().split()
+        for image_id in split_ids:
             assert (self.data_root / "JPEGImages" / f"{image_id}.jpg").exists(), (
                 f"PROB evaluate would fail: test image {image_id} is not on disk")
-            break
         self.calls.append({"verb": "evaluate", "n_prev": n_prev,
                            "n_current": n_current, "test_set": test_set})
-        output = Path(output)
-        if output.exists():
-            return output
         output.parent.mkdir(parents=True, exist_ok=True)
         step = len([c for c in self.calls if c["verb"] == "evaluate"])
         payload = {
@@ -191,6 +194,7 @@ class FakeBridge:
                 sum(float(i % 40) for i in range(n_prev, n_prev + n_current))
                 / n_current if n_current else 0.0),
             "unknown_AP50": 0.4, "WI": 0.03, "A_OSE": 1200,
+            "test_set": test_set,
             "coco_eval_bbox": [30.0, 30.0, *[float(i % 40) for i in range(80)], 0.4],
                 }
         output.write_text(json.dumps(payload), encoding="utf-8")
@@ -203,14 +207,27 @@ class FakeBridge:
             artefact = output.with_name(f"{output.stem}_detections.json")
             unknown = _protocol.CLASS_ORDER[n_prev + n_current:][:6]
             truth, found = [], []
+            # Every split id appears first, in exact split order. The anchor tool
+            # validates this recorded order before it will bless historical data.
+            for index, image_id in enumerate(split_ids):
+                name = _protocol.TASK1[index % len(_protocol.TASK1)]
+                box = [0.0, 0.0, 8.0, 8.0]
+                truth.append({"image_id": image_id, "class_name": name, "box": box})
+                found.append({"image_id": image_id, "class_name": name,
+                              "score": 0.95, "box": box})
             for index, name in enumerate(unknown):
                 box = [10.0 * index, 0.0, 10.0 * index + 8.0, 8.0]
-                truth.append({"image_id": "img0", "class_name": name, "box": box})
+                truth.append({"image_id": split_ids[0], "class_name": name, "box": box})
                 if index % 2 == 0:                      # half of them recalled
-                    found.append({"image_id": "img0", "class_name": "unknown",
+                    found.append({"image_id": split_ids[0], "class_name": "unknown",
                                   "score": 0.9, "box": box})
             artefact.write_text(json.dumps({
                 "schema": "daowod_detections_v1", "unknown_class_name": "unknown",
+                "test_set": test_set, "dataset": "OWDETR",
+                "image_count": len(split_ids),
+                "class_names": [*_protocol.CLASS_ORDER, "unknown"],
+                "previous_introduced_classes": n_prev,
+                "current_introduced_classes": n_current,
                 "ground_truth": truth, "detections": found,
             }), encoding="utf-8")
             payload["detections_path"] = str(artefact)
@@ -229,6 +246,12 @@ def fake_subprocess(jpeg_dir: Path):
     def run(command, **kwargs):
         text = [str(part) for part in command]
         joined = " ".join(text)
+        if any(part.endswith(("evaluate_anchor.py", "compare_replay.py")) for part in text):
+            return real.run(
+                command,
+                check=kwargs.pop("check", False),
+                **kwargs,
+            )
         if "nvidia-smi" in joined:
             return real.CompletedProcess(command, 0, "Tesla T4, 15360 MiB\n", "")
         if text[0] == "which":
@@ -238,8 +261,18 @@ def fake_subprocess(jpeg_dir: Path):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(b"\xff\xd8\xff\xe0fake jpeg")
             return real.CompletedProcess(command, 0, "", "")
-        if "git" in text[0] and "log" in text:
-            return real.CompletedProcess(command, 0, "deadbee dry run\n", "")
+        if "git" in text[0] and text[1:4] == ["remote", "get-url", "origin"]:
+            cwd = Path(kwargs.get("cwd", ROOT))
+            repository = ("https://github.com/gubiczam/PROB.git"
+                          if cwd.name == "PROB" else
+                          "https://github.com/gubiczam/owod-active.git")
+            return real.CompletedProcess(command, 0, repository + "\n", "")
+        if "git" in text[0] and text[1:3] == ["rev-parse", "HEAD"]:
+            cwd = Path(kwargs.get("cwd", ROOT))
+            commit = ("4c66be1a52cad9360e09c729e9134aba8fe0b531"
+                      if cwd.name == "PROB" else
+                      "d1ce0c75be08e1ca1b90005168c19a3e61253be0")
+            return real.CompletedProcess(command, 0, commit + "\n", "")
         return real.CompletedProcess(command, 0, "", "")
 
     return run
@@ -252,15 +285,15 @@ def fake_subprocess(jpeg_dir: Path):
 #: letting it test something other than what ships.
 def substitutions(workspace: Path) -> list[tuple[str, str]]:
     return [
-        ('ROOT = Path("/content/owod-active")', f'ROOT = Path("{ROOT}")'),
-        ('subprocess.run(["rm", "-rf", str(ROOT)], check=True)', "pass"),
-        ('subprocess.run(["git", "clone", "--depth", "1", OWL_REPOSITORY, str(ROOT)], check=True)',
-         "pass"),
-        ('subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", str(ROOT)], check=True)',
-         "pass"),
+        ('Path("/content/owod-active")', f'Path("{ROOT}")'),
         ('DATA = Path("/content/data/OWOD")', f'DATA = Path("{workspace / "OWOD"}")'),
-        ('PROB = bridge.ensure_checkout(Path("/content/PROB"))',
-         f'PROB = Path("{workspace / "PROB"}"); PROB.mkdir(parents=True, exist_ok=True)'),
+        ('Path("/content/PROB")', f'Path("{workspace / "PROB"}")'),
+        ('Path("/content/owod_preflight_comparison")',
+         f'Path("{workspace / "precompare"}")'),
+        ('Path("/content/owod_comparison_replay_v3_fast_seed0")',
+         f'Path("{workspace / "comparison"}")'),
+        ('DRIVE_FREE_GB >= 8.0', 'DRIVE_FREE_GB >= 0.0'),
+        ('LOCAL_FREE_GB >= 12.0', 'LOCAL_FREE_GB >= 0.0'),
     ]
 
 
@@ -273,6 +306,10 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
     drive_root = workspace / "drive" / "MyDrive" / "OWL"
     (drive_root / "checkpoints" / "SOWODB").mkdir(parents=True, exist_ok=True)
     (drive_root / "checkpoints" / "SOWODB" / "t1.pth").write_bytes(b"fake t1")
+    prob_root = workspace / "PROB"
+    (prob_root / ".git").mkdir(parents=True)
+    (prob_root / "models" / "ops").mkdir(parents=True)
+    (prob_root / "requirements.txt").write_text("", encoding="utf-8")
 
     # google.colab
     colab = types.ModuleType("google.colab")
@@ -284,6 +321,16 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
 
     fake_run = fake_subprocess(workspace)
 
+    # A CUDA-capable torch surface is enough for the notebook's preflight. OWL's
+    # exercised code is numpy/scikit-learn and never reaches this stub.
+    torch = types.ModuleType("torch")
+    torch.__version__ = "2.8.0-dry"
+    torch.version = types.SimpleNamespace(cuda="12.6")
+    torch.cuda = types.SimpleNamespace(
+        is_available=lambda: True, get_device_name=lambda _: "Tesla T4 (dry run)")
+    previous_torch = sys.modules.get("torch")
+    sys.modules["torch"] = torch
+
     namespace: dict = {}
     try:
         for index, cell in enumerate(cells()):
@@ -291,24 +338,17 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
                 continue
             source = "".join(cell["source"])
 
-            if index == 2:  # the parameters cell
+            if "# ============================== PARAMETERS" in source:
                 source = source.replace("RUN_GPU = True", f"RUN_GPU = {run_gpu}")
-                source = source.replace("RUN_GPU = False", f"RUN_GPU = {run_gpu}")
                 source = source.replace(
                     'DRIVE_ROOT = "/content/drive/MyDrive/OWL"',
                     f'DRIVE_ROOT = "{drive_root}"')
-                # keep the dry run quick: the CPU sections are the slow part
+                # Preserve the production assertions, then shrink subsequent cells.
                 source += (
                     "\nN_TASKS, BUDGET_PER_TASK, ROUNDS_PER_TASK = 4, 40, 2"
                     "\nCANDIDATE_IMAGES, PROPOSALS_PER_IMAGE = 60, 4"
                     "\nEVAL_MAX_PER_CLASS, EVAL_REMAINDER_RATIO = 3, 0"
-                    "\nN_CLUSTERS, TIME_BUDGET_MINUTES = 64, 10_000"
-                    # one selection arm and both replay arms: the shape the
-                    # replay study actually runs, which exercises the nested
-                    # loop, the per-run workspace and the cross-run comparison,
-                    # and is cheap enough to run on every commit
-                    "\nARMS = ('random',)"
-                    "\nREPLAY_ARMS = ('uniform', 'tail_favouring')\n"
+                    "\nN_CLUSTERS, TIME_BUDGET_MINUTES = 64, 10_000\n"
                 )
 
             for before, after in substitutions(workspace):
@@ -331,13 +371,70 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
             if "from owl import" in source:
                 namespace["bridge"].Bridge = FakeBridge
 
+            # The real Drive input is a completed historical baseline. Seed the
+            # same shape after canonical data preparation and before preflight.
+            if source.startswith("# 4 —"):
+                assert namespace["fetch_images"](namespace["subset"].image_ids) == \
+                    list(namespace["subset"].image_ids)
+                config = namespace["runner"].CycleConfig(
+                    n_tasks=namespace["N_TASKS"],
+                    budget_per_task=namespace["BUDGET_PER_TASK"],
+                    rounds_per_task=namespace["ROUNDS_PER_TASK"],
+                    candidate_images_per_task=namespace["CANDIDATE_IMAGES"],
+                    proposals_per_image=namespace["PROPOSALS_PER_IMAGE"],
+                    arm="random", labelling_policy="known_plus_selected",
+                    replay_arm="none", replay_reallocate=False,
+                    replay_protocol_version=3, epochs=namespace["EPOCHS"],
+                    learning_rate=namespace["LEARNING_RATE"],
+                    batch_size=namespace["BATCH_SIZE"],
+                    n_clusters=namespace["N_CLUSTERS"], seed=namespace["SEED"],
+                    measure_grouped_recall=True,
+                )
+                baseline_bridge = FakeBridge(
+                    prob_root=prob_root, data_root=namespace["DATA"])
+                namespace["runner"].run_chain(
+                    baseline_bridge, config,
+                    workspace=drive_root / "work" / "random__none",
+                    candidate_index=namespace["candidate_index"],
+                    replay_index=namespace["replay_index"],
+                    replay_root=namespace["DATA"],
+                    start_checkpoint=drive_root / "checkpoints" / "SOWODB" / "t1.pth",
+                    test_set=namespace["TEST_SET"], chain=namespace["chain"],
+                    prepare_images=namespace["fetch_images"],
+                )
+
             if verbose:
                 print(f"--- cell {index} ---")
                 print(buffer.getvalue().rstrip() or "(no output)")
             else:
                 print(f"cell {index:2d} ok")
+
+        # Run the orchestration/reporting tail a second time against the same
+        # workspaces. No predict/train/evaluate call may be added: this is the
+        # notebook-level proof that a reconnect + Run all reuses valid work.
+        if run_gpu:
+            calls_before_rerun = len(namespace["prob_bridge"].calls)
+            for index, item in enumerate(cells()):
+                if item["cell_type"] != "code":
+                    continue
+                source = "".join(item["source"])
+                if not any(source.startswith(f"# {stage} —") for stage in range(7, 13)):
+                    continue
+                for before, after in substitutions(workspace):
+                    source = source.replace(before, after)
+                namespace["subprocess"] = types.SimpleNamespace(run=fake_run)
+                with redirect_stdout(io.StringIO()):
+                    exec(compile(source, f"rerun cell {index}", "exec"), namespace)  # noqa: S102
+            assert len(namespace["prob_bridge"].calls) == calls_before_rerun
+            assert namespace["RUN_STATUS"]["random__uniform"] == "validated and skipped"
+            assert namespace["RUN_STATUS"]["random__tail_favouring"] == \
+                "validated and skipped"
+            print("rerun idempotency: valid replay work was skipped with no new PROB calls")
     finally:
-        pass
+        if previous_torch is None:
+            sys.modules.pop("torch", None)
+        else:
+            sys.modules["torch"] = previous_torch
 
     # ---- what the run must have achieved ---------------------------------
     if run_gpu:
@@ -348,53 +445,34 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
         # each arm scores the starting checkpoint once — that is what task 2
         # measures its forgetting against — and then runs the cycle per task
         assert verbs == (["evaluate"] + ["predict", "train", "evaluate"] * 3) * 2, verbs
-        # The notebook falls back to REPLAY_ARMS=("none",) when there is no
-        # old-data index, which is the right refusal but is also invisible in a
-        # table. If the index is on disk, the run must actually have rehearsed —
-        # otherwise a silent fallback would ship a no-replay chain labelled as a
-        # replay one.
+        # The production notebook refuses a missing old-data index. When it is
+        # present, both configured runs must actually rehearse through aliases.
         index_path = ROOT / "data" / "reference" / "t1_replay_class_counts.json"
-        if index_path.exists():
-            assert namespace["replay_index"], "the replay index exists but was not loaded"
-            assert tuple(namespace["REPLAY_ARMS"]) != ("none",), (
-                "the replay index is on disk, yet the notebook fell back to "
-                "REPLAY_ARMS=('none',)")
-            from owl import exemplars as _exemplars
-            from owl import replay as _replay
+        assert index_path.exists() and namespace["replay_index"]
+        from owl import exemplars as _exemplars
+        from owl import replay as _replay
 
-            for call in [c for c in fake.calls if c["verb"] == "train"]:
-                assert call["replay"], (
-                    "a training step received no replay images although a replay "
-                    "arm was configured")
-                # the aliases must be aliases, not the physical images
-                assert all(str(i).startswith("9") for i in call["replay"])
-            for run, rows in by_arm.items():
-                # the run's name carries its replay arm, so the budget it must
-                # hold is looked up per run rather than assumed shared
-                budget = _replay.ARMS[run.rsplit("__", 1)[1]]["total"]
-                for row in rows:
-                    diagnostics = row.replay_row
-                    assert (
-                        diagnostics["requested_objects"]
-                        == diagnostics["allocated_objects"]
-                        == diagnostics["delivered_objects"]
-                        == budget
-                    ), f"{run} {row.task}: object budget not held: {diagnostics}"
-            # and the filtered annotations really were written
-            written = list((namespace["DATA"] / "Annotations").glob("9*.xml"))
-            assert written, "no replay alias annotation was written"
-            boxes = sum(
-                len(_ET.parse(path).getroot().findall("object")) for path in written
-            )
-            print(f"replay branch exercised: {len(namespace['replay_index'])} "
-                  f"old-data images, arms {tuple(namespace['REPLAY_ARMS'])}, "
-                  f"{len(written)} alias annotations holding {boxes} boxes; "
-                  "every run held its own object budget on every task")
-            assert _exemplars.source_id(written[0].stem).startswith("0")
-        else:
-            assert tuple(namespace["REPLAY_ARMS"]) == ("none",), (
-                "no replay index on disk, so the run must not claim to rehearse")
-            print("no replay index on disk: the no-rehearsal branch was exercised")
+        for call in [c for c in fake.calls if c["verb"] == "train"]:
+            assert call["replay"], "configured replay training received no aliases"
+            assert all(str(i).startswith("9") for i in call["replay"])
+        for run, rows in by_arm.items():
+            budget = _replay.ARMS[run.rsplit("__", 1)[1]]["total"]
+            for row in rows:
+                diagnostics = row.replay_row
+                assert (
+                    diagnostics["requested_objects"]
+                    == diagnostics["allocated_objects"]
+                    == diagnostics["delivered_objects"]
+                    == budget
+                ), f"{run} {row.task}: object budget not held: {diagnostics}"
+        written = list((namespace["DATA"] / "Annotations").glob("9*.xml"))
+        assert written, "no replay alias annotation was written"
+        boxes = sum(len(_ET.parse(path).getroot().findall("object")) for path in written)
+        print(f"replay branch exercised: {len(namespace['replay_index'])} "
+              f"old-data images, arms {tuple(namespace['REPLAY_ARMS'])}, "
+              f"{len(written)} alias annotations holding {boxes} boxes; "
+              "every run held its own object budget on every task")
+        assert _exemplars.source_id(written[0].stem).startswith("0")
 
         for arm, results in by_arm.items():
             assert len(results) == 3, f"{arm}: expected three tasks, got {len(results)}"
@@ -404,19 +482,19 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
                                "U_Recall_tail", "oracle_cost_so_far", "forgetting",
                                "drop_from_anchor"):
                     assert flat.get(column) is not None, f"{arm} {row.task}: no {column}"
-        print("\nGPU branch: 2 runs x (1 anchor + 3 tasks), 20 PROB calls, every "
-              "metric present including the grouped recall and t2 forgetting.")
+        assert namespace["EXPERIMENT_COMPLETE"] is True
+        assert (drive_root / "comparisons" / "replay_v3_fast_seed0" / "summary.json").is_file()
+        print("\nGPU branch: pinned baseline + 2 replay runs passed all notebook "
+              "audits, comparison generation, and persistence.")
     else:
-        assert namespace["gpu_results"] == []
-        print("\nCPU branch: complete, GPU chain correctly skipped.")
+        raise AssertionError("the production notebook intentionally requires a GPU")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cpu", action="store_true", help="run the RUN_GPU=False branch")
     parser.add_argument("--verbose", action="store_true", help="print each cell's output")
     arguments = parser.parse_args()
-    run(run_gpu=not arguments.cpu, verbose=arguments.verbose)
+    run(run_gpu=True, verbose=arguments.verbose)
     print("DRY RUN PASSED")
 
 

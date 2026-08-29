@@ -344,6 +344,10 @@ def _prepare_anchor_inputs(workspace: Path, root: Path) -> list[str]:
             assert source is not None
             (annotations / Path(member.name).name).write_bytes(source.read())
     _patch_recorded_split(workspace, list(subset.image_ids))
+    metadata = workspace / f"t2_{config['arm']}" / "checkpoint.train.json"
+    metadata.write_text(json.dumps({
+        "previous_checkpoint": str(root / "t1.pth"),
+    }), encoding="utf-8")
     return list(subset.image_ids)
 
 
@@ -470,12 +474,24 @@ def test_a_failed_staged_evaluation_does_not_leave_an_anchor(tmp_path, monkeypat
 def test_the_anchor_tool_never_overwrites_an_existing_anchor(tmp_path):
     workspace = build_run(tmp_path, "none")
     assert (workspace / "anchor_metrics.json").exists()
+    _prepare_anchor_inputs(workspace, tmp_path)
     before = (workspace / "anchor_metrics.json").read_bytes()
 
     result = _run_anchor_tool(workspace, tmp_path)
     assert result.returncode == 0
-    assert "already exists" in result.stdout
+    assert "inputs are verified" in result.stdout
     assert (workspace / "anchor_metrics.json").read_bytes() == before
+
+
+def test_the_anchor_tool_refuses_missing_checkpoint_provenance(tmp_path):
+    workspace = build_run(tmp_path, "none")
+    (workspace / "anchor_metrics.json").unlink(missing_ok=True)
+    _prepare_anchor_inputs(workspace, tmp_path)
+    (workspace / "t2_random" / "checkpoint.train.json").unlink()
+
+    result = _run_anchor_tool(workspace, tmp_path)
+    assert result.returncode == 1
+    assert "historical checkpoint cannot be proven" in result.stdout + result.stderr
 
 
 # ------------------------------------------------------------ compatibility ---
