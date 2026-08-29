@@ -118,13 +118,19 @@ class FakeBridge:
         unknown_ap = 0.5
         previous = per_class[:n_prev]
         current = per_class[n_prev:n_prev + n_current]
+        known = per_class[:n_prev + n_current]
         payload = {
-            "known_AP50": 40.0, "U_Recall": 20.0, "WI": 0.03, "A_OSE": 1000,
-            "previous_known_AP50": sum(previous) / len(previous) if previous else 0.0,
+            # every aggregate PROB reports is a mean over a slice of the same AP
+            # array it publishes as coco_eval_bbox, and PK_AP50 is absent
+            # entirely when no classes have been introduced yet — the bridge
+            # writes null there. A fake that hard-codes any of these cannot
+            # exercise the provenance check.
+            "known_AP50": sum(known) / len(known) if known else 0.0,
+            "U_Recall": 20.0, "WI": 0.03, "A_OSE": 1000,
+            "previous_known_AP50": (
+                sum(previous) / len(previous) if previous else None),
             "current_known_AP50": sum(current) / len(current) if current else 0.0,
             "unknown_AP50": unknown_ap,
-            "previous_introduced_classes": n_prev,
-            "current_introduced_classes": n_current,
             "coco_eval_bbox": [30.0, 30.0, *per_class, unknown_ap],
                 }
         output.write_text(json.dumps(payload), encoding="utf-8")
@@ -153,6 +159,13 @@ class FakeBridge:
                                   "score": 0.8, "box": box})
             artefact.write_text(json.dumps({
                 "schema": "daowod_detections_v1", "unknown_class_name": "unknown",
+                # the real artefact records which split it scored and how big it
+                # was; tools/evaluate_anchor.py verifies a rebuilt split against
+                # exactly these before it spends any GPU time
+                "test_set": test_set,
+                "image_count": len({record["image_id"] for record in truth}),
+                "previous_introduced_classes": n_prev,
+                "current_introduced_classes": n_current,
                 "ground_truth": truth, "detections": found,
             }), encoding="utf-8")
             payload["detections_path"] = str(artefact)

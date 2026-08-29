@@ -178,18 +178,19 @@ class FakeBridge:
         output.parent.mkdir(parents=True, exist_ok=True)
         step = len([c for c in self.calls if c["verb"] == "evaluate"])
         payload = {
-            "known_AP50": 60.0 - step, "U_Recall": 20.0 - step,
-            # derived from the vector below, the way the real bridge's are: the
-            # per-class provenance check rebuilds these and refuses a file whose
-            # aggregates disagree with its own coco_eval_bbox
+            # every aggregate is a mean over a slice of the same AP array the
+            # file publishes as coco_eval_bbox, and PK_AP50 is absent when no
+            # class has been introduced yet — exactly what the bridge writes.
+            "known_AP50": (
+                sum(float(i % 40) for i in range(n_prev + n_current))
+                / (n_prev + n_current) if n_prev + n_current else 0.0),
+            "U_Recall": 20.0 - step,
             "previous_known_AP50": (
-                sum(float(i % 40) for i in range(n_prev)) / n_prev if n_prev else 0.0),
+                sum(float(i % 40) for i in range(n_prev)) / n_prev if n_prev else None),
             "current_known_AP50": (
                 sum(float(i % 40) for i in range(n_prev, n_prev + n_current))
                 / n_current if n_current else 0.0),
             "unknown_AP50": 0.4, "WI": 0.03, "A_OSE": 1200,
-            "previous_introduced_classes": n_prev,
-            "current_introduced_classes": n_current,
             "coco_eval_bbox": [30.0, 30.0, *[float(i % 40) for i in range(80)], 0.4],
                 }
         output.write_text(json.dumps(payload), encoding="utf-8")

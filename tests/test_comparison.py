@@ -9,10 +9,12 @@ not started, and a run that stopped part-way through the chain.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import io
 import json
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -102,6 +104,24 @@ def test_the_per_class_vector_is_validated_against_the_file_that_carries_it(thre
                 assert check["agrees"], (name, task, check)
 
 
+def test_t3_through_t6_use_the_growing_protocol_prefix(tmp_path):
+    """Regression for the real failure: only t2 has a 19-class prefix."""
+
+    workspace = build_run(tmp_path, "none", n_tasks=6)
+    run = comparison.load_run(workspace)
+    assert run is not None
+    expected = {"t2": 19, "t3": 20, "t4": 21, "t5": 22, "t6": 23}
+    assert set(run.per_task_ap) == set(expected)
+    for task, n_prev in expected.items():
+        report = run.per_class_checks[task]
+        assert report["usable"] is True, (task, report)
+        assert report["previous_introduced_classes"] == n_prev
+        assert report["current_introduced_classes"] == 1
+        assert {check["quantity"] for check in report["checks"]} >= {
+            "previous_known_AP50", "current_known_AP50", "known_AP50",
+        }
+
+
 def test_a_vector_that_does_not_reproduce_its_own_aggregates_is_refused(tmp_path):
     """The failure this guards: silently reporting the wrong classes."""
 
@@ -111,17 +131,79 @@ def test_a_vector_that_does_not_reproduce_its_own_aggregates_is_refused(tmp_path
     task_dir = next(p for p in workspace.iterdir() if p.name.endswith("_random"))
     payload = json.loads((task_dir / "metrics.json").read_text())
 
-    # a vector of the right length whose contents no longer match the aggregates
+    original = list(payload["coco_eval_bbox"])
+
+    # A vector of the right length whose contents no longer match the file's own
+    # aggregates. Told the right class counts, the rebuild disagrees; left to
+    # recover them, no prefix averages to the reported value at all. Either way
+    # it is refused, and the reason says which.
     payload["coco_eval_bbox"] = [30.0, 30.0, *[7.0] * 80, 0.5]
-    report = metrics.validate_per_class_ap50(payload)
-    assert report["usable"] is False
-    assert "does not reproduce" in report["reason"]
+    told = metrics.validate_per_class_ap50(payload, n_prev=19, n_current=1)
+    assert told["usable"] is False
+    assert "does not reproduce" in told["reason"]
+
+    recovered = metrics.validate_per_class_ap50(payload)
+    assert recovered["usable"] is False
+    assert "no prefix" in recovered["reason"]
 
     # and a vector of the wrong length is refused before it is read at all
     payload["coco_eval_bbox"] = [1.0, 2.0, 3.0]
     report = metrics.validate_per_class_ap50(payload)
     assert report["usable"] is False
     assert "entries" in report["reason"]
+
+    # the untouched file recovers its own counts and passes
+    payload["coco_eval_bbox"] = original
+    good = metrics.validate_per_class_ap50(payload)
+    assert good["usable"] is True
+    assert good["counts_recovered_from_file"] is True
+
+
+def test_ambiguous_count_inference_is_diagnostic_not_authoritative():
+    """Zero-heavy real AP vectors can reproduce one mean at several lengths."""
+
+    from owl import metrics
+
+    payload = {
+        "coco_eval_bbox": [0.0, 0.0, *[0.0] * 81],
+        "previous_known_AP50": 0.0,
+        "current_known_AP50": 0.0,
+        "known_AP50": 0.0,
+        "unknown_AP50": 0.0,
+    }
+    inferred = metrics.infer_introduced_counts(payload)
+    assert inferred["found"] is False
+    assert inferred["ambiguous"] is True
+    assert len(inferred["previous_candidates"]) > 1
+
+    # The protocol counts are still sufficient to validate every aggregate;
+    # ambiguity in the optional cross-check must not overrule that authority.
+    told = metrics.validate_per_class_ap50(payload, n_prev=19, n_current=1)
+    assert told["usable"] is True
+    assert told["counts_recovered_from_file"] is False
+    assert "multiple prefixes" in told["count_inference_reason"]
+
+    untold = metrics.validate_per_class_ap50(payload)
+    assert untold["usable"] is False
+    assert "multiple prefixes" in untold["reason"]
+
+
+def test_invalid_per_class_values_are_withheld_from_tables(tmp_path):
+    """A provenance warning must not leave the rejected values reportable."""
+
+    workspace = build_run(tmp_path, "none")
+    task = max(workspace.glob("t*_random"))
+    path = task / "metrics.json"
+    payload = json.loads(path.read_text())
+    payload["coco_eval_bbox"] = [30.0, 30.0, *[7.0] * 80, 0.5]
+    path.write_text(json.dumps(payload))
+
+    run = comparison.load_run(workspace)
+    assert run is not None
+    assert run.per_class_checks[run.final_task]["usable"] is False
+    assert run.final_task not in run.per_task_ap
+    rows = comparison.table_per_class({run.name: run})
+    assert all(row[f"{run.name}:final_AP50"] is None for row in rows)
 
 
 def test_the_recall_crosscheck_comes_from_the_detections_artefact(three_runs):
@@ -167,6 +249,18 @@ def test_a_run_that_has_not_started_is_absent_rather_than_fatal(tmp_path):
     assert comparison.table_cost(runs)
 
 
+def test_default_discovery_ignores_historical_workspaces(tmp_path):
+    build_run(tmp_path, "none")
+    historical = build_run(tmp_path, "uniform")
+    historical.rename(tmp_path / "objectness")
+
+    runs = comparison.load_runs(tmp_path)
+    assert list(runs) == ["random__none"]
+
+    deliberately_included = comparison.load_runs(tmp_path, include=["objectness"])
+    assert list(deliberately_included) == ["objectness"]
+
+
 def test_a_partial_run_is_compared_as_far_as_it_got(tmp_path):
     """The overnight case: one arm finished, the next was cut off."""
 
@@ -187,6 +281,201 @@ def test_a_partial_run_is_compared_as_far_as_it_got(tmp_path):
 def test_an_empty_root_says_what_to_download(tmp_path):
     with pytest.raises(comparison.AnalysisError, match="No finished run"):
         comparison.load_runs(tmp_path)
+
+
+# ------------------------------------------------------------------- anchor ---
+
+
+def _patch_recorded_split(
+    workspace: Path, image_ids: list[str], *, include_ground_truth: bool = True,
+) -> None:
+    """Make the fake run carry the split provenance the real bridge writes."""
+
+    for path in workspace.glob("t*_random/metrics_detections.json"):
+        payload = json.loads(path.read_text())
+        payload["dataset"] = "OWDETR"
+        payload["class_names"] = [*protocol.CLASS_ORDER, "unknown"]
+        payload["image_count"] = len(image_ids)
+        payload["ground_truth"] = (
+            [{"image_id": image_id, "class_name": "unknown", "box": [0, 0, 1, 1]}
+             for image_id in image_ids]
+            if include_ground_truth else []
+        )
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        metrics_path = path.with_name("metrics.json")
+        metrics_payload = json.loads(metrics_path.read_text())
+        metrics_payload["test_set"] = "owl_shared_test"
+        metrics_path.write_text(json.dumps(metrics_payload), encoding="utf-8")
+
+
+def _run_anchor_tool(workspace: Path, root: Path, *extra: str):
+    (root / "t1.pth").write_bytes(b"fake t1")
+    return subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "evaluate_anchor.py"),
+         "--workspace", str(workspace), "--checkpoint", str(root / "t1.pth"),
+         "--prob-root", str(root / "PROB"), "--data-root", str(root / "DATA"),
+         "--dry-run", *extra],
+        capture_output=True, text=True, check=False,
+        env={"PYTHONPATH": str(ROOT), "PATH": "/usr/bin:/bin"},
+    )
+
+
+def _prepare_anchor_inputs(workspace: Path, root: Path) -> list[str]:
+    """The committed split plus the exact XML tree PROB would read."""
+
+    from owl import evaluation_subset
+
+    config = json.loads((workspace / "config.json").read_text())
+    chain = protocol.build_chain(int(config["n_tasks"]))
+    archive = ROOT / "data" / "staging" / "owdetr_test_annotations.tar.gz"
+    subset = evaluation_subset.from_archive(
+        archive, [task.new_class for task in chain[1:]], seed=int(config["seed"]),
+        remainder_multiplier=1, max_per_class=150)
+    wanted = set(subset.image_ids)
+    annotations = root / "DATA" / "Annotations"
+    annotations.mkdir(parents=True, exist_ok=True)
+    (root / "DATA" / "JPEGImages").mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive) as handle:
+        for member in handle.getmembers():
+            if not member.isfile() or not member.name.endswith(".xml") \
+                    or Path(member.name).stem not in wanted:
+                continue
+            source = handle.extractfile(member)
+            assert source is not None
+            (annotations / Path(member.name).name).write_bytes(source.read())
+    _patch_recorded_split(workspace, list(subset.image_ids))
+    return list(subset.image_ids)
+
+
+def test_the_anchor_tool_refuses_a_split_the_chain_was_not_scored_on(tmp_path):
+    """An anchor measured on a different split is worse than no anchor."""
+
+    workspace = build_run(tmp_path, "none")
+    (workspace / "anchor_metrics.json").unlink(missing_ok=True)
+    _patch_recorded_split(workspace, ["not-the-real-split"])
+
+    result = _run_anchor_tool(workspace, tmp_path)
+    assert result.returncode == 1
+    assert "does not match the one the chain was scored on" in result.stdout + result.stderr
+
+
+def test_the_anchor_tool_verifies_the_split_before_touching_prob(tmp_path):
+    """It rebuilds the chain's own split and proves it matches, then stops."""
+
+    workspace = build_run(tmp_path, "none")
+    (workspace / "anchor_metrics.json").unlink(missing_ok=True)
+    _prepare_anchor_inputs(workspace, tmp_path)
+
+    split = tmp_path / "DATA" / "ImageSets" / "OWDETR" / "owl_shared_test.txt"
+    split.parent.mkdir(parents=True)
+    split.write_text("sentinel\n")
+
+    result = _run_anchor_tool(workspace, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "split verified" in result.stdout
+    assert "PROB was not called" in result.stdout
+    assert not (workspace / "anchor_metrics.json").exists(), "dry run must not write it"
+    assert split.read_text() == "sentinel\n", "dry run must not mutate the data root"
+
+
+def test_the_anchor_tool_requires_the_exact_image_ids_not_only_the_count(tmp_path):
+    workspace = build_run(tmp_path, "none")
+    (workspace / "anchor_metrics.json").unlink(missing_ok=True)
+    image_ids = _prepare_anchor_inputs(workspace, tmp_path)
+    wrong = [*image_ids]
+    wrong[-1] = "same-count-different-image"
+    _patch_recorded_split(workspace, wrong)
+
+    result = _run_anchor_tool(workspace, tmp_path)
+    assert result.returncode == 1
+    assert "1 missing, 1 stray" in result.stdout + result.stderr
+
+
+def test_the_anchor_tool_requires_the_same_image_order(tmp_path):
+    workspace = build_run(tmp_path, "none")
+    (workspace / "anchor_metrics.json").unlink(missing_ok=True)
+    image_ids = _prepare_anchor_inputs(workspace, tmp_path)
+    _patch_recorded_split(workspace, list(reversed(image_ids)))
+
+    result = _run_anchor_tool(workspace, tmp_path)
+    assert result.returncode == 1
+    assert "0 missing, 0 stray" in result.stdout + result.stderr
+
+
+def test_the_anchor_tool_requires_the_annotations_prob_will_read(tmp_path):
+    workspace = build_run(tmp_path, "none")
+    (workspace / "anchor_metrics.json").unlink(missing_ok=True)
+    image_ids = _prepare_anchor_inputs(workspace, tmp_path)
+    changed = tmp_path / "DATA" / "Annotations" / f"{image_ids[0]}.xml"
+    changed.write_text("<annotation />")
+
+    result = _run_anchor_tool(workspace, tmp_path)
+    assert result.returncode == 1
+    assert "differ from the committed archive" in result.stdout + result.stderr
+
+
+def _run_anchor_main(monkeypatch, workspace: Path, root: Path, fake_bridge) -> int:
+    spec = importlib.util.spec_from_file_location(
+        "evaluate_anchor_under_test", ROOT / "tools" / "evaluate_anchor.py")
+    assert spec is not None and spec.loader is not None
+    evaluate_anchor = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evaluate_anchor)
+
+    (root / "t1.pth").write_bytes(b"fake t1")
+    fake_bridge.check = lambda: {"fake": True}
+    monkeypatch.setattr(evaluate_anchor.bridge, "Bridge", lambda **kwargs: fake_bridge)
+    monkeypatch.setattr(sys, "argv", [
+        "evaluate_anchor.py", "--workspace", str(workspace),
+        "--checkpoint", str(root / "t1.pth"), "--prob-root", str(root / "PROB"),
+        "--data-root", str(root / "DATA"),
+    ])
+    return evaluate_anchor.main()
+
+
+def test_anchor_is_published_only_after_a_successful_staged_evaluation(
+    tmp_path, monkeypatch,
+):
+    workspace = build_run(tmp_path, "none")
+    (workspace / "anchor_metrics.json").unlink(missing_ok=True)
+    _prepare_anchor_inputs(workspace, tmp_path)
+    before = {path.relative_to(workspace) for path in workspace.rglob("*")}
+    fake = FakeBridge()
+
+    assert _run_anchor_main(monkeypatch, workspace, tmp_path, fake) == 0
+    output = workspace / "anchor_metrics.json"
+    assert output.exists()
+    after = {path.relative_to(workspace) for path in workspace.rglob("*")}
+    assert after - before == {Path("anchor_metrics.json")}
+    assert not (tmp_path / "DATA" / "ImageSets").exists()
+
+
+def test_a_failed_staged_evaluation_does_not_leave_an_anchor(tmp_path, monkeypatch):
+    class InvalidMetricsBridge(FakeBridge):
+        def evaluate(self, **kwargs):
+            path = super().evaluate(**kwargs)
+            payload = json.loads(path.read_text())
+            payload["known_AP50"] += 10.0
+            path.write_text(json.dumps(payload))
+            return path
+
+    workspace = build_run(tmp_path, "none")
+    (workspace / "anchor_metrics.json").unlink(missing_ok=True)
+    _prepare_anchor_inputs(workspace, tmp_path)
+
+    assert _run_anchor_main(
+        monkeypatch, workspace, tmp_path, InvalidMetricsBridge()) == 1
+    assert not (workspace / "anchor_metrics.json").exists()
+
+
+def test_the_anchor_tool_never_overwrites_an_existing_anchor(tmp_path):
+    workspace = build_run(tmp_path, "none")
+    assert (workspace / "anchor_metrics.json").exists()
+    before = (workspace / "anchor_metrics.json").read_bytes()
+
+    result = _run_anchor_tool(workspace, tmp_path)
+    assert result.returncode == 0
+    assert "already exists" in result.stdout
+    assert (workspace / "anchor_metrics.json").read_bytes() == before
 
 
 # ------------------------------------------------------------ compatibility ---

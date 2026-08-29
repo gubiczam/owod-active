@@ -58,10 +58,18 @@ def main() -> int:
     parser.add_argument("--digits", type=int, default=2)
     parser.add_argument("--no-plots", action="store_true",
                         help="tables only; matplotlib is an optional dependency")
+    parser.add_argument(
+        "--include", default=None,
+        help="comma-separated run directories to consider. Defaults to the "
+             "registered replay experiment (" + ", ".join(comparison.EXPECTED) + "); "
+             "a Drive workspace also holds directories from earlier studies, and "
+             "those are different experiments rather than arms of this one.")
     arguments = parser.parse_args()
 
+    include = ([name.strip() for name in arguments.include.split(",") if name.strip()]
+               if arguments.include else None)
     try:
-        runs = comparison.load_runs(arguments.workspace)
+        runs = comparison.load_runs(arguments.workspace, include=include)
     except AnalysisError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
@@ -76,16 +84,27 @@ def main() -> int:
     print(table(depth, digits=digits))
     emit(depth, out, "depth", digits=digits, caption="Runs found")
 
-    missing = [name for name in comparison.EXPECTED if name not in runs]
+    considered = list(include) if include else list(comparison.EXPECTED)
+    print(f"\nconsidered: {considered}")
+    missing = [name for name in considered if name not in runs]
     if missing:
-        print(f"\nnot present yet: {missing}")
+        print(f"not present yet: {missing}")
+    others = sorted(
+        p.name for p in Path(arguments.workspace).iterdir()
+        if p.is_dir() and p.name not in considered
+    ) if Path(arguments.workspace).is_dir() else []
+    if others:
+        print(f"ignored (not part of this experiment): {others}")
+        print("  pass --include to consider them deliberately.")
 
     # ---- where do the per-class numbers come from, and may they be trusted? --
     print(f"\n{'=' * 78}\nper-class AP provenance\n{'=' * 78}")
     print("Source: coco_eval_bbox in each task's metrics.json — the evaluator's own")
-    print("per-class AP50, read by owl.metrics.per_class_ap50. The metrics file has")
-    print("no key named for a per-class table, so every vector is checked against the")
-    print("aggregates the same file reports (previous/current_known_AP50, unknown_AP50).")
+    print("per-class AP50, read by owl.metrics.per_class_ap50. OWEvaluator.summarize")
+    print("publishes AP.flatten() there and slices its aggregates at prev_intro_cls,")
+    print("which the file does not record — so the class counts come from the protocol")
+    print("(Task.n_prev / n_new) and are cross-checked against the counts recovered")
+    print("from the file's own aggregates. Assuming them is what broke this before.")
     provenance = []
     for name, run in runs.items():
         for task, report in sorted(run.per_class_checks.items()):
@@ -93,6 +112,9 @@ def main() -> int:
                 "run": name, "task": task,
                 "usable": report.get("usable"),
                 "classes": report.get("n_classes"),
+                "prev_intro": report.get("previous_introduced_classes"),
+                "curr_intro": report.get("current_introduced_classes"),
+                "counts_from_file": report.get("counts_recovered_from_file"),
                 "checks": ", ".join(
                     f"{c['quantity'].replace('_AP50', '')}"
                     f"{'=' if c['agrees'] else '!='}{c['rebuilt']:.4f}"

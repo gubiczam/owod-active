@@ -384,22 +384,109 @@ def per_class_ap50(payload: Mapping[str, object], *, class_names=None) -> dict[s
 
 
 
+def infer_introduced_counts(payload: Mapping[str, object]) -> dict[str, object]:
+    """Recover the evaluator's own slice boundaries from the file itself.
+
+    ``OWEvaluator.summarize`` computes
+
+        PK_AP50 = AP[:, o50][:prev_intro_cls].mean()
+        CK_AP50 = AP[:, o50][prev_intro_cls:prev_intro_cls + curr_intro_cls].mean()
+
+    over an ``AP`` array indexed by ``CLASS_NAMES`` position, and publishes that
+    same array as ``coco_eval_bbox`` — see ``datasets/open_world_eval.py``::
+
+        self.coco_eval['bbox'].stats = torch.cat(
+            [self.AP[:, o50].mean(dim=0, keepdim=True),
+             self.AP.flatten().mean(dim=0, keepdim=True), self.AP.flatten()])
+
+    but it never writes ``prev_intro_cls`` into the metrics file. Assuming a
+    value is what silently broke this check: 19 happens to be right at t2 and
+    wrong at every task after it, so the error grew with the chain and looked
+    like a layout problem.
+
+    So rather than assume, search for the prefix length whose mean reproduces
+    the reported ``previous_known_AP50``. A match is useful only when it is
+    unique: zero-heavy AP vectors can make several prefix lengths reproduce the
+    same aggregate. Protocol counts remain the source of truth; this recovery is
+    a diagnostic cross-check, or a fallback when there is exactly one solution.
+    """
+
+    vector = payload.get("coco_eval_bbox") or []
+    expected = COCO_EVAL_BBOX_OFFSET + COCO_EVAL_BBOX_CLASSES + 1
+    if len(vector) != expected:
+        return {"found": False, "reason": f"coco_eval_bbox has {len(vector)} entries"}
+
+    values = [float(v) for v in vector[COCO_EVAL_BBOX_OFFSET:]]
+    reported_prev = payload.get("previous_known_AP50")
+    reported_current = payload.get("current_known_AP50")
+
+    n_prev = 0
+    if reported_prev is not None:
+        target = float(reported_prev)
+        matches = [
+            k for k in range(1, len(values))
+            if abs(sum(values[:k]) / k - target) <= 1e-3
+        ]
+        if not matches:
+            return {"found": False,
+                    "reason": "no prefix of coco_eval_bbox averages to "
+                              f"previous_known_AP50 ({target:.6f})"}
+        if len(matches) != 1:
+            return {
+                "found": False,
+                "reason": "multiple prefixes of coco_eval_bbox average to "
+                          f"previous_known_AP50 ({target:.6f}): {matches}",
+                "ambiguous": True,
+                "previous_candidates": matches,
+            }
+        n_prev = matches[0]
+
+    n_current = 0
+    if reported_current is not None:
+        target = float(reported_current)
+        matches = [
+            k for k in range(1, len(values) - n_prev + 1)
+            if abs(sum(values[n_prev:n_prev + k]) / k - target) <= 1e-3
+        ]
+        if not matches:
+            return {"found": False,
+                    "reason": "no window after the previous classes averages to "
+                              f"current_known_AP50 ({target:.6f})"}
+        if len(matches) != 1:
+            return {
+                "found": False,
+                "reason": "multiple windows after the previous classes average to "
+                          f"current_known_AP50 ({target:.6f}): {matches}",
+                "ambiguous": True,
+                "current_candidates": matches,
+            }
+        n_current = matches[0]
+
+    return {"found": True, "previous_introduced_classes": n_prev,
+            "current_introduced_classes": n_current}
+
+
 def validate_per_class_ap50(
-    payload: Mapping[str, object], *, tolerance: float = 1e-3
+    payload: Mapping[str, object],
+    *,
+    n_prev: int | None = None,
+    n_current: int | None = None,
+    tolerance: float = 1e-3,
 ) -> dict[str, object]:
-    """Check the per-class vector against the aggregates the evaluator itself reported.
+    """Check the per-class vector against the aggregates the evaluator reported.
 
     ``coco_eval_bbox`` is not labelled as a per-class table anywhere in the
-    metrics file — its neighbours are scalars, and the key looks like a COCO
-    summary. So rather than trusting the offsets, this recomputes the evaluator's
-    own ``previous_known_AP50``, ``current_known_AP50`` and ``unknown_AP50`` from
-    the vector and compares. If the three agree, the vector is the per-class
-    table and the offsets are right; if they do not, something about the layout
-    changed and the caller must be told rather than handed a plausible-looking
-    table of the wrong classes.
+    metrics file, and the file does not record how many classes had been
+    introduced when it was written. Both are needed to check it, and **neither
+    may be guessed** — a wrong class count is exactly what made this check fail
+    from t3 onward while passing at t2.
 
-    Verified on every committed GPU metrics file: the reconstruction matches to
-    six significant figures.
+    ``n_prev`` and ``n_current`` should therefore be passed by the caller, which
+    knows them from the protocol (``owl.protocol.Task.n_prev`` / ``n_new`` are
+    what the runner handed the bridge). When they are not passed, they are
+    *recovered from the file* by :func:`infer_introduced_counts` rather than
+    assumed. When both are available they are compared, and a disagreement is
+    itself a failure — the file and the protocol must describe the same run.
     """
 
     per_class = per_class_ap50(payload)
@@ -417,18 +504,23 @@ def validate_per_class_ap50(
 
     from owl.protocol import CLASS_ORDER
 
-    # Absent is not the same as zero. The anchor is evaluated with
-    # `prev=0, current=19` — zero previous classes is the truth there, not a
-    # missing field — while the older committed files carry neither key and do
-    # need the chain's default split. Conflating the two compared the wrong
-    # slices and made the anchor look corrupt.
+    inferred = infer_introduced_counts(payload)
     declared_prev = payload.get("previous_introduced_classes")
     declared_current = payload.get("current_introduced_classes")
-    if declared_prev is None and declared_current is None:
-        n_prev, n_current = 19, 0
-    else:
-        n_prev = int(declared_prev or 0)
-        n_current = int(declared_current or 0)
+
+    if n_prev is None:
+        n_prev = (int(declared_prev) if declared_prev is not None
+                  else inferred.get("previous_introduced_classes"))
+    if n_current is None:
+        n_current = (int(declared_current) if declared_current is not None
+                     else inferred.get("current_introduced_classes"))
+    if n_prev is None or n_current is None:
+        return {"usable": False, "checks": [],
+                "reason": inferred.get("reason", "the class counts are unknown")}
+    n_prev, n_current = int(n_prev), int(n_current)
+    if n_prev < 0 or n_current < 0 or n_prev + n_current > len(CLASS_ORDER):
+        return {"usable": False, "checks": [],
+                "reason": f"invalid class counts: prev={n_prev}, current={n_current}"}
 
     checks: list[dict] = []
 
@@ -439,6 +531,7 @@ def validate_per_class_ap50(
         rebuilt = sum(values) / len(values)
         checks.append({
             "quantity": label,
+            "classes": len(values),
             "rebuilt": rebuilt,
             "reported": float(reported),
             "agrees": abs(rebuilt - float(reported)) <= tolerance,
@@ -450,25 +543,51 @@ def validate_per_class_ap50(
     if n_current:
         compare("current_known_AP50", CLASS_ORDER[n_prev:n_prev + n_current],
                 payload.get("current_known_AP50"))
+    if n_prev + n_current:
+        compare("known_AP50", CLASS_ORDER[:n_prev + n_current],
+                payload.get("known_AP50"))
     unknown = payload.get("unknown_AP50")
     if unknown is not None and "unknown" in per_class:
         checks.append({
             "quantity": "unknown_AP50",
+            "classes": 1,
             "rebuilt": per_class["unknown"],
             "reported": float(unknown),
             "agrees": abs(per_class["unknown"] - float(unknown)) <= tolerance,
         })
 
     disagreed = [c["quantity"] for c in checks if not c["agrees"]]
+    # the protocol and the file must describe the same run
+    if inferred.get("found") and inferred.get("previous_introduced_classes") != n_prev:
+        disagreed.append(
+            f"the file's own aggregates imply prev_intro_cls="
+            f"{inferred['previous_introduced_classes']}, the caller said {n_prev}")
+    if inferred.get("found") and inferred.get("current_introduced_classes") != n_current:
+        disagreed.append(
+            f"the file's own aggregates imply curr_intro_cls="
+            f"{inferred['current_introduced_classes']}, the caller said {n_current}")
+    if declared_prev is not None and int(declared_prev) != n_prev:
+        disagreed.append(
+            f"the file declares prev_intro_cls={int(declared_prev)}, "
+            f"the caller said {n_prev}")
+    if declared_current is not None and int(declared_current) != n_current:
+        disagreed.append(
+            f"the file declares curr_intro_cls={int(declared_current)}, "
+            f"the caller said {n_current}")
+
     return {
-        "usable": not disagreed,
+        "usable": bool(checks) and not disagreed,
         "reason": (
             "" if not disagreed else
             f"the per-class vector does not reproduce {disagreed}; the layout of "
-            "coco_eval_bbox is not what this reader assumes"
+            "coco_eval_bbox or the class counts are not what this reader assumes"
         ),
         "checks": checks,
         "n_classes": len(per_class),
+        "previous_introduced_classes": n_prev,
+        "current_introduced_classes": n_current,
+        "counts_recovered_from_file": inferred.get("found", False),
+        "count_inference_reason": inferred.get("reason", ""),
     }
 
 

@@ -104,7 +104,8 @@ def _read_metrics(path: Path) -> dict:
         return {}
 
 
-def _per_class(path: Path) -> tuple[dict[str, float], dict]:
+def _per_class(path: Path, *, n_prev: int | None = None,
+               n_current: int | None = None) -> tuple[dict[str, float], dict]:
     """Per-class AP50 and the report saying whether it may be trusted.
 
     The metrics file has no key named for a per-class table. What it has is
@@ -123,7 +124,13 @@ def _per_class(path: Path) -> tuple[dict[str, float], dict]:
     if not payload:
         return {}, {"usable": False, "reason": f"{path.name} is missing or unreadable",
                     "checks": []}
-    return metrics.per_class_ap50(payload), metrics.validate_per_class_ap50(payload)
+    found = metrics.per_class_ap50(payload)
+    report = metrics.validate_per_class_ap50(
+        payload, n_prev=n_prev, n_current=n_current)
+    # A warning next to Table 4 is not enough: once validation says that the
+    # layout or slice counts are wrong, those plausible-looking class values
+    # must not flow into the table, forgetting analysis, or vulnerability fit.
+    return (found if report.get("usable") else {}), report
 
 
 def _recall(metrics_path: Path, classes: Sequence[str]) -> dict[str, dict]:
@@ -173,7 +180,21 @@ def load_run(directory: Path) -> Run | None:
     selection = str(config.get("arm", selection or results[0].stem[len("results_"):]))
     replay = str(config.get("replay_arm", replay or "unknown"))
 
-    anchor, anchor_check = _per_class(directory / "anchor_metrics.json")
+    # The metrics file does not record how many classes had been introduced when
+    # it was written, and PROB slices its aggregates by exactly that number. The
+    # chain does know it: `Task.n_prev` and `Task.n_new` are what the runner
+    # handed the bridge, so they are the authority here. Guessing 19 for every
+    # task is what made this check pass at t2 and fail at t3 onward.
+    n_tasks = int(config.get("n_tasks") or (len(rows) + 1))
+    try:
+        chain = {task.name: task for task in protocol.build_chain(n_tasks)}
+    except protocol.ProtocolError:
+        chain = {}
+    anchor_task = protocol.build_chain(2)[0]
+
+    anchor, anchor_check = _per_class(
+        directory / "anchor_metrics.json",
+        n_prev=anchor_task.n_prev, n_current=anchor_task.n_new)
     per_task: dict[str, dict[str, float]] = {}
     checks: dict[str, dict] = {}
     recall: dict[str, dict[str, dict]] = {}
@@ -181,8 +202,12 @@ def load_run(directory: Path) -> Run | None:
         checks["anchor"] = anchor_check
     for row in rows:
         task = str(row.get("task"))
+        step = chain.get(task)
         metrics_path = directory / f"{task}_{selection}" / "metrics.json"
-        found, report = _per_class(metrics_path)
+        found, report = _per_class(
+            metrics_path,
+            n_prev=step.n_prev if step else None,
+            n_current=step.n_new if step else None)
         if found:
             per_task[task] = found
         if report.get("checks") or found:
@@ -197,32 +222,47 @@ def load_run(directory: Path) -> Run | None:
                per_class_checks=checks, per_task_recall=recall)
 
 
-def load_runs(root: str | Path) -> dict[str, Run]:
-    """Every run under ``root``, keyed by directory name.
+def load_runs(
+    root: str | Path,
+    *,
+    include: Sequence[str] | None = None,
+) -> dict[str, Run]:
+    """The registered replay runs under ``root``, keyed by directory name.
 
     ``root`` may be the workspace root that holds one directory per run, or a
     single run directory. Directories without a results file are skipped
     silently — a run that has not started yet is not an error.
+
+    By default only :data:`EXPECTED` is considered. A Drive workspace
+    accumulates directories from every earlier study — ``objectness``,
+    ``prior_consult_batch``, a bare ``random`` — and those are different
+    experiments, not arms of this one. Reporting them as incompatible is
+    correct but noisy; the registered experiment should simply not look at
+    them. Pass ``include`` to widen the set deliberately.
     """
 
     root = Path(root)
     if not root.exists():
         raise AnalysisError(f"{root} does not exist.")
 
+    wanted = set(EXPECTED if include is None else include)
     found: dict[str, Run] = {}
     single = load_run(root)
     if single is not None:
         found[single.name] = single
     else:
         for child in sorted(p for p in root.iterdir() if p.is_dir()):
+            if child.name not in wanted:
+                continue
             run = load_run(child)
             if run is not None:
                 found[run.name] = run
     if not found:
         raise AnalysisError(
-            f"No finished run under {root}. A run directory holds "
-            "results_<arm>.csv next to its per-task metrics; download the "
-            "workspace from Drive, not the notebook output."
+            f"No finished run under {root} among {sorted(wanted)}. A run "
+            "directory holds results_<arm>.csv next to its per-task metrics; "
+            "download the workspace from Drive, not the notebook output. Pass "
+            "--include to consider directories outside the registered experiment."
         )
     return {name: found[name] for name in sorted(found, key=_order)}
 
