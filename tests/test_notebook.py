@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import ast
 import json
+import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 NOTEBOOK = ROOT / "notebooks" / "owod_active.ipynb"
@@ -156,6 +159,69 @@ def test_canonical_data_and_shared_split_are_package_owned():
     assert "evaluation_subset.SHARED_TEST_SET" in data
     assert '"owl_shared_test"' not in data
     assert "extract_committed_archive" in data and "destination" in data
+
+
+def test_coco_image_download_is_tls_verified_atomic_validated_and_fail_closed():
+    data = cell(4)
+    assert 'COCO_IMAGE_SOURCE = "https://s3.amazonaws.com/images.cocodataset.org"' in data
+    for option in ("--fail", "--location", "--retry", "--connect-timeout",
+                   "--max-time", "--output"):
+        assert option in data
+    assert "image.verify()" in data and 'image.format != "JPEG"' in data
+    assert 'target.name + ".part"' in data and "partial.replace(target)" in data
+    assert "COCO image materialization failed" in data
+    assert "TLS verification enabled" in data
+    assert 'label="COCO image materialization"' in data
+    assert 'label="COCO shared-test image materialization"' in cell(6)
+    lowered = data.lower()
+    assert "--insecure" not in lowered and "verify=false" not in lowered
+    assert '"-k"' not in lowered and "curl -k" not in lowered
+
+
+def test_fetch_images_handles_cache_success_corruption_failure_and_rerun(tmp_path, capsys):
+    fetch = notebook_function(4, "fetch_images")
+    namespace = fetch.__globals__
+    jpeg = tmp_path / "JPEGImages"
+    jpeg.mkdir()
+    namespace.update({
+        "JPEG": jpeg,
+        "Image": Image,
+        "Path": Path,
+        "ThreadPoolExecutor": ThreadPoolExecutor,
+        "COCO_IMAGE_SOURCE": "https://s3.amazonaws.com/images.cocodataset.org",
+    })
+
+    existing, downloadable = "000000000139", "000000000285"
+    failing, empty = "000000000632", "000000000724"
+    Image.new("RGB", (4, 4)).save(jpeg / f"{existing}.jpg", format="JPEG")
+    (jpeg / f"{empty}.jpg").write_bytes(b"")
+    calls = []
+
+    def fake_run(command, **_):
+        calls.append(command)
+        partial = Path(command[command.index("--output") + 1])
+        url = command[-1]
+        image_id = url.rsplit("/", 1)[-1].removesuffix(".jpg")
+        if image_id == downloadable and "/val2017/" in url:
+            Image.new("RGB", (5, 5)).save(partial, format="JPEG")
+            return types.SimpleNamespace(returncode=0, stderr="")
+        partial.write_bytes(b"partial")
+        return types.SimpleNamespace(returncode=60, stderr="TLS or HTTP failure")
+
+    namespace["subprocess"] = types.SimpleNamespace(run=fake_run)
+    assert fetch([existing, downloadable], workers=1) == [existing, downloadable]
+    first_call_count = len(calls)
+    assert first_call_count == 2  # train miss, then val success
+    assert fetch([existing, downloadable], workers=1) == [existing, downloadable]
+    assert len(calls) == first_call_count
+
+    for image_id in (failing, empty):
+        with pytest.raises(RuntimeError, match="COCO image materialization failed"):
+            fetch([image_id], workers=1)
+        assert not (jpeg / f"{image_id}.jpg").exists()
+        assert not (jpeg / f"{image_id}.jpg.part").exists()
+    output = capsys.readouterr().out
+    assert "available: 2" in output and "missing: 1" in output
 
 
 def test_preflight_is_fail_closed_and_covers_every_required_input():

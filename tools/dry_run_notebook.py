@@ -34,6 +34,7 @@ from pathlib import Path
 from xml.etree import ElementTree as _ET
 
 import numpy as np
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 NOTEBOOK = ROOT / "notebooks" / "owod_active.ipynb"
@@ -341,9 +342,10 @@ def fake_subprocess(jpeg_dir: Path):
         if text[0] == "which":
             return real.CompletedProcess(command, 0, "/usr/local/cuda/bin/nvcc\n", "")
         if text[0] == "curl":
-            target = Path(text[text.index("-o") + 1])
+            output_option = "--output" if "--output" in text else "-o"
+            target = Path(text[text.index(output_option) + 1])
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b"\xff\xd8\xff\xe0fake jpeg")
+            Image.new("RGB", (8, 8)).save(target, format="JPEG")
             return real.CompletedProcess(command, 0, "", "")
         if "git" in text[0] and text[1:4] == ["remote", "get-url", "origin"]:
             cwd = Path(kwargs.get("cwd", ROOT))
