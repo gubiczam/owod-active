@@ -241,7 +241,12 @@ class FakeBridge:
 def fake_subprocess(jpeg_dir: Path):
     """git / pip / curl / nvidia-smi, answered without a network."""
 
+    import re
     import subprocess as real
+
+    installed_versions = {
+        "pandas": "2.3.2", "seaborn": "0.13.2", "tqdm": "4.67.1",
+    }
 
     def run(command, **kwargs):
         text = [str(part) for part in command]
@@ -254,6 +259,26 @@ def fake_subprocess(jpeg_dir: Path):
             )
         if "nvidia-smi" in joined:
             return real.CompletedProcess(command, 0, "Tesla T4, 15360 MiB\n", "")
+        if len(text) >= 4 and text[1:3] == ["-m", "pip"] and "install" in text:
+            for part in text:
+                match = re.fullmatch(r"([A-Za-z0-9_.-]+)==([^ ]+)", part)
+                if match:
+                    installed_versions[match.group(1).lower()] = match.group(2)
+            return real.CompletedProcess(command, 0, "", "")
+        if "-c" in text:
+            script = text[text.index("-c") + 1]
+            version_match = re.search(r"version\(['\"]([^'\"]+)['\"]\)", script)
+            if version_match:
+                version = installed_versions.get(version_match.group(1).lower())
+                return real.CompletedProcess(
+                    command, 0 if version else 1, (version + "\n") if version else "", "")
+            direct_import = re.fullmatch(r"import ([A-Za-z0-9_.]+)", script)
+            if direct_import:
+                module = direct_import.group(1).split(".", 1)[0].lower()
+                return real.CompletedProcess(
+                    command, 0 if module in installed_versions else 1, "", "")
+            # The CUDA and complete PROB runtime probes are successful fakes.
+            return real.CompletedProcess(command, 0, "fake subprocess probe: PASS\n", "")
         if text[0] == "which":
             return real.CompletedProcess(command, 0, "/usr/local/cuda/bin/nvcc\n", "")
         if text[0] == "curl":
@@ -271,7 +296,7 @@ def fake_subprocess(jpeg_dir: Path):
             cwd = Path(kwargs.get("cwd", ROOT))
             commit = ("4c66be1a52cad9360e09c729e9134aba8fe0b531"
                       if cwd.name == "PROB" else
-                      "d1ce0c75be08e1ca1b90005168c19a3e61253be0")
+                      "ae2d2ab1bdeb7a9c30992448d0a839c3458451e9")
             return real.CompletedProcess(command, 0, commit + "\n", "")
         return real.CompletedProcess(command, 0, "", "")
 
@@ -440,6 +465,9 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
     if run_gpu:
         fake = namespace["prob_bridge"]
         by_arm = namespace["by_arm"]
+        assert namespace["PROB_COMPAT_INSTALLED"] == [
+            "einops==0.5.0", "pycocotools==2.0.5", "wandb==0.18.7",
+        ]
         assert set(by_arm) == {"random__uniform", "random__tail_favouring"}, sorted(by_arm)
         verbs = [call["verb"] for call in fake.calls]
         # each arm scores the starting checkpoint once — that is what task 2

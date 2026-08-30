@@ -9,7 +9,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 NOTEBOOK = ROOT / "notebooks" / "owod_active.ipynb"
-OWL_SHA = "d1ce0c75be08e1ca1b90005168c19a3e61253be0"
+OWL_SHA = "ae2d2ab1bdeb7a9c30992448d0a839c3458451e9"
 PROB_SHA = "4c66be1a52cad9360e09c729e9134aba8fe0b531"
 
 
@@ -80,7 +80,22 @@ def test_drive_mount_precedes_clones_and_is_the_only_interactive_operation():
 def test_dependencies_are_installed_without_floating_upgrades_or_runtime_restart():
     joined = "\n".join((cell(2), cell(3)))
     assert "pip\", \"install" in joined and 'f"{ROOT}[plots]"' in joined
-    assert '"-r", str(PROB / "requirements.txt")' in joined
+    assert 'str(PROB / "requirements.txt")' not in joined
+    for requirement in ("einops==0.5.0", "Cython==3.1.3", "pycocotools==2.0.5",
+                        "wandb==0.18.7", "pandas==2.3.2", "seaborn==0.13.2",
+                        "tqdm==4.67.1"):
+        assert requirement in joined
+    assert "--no-build-isolation" in joined and "--no-deps" in joined
+    assert "--only-binary=:all:" in joined
+    assert "runtime_probe" in joined and "import main_open_world" in joined
+    assert "sys.version_info[:2] == (3, 13)" in joined
+    assert "CocoEvaluator" in joined and "NPY_OWNDATA" in joined
+    assert "evaluator.coco_eval" in joined and "stats[0]" in joined
+    assert "PROB CUDA model/loss/evaluator smoke" in joined
+    assert "weighted.backward()" in joined and "MSDA_AVAILABLE" in joined
+    assert "OWDetection" in joined and "voc_eval" in joined
+    assert "scikit-image==0.19.2" not in joined and "pandas==1.5.1" not in joined
+    assert "/usr/bin/python" not in joined and "/usr/local/bin/python" not in joined
     assert "--upgrade" not in joined and "restart" not in joined.lower()
     assert "MultiScaleDeformableAttention" in joined and "msda_available" in joined
 
