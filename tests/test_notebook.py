@@ -97,7 +97,38 @@ def test_dependencies_are_installed_without_floating_upgrades_or_runtime_restart
     assert "scikit-image==0.19.2" not in joined and "pandas==1.5.1" not in joined
     assert "/usr/bin/python" not in joined and "/usr/local/bin/python" not in joined
     assert "--upgrade" not in joined and "restart" not in joined.lower()
-    assert "MultiScaleDeformableAttention" in joined and "msda_available" in joined
+    assert "MultiScaleDeformableAttention" in joined and "probe_prob_msda" in joined
+
+
+def test_msda_backend_is_runtime_authoritative_and_cuda_smoke_gated():
+    prob, preflight, final = cell(3), cell(5), cell(12)
+
+    # Regression for the real T4 failure: the no-torch bare import remains only
+    # diagnostic and is never equated with the wrapper's dispatch decision.
+    assert 'RAW_MSDA = run_json_probe(' in prob
+    assert 'from models.ops.functions import ms_deform_attn_func as msda_func' in prob
+    assert 'from models.ops.modules import ms_deform_attn as msda_module' in prob
+    assert 'PREBUILD_PROB_MSDA.get("available") is not True' in prob
+    assert 'RAW_MSDA.get("ok") != POSTBUILD_PROB_MSDA.get("available")' in prob
+    assert 'assert MSDA_AVAILABLE ==' not in prob
+    assert 'sys.argv[2]' not in prob
+
+    # Both compiled and fallback branches must be observed inside the actual
+    # detector forward and survive criterion, backward, and postprocessing.
+    assert 'dispatch_counts = {"compiled": 0, "fallback": 0}' in prob
+    assert 'ObservedCompiledDispatch' in prob and 'observed_fallback' in prob
+    assert 'assert dispatch_counts[' in prob
+    assert 'weighted.backward()' in prob and 'postprocessors["bbox"]' in prob
+    assert 'torch.cuda.synchronize()' in prob
+    assert 'compatible_keys' in prob and 'T1 checkpoint has no compatible' in prob
+    assert 'if prob_smoke.returncode != 0:' in prob
+    assert 'ENVIRONMENT_PREFLIGHT_OK = True' in prob
+    assert prob.index('if prob_smoke.returncode != 0:') < prob.index(
+        'ENVIRONMENT_PREFLIGHT_OK = True')
+
+    # A failed/missing smoke result cannot reach anchor evaluation or training.
+    assert '"CUDA model smoke": ENVIRONMENT_PREFLIGHT_OK' in preflight
+    assert 'PROB_MSDA_BACKEND' in final and 'MSDA_BUILT' not in final
 
 
 def test_canonical_data_and_shared_split_are_package_owned():
@@ -114,7 +145,7 @@ def test_canonical_data_and_shared_split_are_package_owned():
 
 def test_preflight_is_fail_closed_and_covers_every_required_input():
     preflight = cell(5)
-    for label in ("GPU visible", "GPU memory >= 14 GiB", "torch CUDA",
+    for label in ("CUDA model smoke", "GPU visible", "GPU memory >= 14 GiB", "torch CUDA",
                   "package consistency", "OWL exact SHA", "PROB exact SHA",
                   "Drive writable", "Drive free >= 8 GiB", "local free >= 12 GiB",
                   "checkpoint", "canonical data root",
@@ -214,6 +245,9 @@ def test_whole_notebook_runs_with_colab_gpu_network_prob_and_baseline_faked(caps
         dry_run_notebook.run(run_gpu=True, verbose=False)
     finally:
         sys.path.remove(tools)
+    from owl import bridge as live_bridge
+
+    assert live_bridge.Bridge.__name__ == "Bridge"
     output = capsys.readouterr().out
     assert "GPU branch: pinned baseline + 2 replay runs" in output
     assert "all notebook audits" in output

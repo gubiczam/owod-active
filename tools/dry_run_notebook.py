@@ -267,6 +267,60 @@ def fake_subprocess(jpeg_dir: Path):
             return real.CompletedProcess(command, 0, "", "")
         if "-c" in text:
             script = text[text.index("-c") + 1]
+            if "OWOD_RAW_MSDA_PROBE=" in script:
+                payload = {
+                    "ok": False,
+                    "path": None,
+                    "error": "ImportError: dry-run extension needs torch loaded first",
+                }
+                return real.CompletedProcess(
+                    command, 0, "OWOD_RAW_MSDA_PROBE=" + json.dumps(payload) + "\n", "")
+            if "OWOD_PROB_MSDA_PROBE=" in script:
+                prob_root = Path(kwargs.get("cwd", ROOT))
+                payload = {
+                    "probe_ok": True,
+                    "python": "3.13.7",
+                    "executable": text[0],
+                    "torch": "2.8.0+cu126",
+                    "torchvision": "0.23.0+cu126",
+                    "torch_cuda": "12.6",
+                    "cuda_available": True,
+                    "gpu": "Tesla T4 (dry run)",
+                    "numpy": np.__version__,
+                    "scipy": "1.16.1",
+                    "sklearn": "1.7.1",
+                    "pillow": "11.3.0",
+                    "matplotlib": "3.10.5",
+                    "pandas": "2.3.2",
+                    "einops": "0.5.0",
+                    "pycocotools": "2.0.5",
+                    "extension_after_torch": {
+                        "ok": True, "path": "/fake/MultiScaleDeformableAttention.so",
+                        "error": None,
+                    },
+                    "available": True,
+                    "backend": "compiled",
+                    "wrapper_path": str(prob_root / "models" / "ops" / "functions" /
+                                        "ms_deform_attn_func.py"),
+                    "downstream_path": str(prob_root / "models" / "ops" / "modules" /
+                                           "ms_deform_attn.py"),
+                    "extension_path": "/fake/MultiScaleDeformableAttention.so",
+                    "error": None,
+                }
+                return real.CompletedProcess(
+                    command, 0, "OWOD_PROB_MSDA_PROBE=" + json.dumps(payload) + "\n", "")
+            if "OWOD_MSDA_RESULT=" in script:
+                payload = {
+                    "available": True,
+                    "backend": "compiled",
+                    "dispatch_counts": {"compiled": 12, "fallback": 0},
+                }
+                output = (
+                    "OWOD_MSDA_RESULT=" + json.dumps(payload) + "\n"
+                    "MSDA backend: compiled\n"
+                    "PROB CUDA model/loss/evaluator smoke: PASS\n"
+                )
+                return real.CompletedProcess(command, 0, output, "")
             version_match = re.search(r"version\(['\"]([^'\"]+)['\"]\)", script)
             if version_match:
                 version = installed_versions.get(version_match.group(1).lower())
@@ -327,6 +381,9 @@ def cells() -> list[dict]:
 
 
 def run(run_gpu: bool, *, verbose: bool) -> None:
+    from owl import bridge as original_bridge_module
+
+    original_bridge_class = original_bridge_module.Bridge
     workspace = Path(tempfile.mkdtemp(prefix="owl-dry-"))
     drive_root = workspace / "drive" / "MyDrive" / "OWL"
     (drive_root / "checkpoints" / "SOWODB").mkdir(parents=True, exist_ok=True)
@@ -456,6 +513,8 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
                 "validated and skipped"
             print("rerun idempotency: valid replay work was skipped with no new PROB calls")
     finally:
+        if "bridge" in namespace:
+            namespace["bridge"].Bridge = original_bridge_class
         if previous_torch is None:
             sys.modules.pop("torch", None)
         else:
