@@ -499,6 +499,18 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
                 assert legacy_config.pop("replay_protocol_version") == 3
                 legacy_baseline_config_path.write_text(
                     json.dumps(legacy_config, indent=2), encoding="utf-8")
+                baseline_states = sorted(
+                    (drive_root / "work" / "random__none").glob("t*_random/state.json"))
+                assert len(baseline_states) == 3
+                legacy_states = [json.loads(path.read_text()) for path in baseline_states]
+                legacy_states[0]["replay_row"] = {}
+                legacy_states[0].pop("exemplars", None)
+                legacy_states[1]["replay_row"] = {"images": 0, "per_class": ""}
+                legacy_states[1]["exemplars"] = []
+                legacy_states[2].pop("replay_row", None)
+                legacy_states[2].pop("exemplars", None)
+                for path, state in zip(baseline_states, legacy_states, strict=True):
+                    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
                 legacy_baseline_config_bytes = legacy_baseline_config_path.read_bytes()
 
             if verbose:

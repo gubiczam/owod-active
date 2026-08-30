@@ -236,6 +236,33 @@ def test_legacy_no_replay_baseline_exception_is_exactly_one_field_narrow():
     assert all(differences and note is None for differences, note in rejected)
 
 
+def test_legacy_no_replay_state_evidence_accepts_zero_or_absent_only():
+    problems = notebook_function(5, "legacy_no_replay_state_problems")
+
+    accepted = (
+        {"replay_row": {}},
+        {"replay_row": {"requested_objects": 0, "delivered_objects": 0,
+                        "images": 0, "added": 0}},
+        {"replay_row": {"per_class": ""}},
+        {},
+        {"replay_row": {}, "exemplars": []},
+    )
+    assert all(problems(state) == [] for state in accepted)
+
+    for field in (
+        "requested_objects", "allocated_objects", "delivered_objects", "images",
+        "unique_source_images", "from_previous_memory", "from_new_task",
+        "evicted", "added",
+    ):
+        assert problems({"replay_row": {field: 1}}) == [
+            f"replay diagnostics are not zero: {{{field!r}: 1}}"]
+    assert problems({"exemplars": [{"image_id": "1"}]}) == [
+        "stores exemplar identities"]
+    for invalid in (None, [], "missing"):
+        assert problems({"replay_row": invalid}) == [
+            "replay_row is present but is not an object"]
+
+
 def test_legacy_projection_never_rewrites_drive_and_comparisons_record_provenance():
     preflight, anchor, final_compare = cell(5), cell(6), cell(11)
     assert "BASELINE_CONFIG_BYTES" in preflight
