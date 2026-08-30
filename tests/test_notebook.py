@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 
@@ -26,6 +27,16 @@ def cell(stage: int) -> str:
     matches = [source for source in code_cells() if source.startswith(f"# {stage} —")]
     assert len(matches) == 1, (stage, len(matches))
     return matches[0]
+
+
+def notebook_function(stage: int, name: str):
+    tree = ast.parse(cell(stage))
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    assert any(node.name == name for node in functions), name
+    namespace: dict = {}
+    exec(compile(ast.Module(body=functions, type_ignores=[]),
+                 f"stage {stage}:{name}", "exec"), namespace)  # noqa: S102
+    return namespace[name]
 
 
 def test_notebook_is_valid_compilable_json_with_exactly_stages_0_through_12():
@@ -83,7 +94,7 @@ def test_dependencies_are_installed_without_floating_upgrades_or_runtime_restart
     assert 'str(PROB / "requirements.txt")' not in joined
     for requirement in ("einops==0.5.0", "Cython==3.1.3", "pycocotools==2.0.5",
                         "wandb==0.18.7", "pandas==2.3.2", "seaborn==0.13.2",
-                        "tqdm==4.67.1"):
+                        "tqdm==4.67.1", "jedi==0.19.2"):
         assert requirement in joined
     assert "--no-build-isolation" in joined and "--no-deps" in joined
     assert "--only-binary=:all:" in joined
@@ -98,6 +109,10 @@ def test_dependencies_are_installed_without_floating_upgrades_or_runtime_restart
     assert "/usr/bin/python" not in joined and "/usr/local/bin/python" not in joined
     assert "--upgrade" not in joined and "restart" not in joined.lower()
     assert "MultiScaleDeformableAttention" in joined and "probe_prob_msda" in joined
+    assert "requires jedi, which is not installed" in joined
+    assert "bootstrap_package_probe = pip_check()" in joined
+    assert "if bootstrap_package_probe.returncode != 0:" in joined
+    assert "Python package consistency check failed after bootstrap repair" in joined
 
 
 def test_msda_backend_is_runtime_authoritative_and_cuda_smoke_gated():
@@ -158,6 +173,79 @@ def test_preflight_is_fail_closed_and_covers_every_required_input():
     assert "PREFLIGHT FAILED" in preflight
     assert "No GPU evaluation or training was started" in preflight
     assert "PREFLIGHT_OK = True" in preflight
+
+
+def test_legacy_no_replay_baseline_exception_is_exactly_one_field_narrow():
+    decide = notebook_function(5, "legacy_no_replay_baseline_decision")
+    expected = {
+        "arm": "random", "replay_arm": "none", "seed": 0,
+        "replay_protocol_version": 3,
+    }
+    legacy = {name: value for name, value in expected.items()
+              if name != "replay_protocol_version"}
+
+    differences, note = decide(
+        workspace_name="random__none", stored=legacy, expected=expected,
+        completed=True, integrity_ok=True, no_replay_artifacts=True)
+    assert differences == {}
+    assert note == {
+        "workspace": "random__none",
+        "stored": "absent",
+        "normalized_for_compatibility": "no-replay-only",
+        "reason": "replay_arm=none; replay protocol inactive",
+        "historical_config_modified": False,
+    }
+
+    rejected = []
+    for workspace, replay_arm in (
+        ("random__uniform", "uniform"),
+        ("random__tail_favouring", "tail_favouring"),
+        ("random__none", "uniform"),
+    ):
+        candidate_expected = dict(expected, replay_arm=replay_arm)
+        candidate_stored = dict(candidate_expected)
+        candidate_stored.pop("replay_protocol_version")
+        rejected.append(decide(
+            workspace_name=workspace, stored=candidate_stored,
+            expected=candidate_expected, completed=True, integrity_ok=True,
+            no_replay_artifacts=True))
+
+    other_mismatch = dict(legacy, seed=7)
+    rejected.append(decide(
+        workspace_name="random__none", stored=other_mismatch, expected=expected,
+        completed=True, integrity_ok=True, no_replay_artifacts=True))
+    rejected.append(decide(
+        workspace_name="random__none", stored=legacy, expected=expected,
+        completed=False, integrity_ok=True, no_replay_artifacts=True))
+    rejected.append(decide(
+        workspace_name="random__none", stored=legacy, expected=expected,
+        completed=True, integrity_ok=False, no_replay_artifacts=True))
+    rejected.append(decide(
+        workspace_name="random__none", stored=legacy, expected=expected,
+        completed=True, integrity_ok=True, no_replay_artifacts=False))
+    rejected.append(decide(
+        workspace_name="random__none", stored=dict(legacy, replay_protocol_version=2),
+        expected=expected, completed=True, integrity_ok=True,
+        no_replay_artifacts=True))
+    unrelated_missing = dict(legacy)
+    unrelated_missing.pop("seed")
+    rejected.append(decide(
+        workspace_name="random__none", stored=unrelated_missing, expected=expected,
+        completed=True, integrity_ok=True, no_replay_artifacts=True))
+
+    assert all(differences and note is None for differences, note in rejected)
+
+
+def test_legacy_projection_never_rewrites_drive_and_comparisons_record_provenance():
+    preflight, anchor, final_compare = cell(5), cell(6), cell(11)
+    assert "BASELINE_CONFIG_BYTES" in preflight
+    assert "Historical random__none config.json was modified" in preflight
+    assert "destination.symlink_to" in preflight
+    assert "COMPARISON_WORKSPACE" in preflight
+    assert "load_compatible_run(BASELINE)" in anchor
+    assert "build_comparison_workspace()" in anchor
+    assert "legacy_baseline_replay_protocol" in final_compare
+    assert "assert_historical_baseline_unchanged()" in final_compare
 
 
 def test_baseline_is_exact_and_anchor_validation_precedes_any_replay_training():

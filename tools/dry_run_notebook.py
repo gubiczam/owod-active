@@ -259,6 +259,11 @@ def fake_subprocess(jpeg_dir: Path):
             )
         if "nvidia-smi" in joined:
             return real.CompletedProcess(command, 0, "Tesla T4, 15360 MiB\n", "")
+        if len(text) >= 4 and text[1:4] == ["-m", "pip", "check"]:
+            if "jedi" not in installed_versions:
+                conflict = "ipython 7.34.0 requires jedi, which is not installed.\n"
+                return real.CompletedProcess(command, 1, conflict, "")
+            return real.CompletedProcess(command, 0, "No broken requirements found.\n", "")
         if len(text) >= 4 and text[1:3] == ["-m", "pip"] and "install" in text:
             for part in text:
                 match = re.fullmatch(r"([A-Za-z0-9_.-]+)==([^ ]+)", part)
@@ -371,6 +376,8 @@ def substitutions(workspace: Path) -> list[tuple[str, str]]:
          f'Path("{workspace / "precompare"}")'),
         ('Path("/content/owod_comparison_replay_v3_fast_seed0")',
          f'Path("{workspace / "comparison"}")'),
+        ('Path("/content/owod_no_replay_compatibility_view")',
+         f'Path("{workspace / "compatibility_view"}")'),
         ('DRIVE_FREE_GB >= 8.0', 'DRIVE_FREE_GB >= 0.0'),
         ('LOCAL_FREE_GB >= 12.0', 'LOCAL_FREE_GB >= 0.0'),
     ]
@@ -414,6 +421,8 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
     sys.modules["torch"] = torch
 
     namespace: dict = {}
+    legacy_baseline_config_path: Path | None = None
+    legacy_baseline_config_bytes: bytes | None = None
     try:
         for index, cell in enumerate(cells()):
             if cell["cell_type"] != "code":
@@ -484,6 +493,13 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
                     test_set=namespace["TEST_SET"], chain=namespace["chain"],
                     prepare_images=namespace["fetch_images"],
                 )
+                legacy_baseline_config_path = (
+                    drive_root / "work" / "random__none" / "config.json")
+                legacy_config = json.loads(legacy_baseline_config_path.read_text())
+                assert legacy_config.pop("replay_protocol_version") == 3
+                legacy_baseline_config_path.write_text(
+                    json.dumps(legacy_config, indent=2), encoding="utf-8")
+                legacy_baseline_config_bytes = legacy_baseline_config_path.read_bytes()
 
             if verbose:
                 print(f"--- cell {index} ---")
@@ -526,7 +542,25 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
         by_arm = namespace["by_arm"]
         assert namespace["PROB_COMPAT_INSTALLED"] == [
             "einops==0.5.0", "pycocotools==2.0.5", "wandb==0.18.7",
+            "jedi==0.19.2",
         ]
+        for label in (
+            "CUDA model smoke", "package consistency", "baseline fingerprint",
+            "target fingerprints", "Replay Protocol V3",
+        ):
+            assert namespace["checks"][label], label
+            print(f"{label:30s} PASS")
+        assert namespace["LEGACY_BASELINE_COMPATIBILITY"] == {
+            "workspace": "random__none",
+            "stored": "absent",
+            "normalized_for_compatibility": "no-replay-only",
+            "reason": "replay_arm=none; replay protocol inactive",
+            "historical_config_modified": False,
+        }
+        assert legacy_baseline_config_path is not None
+        assert legacy_baseline_config_path.read_bytes() == legacy_baseline_config_bytes
+        assert namespace["summary"]["legacy_baseline_replay_protocol"] == \
+            namespace["LEGACY_BASELINE_COMPATIBILITY"]
         assert set(by_arm) == {"random__uniform", "random__tail_favouring"}, sorted(by_arm)
         verbs = [call["verb"] for call in fake.calls]
         # each arm scores the starting checkpoint once — that is what task 2
