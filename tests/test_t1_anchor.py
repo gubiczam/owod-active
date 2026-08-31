@@ -419,6 +419,7 @@ def test_dedicated_notebook_is_static_compilable_and_fail_closed():
     for index, source in enumerate(code):
         compile(source, f"{notebook_path.name}:cell-{index}", "exec")
     joined = "\n".join(sources)
+    assert 'OWL_COMMIT = "c46ffe193c7f1ab0edc282214d720f08461736f9"' in joined
     assert 'PROB_COMMIT = "4c66be1a52cad9360e09c729e9134aba8fe0b531"' in joined
     assert 'ALLOW_BUDGET_OVERRUN = False' in joined
     assert 'BENCHMARK_ITERATIONS = 20' in joined

@@ -101,7 +101,7 @@ must match across anchors; every fixed scientific field remains identical.
 
 | Component | Fixed value |
 |---|---|
-| Code | reviewed OWL commit (pending review); PROB `4c66be1a52cad9360e09c729e9134aba8fe0b531` |
+| Code | OWL `c46ffe193c7f1ab0edc282214d720f08461736f9`; PROB `4c66be1a52cad9360e09c729e9134aba8fe0b531` |
 | Conditions | LT-10, LT-50, LT-100 only |
 | Architecture | PROB Deformable-DETR, `model_type=prob`, DINO ResNet-50, 100 queries, four feature levels |
 | Transformer | 6 encoder + 6 decoder layers, hidden 256, FFN 1024, 8 heads, dropout 0.1; single-stage/no box refinement; auxiliary losses on |
