@@ -1,0 +1,186 @@
+{
+  "protocol": "sowodb_controlled_t1_longtail",
+  "protocol_version": 1,
+  "condition": "lt10",
+  "scope": "the 19 fixed T1 classes whose retention is measured through T2-T6",
+  "source_dataset_identity": "S-OWODB canonical COCO training annotations",
+  "source_split_identity": "owdetr_t1_train",
+  "source_index": {
+    "path": "data/reference/t1_replay_class_counts.json",
+    "sha256": "ac4c6316b38660b841c318ef72bc9a9bd615aaeefc74cca8ce27b2acfa2d97a2"
+  },
+  "source_annotations": {
+    "path": "data/staging/owdetr_replay_annotations.tar.gz",
+    "sha256": "b641e6da90307dbd07922099f2b45ce535e443438d3099c924a386e66ce247b6"
+  },
+  "evaluation_split_sha256": "a85919758975d069ce277b34f4f2147ec1722ecc977c98214a5f50e46a3703f5",
+  "requested_rho": 10,
+  "achieved_rho": 10.001917545541707,
+  "seed": 0,
+  "sampling_algorithm": "per-class seeded SHA-256 object order without replacement",
+  "sampling_unit": "annotated object; training-only filtered XML view",
+  "target_formula": "n_r = k * rho^(-r/(C-1)); largest-remainder integer rounding",
+  "total_policy": "fixed common controlled total=79233",
+  "selected_images": 37429,
+  "selected_objects": 79233,
+  "selection": {
+    "path": "data/reference/longtail/lt10_objects.json.gz",
+    "sha256": "8d1b0443c7648cdca20a628f91627c3caee9e2f8414934ca2cc8c135d07a141d"
+  },
+  "group_definition": "original-frequency rank thirds: ranks 0-6 / 7-12 / 13-18",
+  "classes": [
+    {
+      "class_name": "person",
+      "original_count": 262465,
+      "target_count": 10432,
+      "achieved_count": 10432,
+      "rank": 0,
+      "group": "head"
+    },
+    {
+      "class_name": "car",
+      "original_count": 43867,
+      "target_count": 9179,
+      "achieved_count": 9179,
+      "rank": 1,
+      "group": "head"
+    },
+    {
+      "class_name": "bird",
+      "original_count": 10806,
+      "target_count": 8077,
+      "achieved_count": 8077,
+      "rank": 2,
+      "group": "head"
+    },
+    {
+      "class_name": "boat",
+      "original_count": 10759,
+      "target_count": 7107,
+      "achieved_count": 7107,
+      "rank": 3,
+      "group": "head"
+    },
+    {
+      "class_name": "truck",
+      "original_count": 9973,
+      "target_count": 6254,
+      "achieved_count": 6254,
+      "rank": 4,
+      "group": "head"
+    },
+    {
+      "class_name": "sheep",
+      "original_count": 9509,
+      "target_count": 5503,
+      "achieved_count": 5503,
+      "rank": 5,
+      "group": "head"
+    },
+    {
+      "class_name": "motorbike",
+      "original_count": 8725,
+      "target_count": 4842,
+      "achieved_count": 4842,
+      "rank": 6,
+      "group": "head"
+    },
+    {
+      "class_name": "cow",
+      "original_count": 8147,
+      "target_count": 4261,
+      "achieved_count": 4261,
+      "rank": 7,
+      "group": "medium"
+    },
+    {
+      "class_name": "bicycle",
+      "original_count": 7113,
+      "target_count": 3749,
+      "achieved_count": 3749,
+      "rank": 8,
+      "group": "medium"
+    },
+    {
+      "class_name": "horse",
+      "original_count": 6587,
+      "target_count": 3299,
+      "achieved_count": 3299,
+      "rank": 9,
+      "group": "medium"
+    },
+    {
+      "class_name": "bus",
+      "original_count": 6069,
+      "target_count": 2903,
+      "achieved_count": 2903,
+      "rank": 10,
+      "group": "medium"
+    },
+    {
+      "class_name": "elephant",
+      "original_count": 5513,
+      "target_count": 2554,
+      "achieved_count": 2554,
+      "rank": 11,
+      "group": "medium"
+    },
+    {
+      "class_name": "dog",
+      "original_count": 5508,
+      "target_count": 2248,
+      "achieved_count": 2248,
+      "rank": 12,
+      "group": "medium"
+    },
+    {
+      "class_name": "zebra",
+      "original_count": 5303,
+      "target_count": 1978,
+      "achieved_count": 1978,
+      "rank": 13,
+      "group": "tail"
+    },
+    {
+      "class_name": "aeroplane",
+      "original_count": 5135,
+      "target_count": 1740,
+      "achieved_count": 1740,
+      "rank": 14,
+      "group": "tail"
+    },
+    {
+      "class_name": "giraffe",
+      "original_count": 5131,
+      "target_count": 1531,
+      "achieved_count": 1531,
+      "rank": 15,
+      "group": "tail"
+    },
+    {
+      "class_name": "cat",
+      "original_count": 4768,
+      "target_count": 1347,
+      "achieved_count": 1347,
+      "rank": 16,
+      "group": "tail"
+    },
+    {
+      "class_name": "train",
+      "original_count": 4571,
+      "target_count": 1186,
+      "achieved_count": 1186,
+      "rank": 17,
+      "group": "tail"
+    },
+    {
+      "class_name": "bear",
+      "original_count": 1294,
+      "target_count": 1043,
+      "achieved_count": 1043,
+      "rank": 18,
+      "group": "tail"
+    }
+  ],
+  "scientific_sha256": "b3c751fa1034a499d592391d87afc145b0cc8b11bf4a255512fd4f52ca094f0f"
+}
