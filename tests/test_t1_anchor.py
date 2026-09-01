@@ -126,12 +126,15 @@ def _training_metadata(checkpoint: Path, condition: str = "lt10") -> dict[str, o
     return {
         "schema": t1_anchor.ANCHOR_SCHEMA,
         "condition": condition,
-        "manifest_sha256": "1" * 64,
+        "manifest_sha256": t1_anchor.EXPECTED_MANIFEST_SHA256[condition],
         "owl_commit": "2" * 40,
-        "prob_commit": "3" * 40,
+        "prob_commit": t1_anchor.PINNED_PROB_COMMIT,
         "initialization_sha256": "4" * 64,
         "recipe_fingerprint": "5" * 64,
-        "seed": 0, "epochs": 41, "optimizer_steps": 10,
+        "recipe_version": t1_anchor.RECIPE_VERSION,
+        "seed": 0, "reference_epochs": 41,
+        "global_step": 183_434, "optimizer_steps": 183_434,
+        "image_presentations": 366_868,
         "checkpoint_sha256": longtail.sha256_file(checkpoint),
         "class_order": list(protocol.TASK1),
         "train_objects": 79_233, "train_images": 37_429,
@@ -211,7 +214,7 @@ def test_workspace_isolation_and_historical_checkpoint_protection(tmp_path):
 def test_workspace_state_distinguishes_ready_resume_done_and_corruption(tmp_path):
     workspace = tmp_path / "t1_anchor__lt10__seed0"
     assert t1_anchor.workspace_state(workspace, "lt10") == "READY"
-    checkpoint = workspace / "train" / "checkpoint.pth"
+    checkpoint = workspace / "train" / "resume_latest.pth"
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b"resume")
     assert t1_anchor.workspace_state(workspace, "lt10") == "INCOMPLETE RESUMABLE"
@@ -223,6 +226,7 @@ def test_workspace_state_distinguishes_ready_resume_done_and_corruption(tmp_path
     metrics_path = workspace / "anchor_metrics.json"
     metrics = {
         "condition": "lt10",
+        "recipe_version": t1_anchor.RECIPE_VERSION,
         "checkpoint_sha256": metadata["checkpoint_sha256"],
         "recipe_fingerprint": metadata["recipe_fingerprint"],
     }
@@ -230,6 +234,9 @@ def test_workspace_state_distinguishes_ready_resume_done_and_corruption(tmp_path
     per_class = workspace / "per_class.csv"
     per_class.write_text("condition,class_name\n", encoding="utf-8")
     done = {
+        "schema": "controlled_t1_anchor_done_v2",
+        "recipe_version": t1_anchor.RECIPE_VERSION,
+        "global_step": t1_anchor.TOTAL_OPTIMIZER_UPDATES,
         "condition": "lt10",
         "checkpoint_sha256": longtail.sha256_file(final),
         "metrics_sha256": longtail.sha256_file(metrics_path),
@@ -312,16 +319,17 @@ def test_command_propagates_seed_recipe_and_no_replay_without_dry_run_writes(
         python="python", prob_root=tmp_path / "PROB",
         workspace=tmp_path / "t1_anchor__lt10__seed0",
         initialization=tmp_path / "init.pth", resume=False,
-        benchmark_iterations=2,
+        benchmark_iterations=2, stop_at_unix=None,
     )
     command, _, _ = train_tool.command_for(
         arguments, recipe("lt10"), {"data_root": str(data_root)},
         smoke=True, write_smoke_splits=False)
     joined = " ".join(command)
-    assert "run_prob_t1_anchor.py" in joined
+    assert "run_prob_t1_anchor_v2.py" in joined
     assert "--seed 0" in joined
     assert "--PREV_INTRODUCED_CLS 0 --CUR_INTRODUCED_CLS 19" in joined
-    assert "--batch_size 2" in joined and "--epochs 1" in joined
+    assert "--batch_size 2" in joined and "--epochs 41" in joined
+    assert "--warmup-iterations 5 --measured-iterations 2" in joined
     assert "replay" not in joined and "exemplar" not in joined
     assert not (image_sets / "owl_anchor_smoke_train.txt").exists()
 
@@ -392,11 +400,42 @@ def test_anchor_metric_schema_groups_and_condition_specific_forgetting():
         t1_anchor.condition_forgetting(anchor, final | {"condition": "lt50"})
 
 
-def test_step_counts_quantify_same_epoch_image_difference():
-    expected = {"lt10": 767_274, "lt50": 734_064, "lt100": 726_930}
-    for condition, steps in expected.items():
+def test_v2_budgets_are_identical_for_every_condition():
+    for condition in t1_anchor.PRIMARY_CONDITIONS:
         _, manifest = t1_anchor.condition_manifest(condition, MANIFEST_ROOT)
-        assert t1_anchor.optimizer_steps(int(manifest["selected_images"]), recipe(condition)) == steps
+        item = recipe(condition)
+        assert t1_anchor.optimizer_steps(int(manifest["selected_images"]), item) == 183_434
+        assert item.updates_per_reference_epoch == 4_474
+        assert item.images_per_reference_epoch == 8_948
+        assert item.total_image_presentations == 366_868
+
+
+def test_reference_epoch_sampling_is_unique_deterministic_and_condition_scoped():
+    first = t1_anchor.reference_epoch_indices(37_429, "lt10", 7)
+    assert len(first) == 8_948 == len(set(first))
+    assert first == t1_anchor.reference_epoch_indices(37_429, "lt10", 7)
+    assert first != t1_anchor.reference_epoch_indices(37_429, "lt10", 8)
+    assert first != t1_anchor.reference_epoch_indices(37_429, "lt50", 7)
+
+
+def test_mid_reference_epoch_resume_has_exact_uninterrupted_suffix():
+    selected = t1_anchor.reference_epoch_indices(35_460, "lt100", 3)
+    batches = tuple(zip(selected[::2], selected[1::2], strict=True))
+    completed = 3 * 4_474 + 1_237
+    assert t1_anchor.reference_position(completed) == (3, 1_237)
+    assert t1_anchor.remaining_reference_batches(35_460, "lt100", completed) == batches[1_237:]
+
+
+def test_lr_drop_boundary_is_exact_and_documented_in_one_based_update_space():
+    assert t1_anchor.learning_rate_scale_for_update(138_693) == 1.0  # update 138,694
+    assert t1_anchor.learning_rate_scale_for_update(138_694) == 0.1  # update 138,695
+
+
+def test_legacy_recipe_cannot_validate_as_v2_final_science():
+    payload = recipe("lt10").payload()
+    payload["recipe_version"] = "controlled_t1_anchor_v1"
+    with pytest.raises(t1_anchor.AnchorError, match="Legacy Recipe V1"):
+        t1_anchor.AnchorRecipe(**payload).validate()
 
 
 def test_exact_three_condition_jpeg_union_is_stable(materialize_tool):
@@ -422,7 +461,13 @@ def test_dedicated_notebook_is_static_compilable_and_fail_closed():
     assert 'OWL_COMMIT = "c46ffe193c7f1ab0edc282214d720f08461736f9"' in joined
     assert 'PROB_COMMIT = "4c66be1a52cad9360e09c729e9134aba8fe0b531"' in joined
     assert 'ALLOW_BUDGET_OVERRUN = False' in joined
+    assert 'CONDITIONS = ["lt100"]' in joined
+    assert 'GPU_BUDGET_HOURS = 8.5' in joined
     assert 'BENCHMARK_ITERATIONS = 20' in joined
+    assert 'controlled_lt_v2/seed0' in joined
+    assert 'cuda_training_smoke_v2.json' in joined
+    assert '"--stop-at-unix"' in joined
+    assert "SOFT_STOP_RESERVE_SECONDS" in joined
     assert "pip\", \"install\", \"-r" not in notebook_path.read_text(encoding="utf-8")
     assert "CONTROLLED LT ANCHOR PREFLIGHT PASS" not in joined  # emitted only by the tool
     assert "ANCHOR BENCHMARK/RESUME POINT COMPLETE" in joined
@@ -448,6 +493,7 @@ def test_combined_report_requires_valid_done_anchors(compare_tool, tmp_path):
     ]
     metrics = {
         "condition": condition,
+        "recipe_version": t1_anchor.RECIPE_VERSION,
         "checkpoint_sha256": metadata["checkpoint_sha256"],
         "recipe_fingerprint": metadata["recipe_fingerprint"],
         "overall_mAP50": 9.0,
@@ -464,6 +510,9 @@ def test_combined_report_requires_valid_done_anchors(compare_tool, tmp_path):
     per_class = workspace / "per_class.csv"
     per_class.write_text("condition,class_name\n", encoding="utf-8")
     done = {
+        "schema": "controlled_t1_anchor_done_v2",
+        "recipe_version": t1_anchor.RECIPE_VERSION,
+        "global_step": t1_anchor.TOTAL_OPTIMIZER_UPDATES,
         "condition": condition,
         "checkpoint_sha256": metadata["checkpoint_sha256"],
         "metrics_sha256": longtail.sha256_file(metrics_path),

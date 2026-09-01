@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import shutil
 import tarfile
 from collections import Counter, defaultdict
@@ -18,8 +19,9 @@ from xml.etree import ElementTree
 
 from owl import evaluation_subset, longtail, metrics, protocol
 
-ANCHOR_PROTOCOL_VERSION = 1
-ANCHOR_SCHEMA = "controlled_t1_anchor_v1"
+RECIPE_VERSION = "controlled_t1_anchor_v2"
+ANCHOR_PROTOCOL_VERSION = 2
+ANCHOR_SCHEMA = RECIPE_VERSION
 PINNED_PROB_COMMIT = "4c66be1a52cad9360e09c729e9134aba8fe0b531"
 DINO_SHA256 = "156f8c4166a23dc2951ae811e39d76a06269c565932edf647c0187e65cd7aa7c"
 HISTORICAL_T1_SHA256 = "dba5390bffdfdf63058a995f241696df8d06b7fb859aecc8292d9ea02d459a22"
@@ -31,6 +33,14 @@ EXPECTED_MANIFEST_SHA256 = {
 }
 PRIMARY_CONDITIONS = ("lt10", "lt50", "lt100")
 TRAINING_SEED = 0
+TOTAL_OPTIMIZER_UPDATES = 183_434
+REFERENCE_EPOCHS = 41
+UPDATES_PER_REFERENCE_EPOCH = 4_474
+IMAGES_PER_REFERENCE_EPOCH = 8_948
+TOTAL_IMAGE_PRESENTATIONS = 366_868
+LR_DROP_UPDATE = 138_694
+CHECKPOINT_INTERVAL_UPDATES = 1_000
+SOFT_STOP_RESERVE_SECONDS = 600
 EVALUATION_SPLIT = evaluation_subset.SHARED_TEST_SET
 EVALUATION_SPLIT_SHA256 = "f37a3bb0916dd8462fceb35f60364fed75d3a00cebd3e0ce72775dbf79d76c27"
 EVALUATION_MAX_PER_CLASS = 150
@@ -280,6 +290,7 @@ class AnchorRecipe:
     """The reviewed single-T4 fixed recipe; not an exact historical reproduction."""
 
     schema: str = ANCHOR_SCHEMA
+    recipe_version: str = RECIPE_VERSION
     anchor_protocol_version: int = ANCHOR_PROTOCOL_VERSION
     condition: str = ""
     manifest_sha256: str = ""
@@ -302,20 +313,25 @@ class AnchorRecipe:
     train_supervision: str = "condition-filtered T1 XML aliases"
     evaluation_split: str = EVALUATION_SPLIT
     evaluation_split_sha256: str = EVALUATION_SPLIT_SHA256
-    epochs: int = 41
-    duration_policy: str = "same_epochs"
+    reference_epochs: int = REFERENCE_EPOCHS
+    total_optimizer_updates: int = TOTAL_OPTIMIZER_UPDATES
+    updates_per_reference_epoch: int = UPDATES_PER_REFERENCE_EPOCH
+    images_per_reference_epoch: int = IMAGES_PER_REFERENCE_EPOCH
+    total_image_presentations: int = TOTAL_IMAGE_PRESENTATIONS
+    duration_policy: str = "fixed_global_optimizer_updates"
     batch_size: int = 2
     optimizer: str = "AdamW"
     learning_rate: float = 2e-4
     backbone_learning_rate: float = 2e-5
     linear_projection_learning_rate: float = 2e-5
     weight_decay: float = 1e-4
-    scheduler: str = "StepLR"
-    lr_drop_epoch: int = 31
+    scheduler: str = "explicit_update_space_step_drop"
+    lr_drop_update: int = LR_DROP_UPDATE
     lr_drop_gamma: float = 0.1
     clip_max_norm: float = 0.1
     seed: int = TRAINING_SEED
-    num_workers: int = 2
+    # Single-process loading makes transform RNG checkpoint/resume exact.
+    num_workers: int = 0
     num_queries: int = 100
     num_feature_levels: int = 4
     with_box_refine: bool = False
@@ -354,7 +370,9 @@ class AnchorRecipe:
     freeze_probabilistic_model: bool = False
     remove_difficult: bool = False
     cache_mode: bool = False
-    evaluation_every: int = 5
+    evaluation_cadence: str = "mandatory_final_only"
+    checkpoint_interval_updates: int = CHECKPOINT_INTERVAL_UPDATES
+    soft_stop_reserve_seconds: int = SOFT_STOP_RESERVE_SECONDS
     device: str = "cuda"
     augmentation: str = (
         "RandomHorizontalFlip; RandomSelect(RandomResize[480..800], "
@@ -401,6 +419,19 @@ class AnchorRecipe:
         for name in ("python_version", "torch_version", "torchvision_version", "cuda_version"):
             if not getattr(self, name):
                 raise AnchorError(f"The recipe lacks pinned runtime field {name!r}.")
+        if self.recipe_version != RECIPE_VERSION or self.schema != ANCHOR_SCHEMA:
+            raise AnchorError("Legacy Recipe V1 cannot launch final scientific training.")
+        if self.total_optimizer_updates != (
+                self.reference_epochs * self.updates_per_reference_epoch):
+            raise AnchorError("The fixed update budget is internally inconsistent.")
+        if self.images_per_reference_epoch != (
+                self.batch_size * self.updates_per_reference_epoch):
+            raise AnchorError("The fixed image-presentation budget is internally inconsistent.")
+        if self.total_image_presentations != (
+                self.reference_epochs * self.images_per_reference_epoch):
+            raise AnchorError("The total image-presentation budget is inconsistent.")
+        if self.lr_drop_update != 31 * self.updates_per_reference_epoch:
+            raise AnchorError("The historical 31/41 LR boundary changed.")
         identity = {
             "condition", "manifest_sha256", "owl_commit", "initialization_sha256",
             "initialization_model_state_sha256", "python_version", "torch_version",
@@ -426,7 +457,62 @@ class AnchorRecipe:
 def optimizer_steps(images: int, recipe: AnchorRecipe) -> int:
     if images < recipe.batch_size:
         raise AnchorError("Training view is smaller than one drop-last batch.")
-    return (images // recipe.batch_size) * recipe.epochs
+    if images < recipe.images_per_reference_epoch:
+        raise AnchorError("Training view cannot supply one reference epoch without replacement.")
+    return recipe.total_optimizer_updates
+
+
+def reference_position(global_step: int) -> tuple[int, int]:
+    """Return the zero-based reference epoch and batch offset for completed steps."""
+
+    if not 0 <= global_step <= TOTAL_OPTIMIZER_UPDATES:
+        raise AnchorError(f"global_step {global_step} is outside the V2 budget.")
+    return divmod(global_step, UPDATES_PER_REFERENCE_EPOCH)
+
+
+def reference_epoch_seed(condition: str, reference_epoch: int, seed: int = 0) -> int:
+    if condition not in PRIMARY_CONDITIONS or not 0 <= reference_epoch < REFERENCE_EPOCHS:
+        raise AnchorError("Invalid deterministic reference-epoch sampling identity.")
+    if seed != TRAINING_SEED:
+        raise AnchorError("Recipe V2 sampling is preregistered at seed 0.")
+    identity = f"{RECIPE_VERSION}\0{seed}\0{condition}\0{reference_epoch}".encode()
+    return int.from_bytes(hashlib.sha256(identity).digest()[:8], "big")
+
+
+def reference_epoch_indices(
+    dataset_size: int, condition: str, reference_epoch: int, seed: int = 0,
+) -> tuple[int, ...]:
+    """Select and order exactly 8,948 unique dataset indices for one reference epoch."""
+
+    if dataset_size < IMAGES_PER_REFERENCE_EPOCH:
+        raise AnchorError("Dataset is too small for Recipe V2 sampling without replacement.")
+    generator = random.Random(reference_epoch_seed(condition, reference_epoch, seed))
+    return tuple(generator.sample(range(dataset_size), IMAGES_PER_REFERENCE_EPOCH))
+
+
+def remaining_reference_batches(
+    dataset_size: int, condition: str, global_step: int, seed: int = 0,
+) -> tuple[tuple[int, int], ...]:
+    """Reconstruct the exact unconsumed batch suffix after ``global_step`` updates."""
+
+    reference_epoch, offset = reference_position(global_step)
+    if global_step == TOTAL_OPTIMIZER_UPDATES:
+        return ()
+    selected = reference_epoch_indices(dataset_size, condition, reference_epoch, seed)
+    batches = tuple(zip(selected[::2], selected[1::2], strict=True))
+    return batches[offset:]
+
+
+def learning_rate_scale_for_update(update_index: int) -> float:
+    """LR multiplier for a zero-based update index.
+
+    The first 138,694 one-based updates use the base LR. The lower LR therefore
+    applies to one-based update 138,695 (zero-based index 138,694).
+    """
+
+    if not 0 <= update_index < TOTAL_OPTIMIZER_UPDATES:
+        raise AnchorError("Update index is outside the Recipe V2 budget.")
+    return 1.0 if update_index < LR_DROP_UPDATE else 0.1
 
 
 def initialization_metadata(
@@ -484,8 +570,9 @@ def validate_initialization_metadata(
 
 REQUIRED_METADATA = {
     "schema", "condition", "manifest_sha256", "owl_commit", "prob_commit",
-    "initialization_sha256", "recipe_fingerprint", "seed", "epochs",
-    "optimizer_steps", "checkpoint_sha256", "class_order", "train_objects",
+    "initialization_sha256", "recipe_fingerprint", "recipe_version", "seed",
+    "reference_epochs", "global_step", "optimizer_steps", "image_presentations",
+    "checkpoint_sha256", "class_order", "train_objects",
     "train_images", "started_at", "ended_at", "gpu", "torch_version",
     "torchvision_version", "python_version", "cuda_version", "msda", "command",
     "evaluation_split_sha256",
@@ -498,6 +585,26 @@ def validate_training_metadata(payload: Mapping[str, object]) -> None:
         raise AnchorError(f"Anchor metadata is missing {sorted(missing)}.")
     if payload["schema"] != ANCHOR_SCHEMA:
         raise AnchorError("Anchor metadata has another schema.")
+    if payload["recipe_version"] != RECIPE_VERSION:
+        raise AnchorError("Legacy Recipe V1 metadata cannot be a V2 final anchor.")
+    condition = str(payload["condition"])
+    if condition not in PRIMARY_CONDITIONS:
+        raise AnchorError("Anchor metadata has an invalid condition.")
+    if payload["manifest_sha256"] != EXPECTED_MANIFEST_SHA256[condition]:
+        raise AnchorError("Anchor metadata changed the reviewed condition manifest.")
+    if payload["prob_commit"] != PINNED_PROB_COMMIT:
+        raise AnchorError("Anchor metadata changed the pinned PROB commit.")
+    if payload["seed"] != TRAINING_SEED:
+        raise AnchorError("Anchor metadata changed the preregistered seed.")
+    if payload["reference_epochs"] != REFERENCE_EPOCHS:
+        raise AnchorError("Anchor metadata changed the reference-epoch budget.")
+    if payload["global_step"] != TOTAL_OPTIMIZER_UPDATES \
+            or payload["optimizer_steps"] != TOTAL_OPTIMIZER_UPDATES:
+        raise AnchorError("Final anchor does not contain exactly 183,434 updates.")
+    if payload["image_presentations"] != TOTAL_IMAGE_PRESENTATIONS:
+        raise AnchorError("Final anchor has the wrong image-presentation budget.")
+    if payload["evaluation_split_sha256"] != EVALUATION_SPLIT_SHA256:
+        raise AnchorError("Anchor metadata changed the fixed evaluation split.")
     if tuple(payload["class_order"]) != protocol.TASK1:
         raise AnchorError("Anchor metadata changed the T1 class order.")
     for name in (
@@ -549,7 +656,8 @@ def anchor_metrics_payload(
             f"{overall}."
         )
     return {
-        "schema": "controlled_t1_anchor_metrics_v1",
+        "schema": "controlled_t1_anchor_metrics_v2",
+        "recipe_version": RECIPE_VERSION,
         "condition": condition,
         "manifest_sha256": manifest["scientific_sha256"],
         "checkpoint_sha256": _lower_hex(checkpoint_sha256, 64, "checkpoint_sha256"),
@@ -650,7 +758,7 @@ def workspace_state(workspace: str | Path, condition: str) -> str:
     metrics_path = root / "anchor_metrics.json"
     raw_metrics = root / "anchor_bridge_metrics.json"
     per_class = root / "per_class.csv"
-    checkpoint = root / "train" / "checkpoint.pth"
+    checkpoint = root / "train" / "resume_latest.pth"
     if done.is_file():
         if not all(path.is_file() for path in (final, metadata, metrics_path, per_class)):
             return "INCOMPLETE NON-RESUMABLE"
@@ -666,13 +774,18 @@ def workspace_state(workspace: str | Path, condition: str) -> str:
             "metrics_sha256": longtail.sha256_file(metrics_path),
             "per_class_csv_sha256": longtail.sha256_file(per_class),
             "condition": condition,
+            "schema": "controlled_t1_anchor_done_v2",
+            "global_step": TOTAL_OPTIMIZER_UPDATES,
+            "recipe_version": RECIPE_VERSION,
         }
         consistent = (
             all(payload.get(key) == value for key, value in expected.items())
             and metadata_payload.get("condition") == condition
             and metadata_payload.get("checkpoint_sha256") == expected["checkpoint_sha256"]
+            and metadata_payload.get("global_step") == TOTAL_OPTIMIZER_UPDATES
             and metrics_payload.get("condition") == condition
             and metrics_payload.get("checkpoint_sha256") == expected["checkpoint_sha256"]
+            and metrics_payload.get("recipe_version") == RECIPE_VERSION
             and payload.get("recipe_fingerprint")
             == metadata_payload.get("recipe_fingerprint")
             == metrics_payload.get("recipe_fingerprint")

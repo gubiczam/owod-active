@@ -62,6 +62,8 @@ def evaluate(arguments: argparse.Namespace) -> dict[str, object]:
         raise t1_anchor.AnchorError("Complete checkpoint and metadata are required.")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     t1_anchor.validate_training_metadata(metadata)
+    if metadata.get("global_step") != t1_anchor.TOTAL_OPTIMIZER_UPDATES:
+        raise t1_anchor.AnchorError("Final evaluation requires all 183,434 updates.")
     if metadata["condition"] != arguments.condition:
         raise t1_anchor.AnchorError("Checkpoint metadata belongs to another condition.")
     if longtail.sha256_file(checkpoint) != metadata["checkpoint_sha256"]:
@@ -202,8 +204,10 @@ def evaluate(arguments: argparse.Namespace) -> dict[str, object]:
             })
     temporary_csv.replace(per_class)
     done = {
-        "schema": "controlled_t1_anchor_done_v1",
+        "schema": "controlled_t1_anchor_done_v2",
+        "recipe_version": t1_anchor.RECIPE_VERSION,
         "condition": arguments.condition,
+        "global_step": t1_anchor.TOTAL_OPTIMIZER_UPDATES,
         "checkpoint_sha256": metadata["checkpoint_sha256"],
         "metrics_sha256": longtail.sha256_file(output),
         "per_class_csv_sha256": longtail.sha256_file(per_class),
