@@ -390,6 +390,10 @@ def cells() -> list[dict]:
 
 
 def run(run_gpu: bool, *, verbose: bool) -> None:
+    original_owl_modules = {
+        name: module for name, module in sys.modules.items()
+        if name == "owl" or name.startswith("owl.")
+    }
     from owl import bridge as original_bridge_module
 
     original_bridge_class = original_bridge_module.Bridge
@@ -551,9 +555,10 @@ def run(run_gpu: bool, *, verbose: bool) -> None:
             print("rerun idempotency: valid replay work was skipped with no new PROB calls")
     finally:
         original_bridge_module.Bridge = original_bridge_class
-        sys.modules["owl.bridge"] = original_bridge_module
-        import owl as owl_package
-        owl_package.bridge = original_bridge_module
+        for name in [name for name in sys.modules
+                     if name == "owl" or name.startswith("owl.")]:
+            sys.modules.pop(name, None)
+        sys.modules.update(original_owl_modules)
         if previous_torch is None:
             sys.modules.pop("torch", None)
         else:

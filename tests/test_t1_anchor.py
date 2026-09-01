@@ -460,17 +460,18 @@ def test_dedicated_notebook_is_static_compilable_and_fail_closed():
     joined = "\n".join(sources)
     assert 'OWL_COMMIT = "8a9c5a97d23f4532240d7be4852e3bc98dc2060b"' in joined
     assert 'PROB_COMMIT = "4c66be1a52cad9360e09c729e9134aba8fe0b531"' in joined
-    assert 'ALLOW_BUDGET_OVERRUN = False' in joined
-    assert 'CONDITIONS = ["lt100"]' in joined
-    assert 'GPU_BUDGET_HOURS = 8.5' in joined
+    assert 'ANCHOR_RECIPE = "fast"' in joined
+    assert 'CONDITIONS = ["lt100", "lt50", "lt10"]' in joined
+    assert 'TOTAL_GPU_BUDGET_HOURS = 14.0' in joined
+    assert 'FAST_DEFAULT_UPDATES = 12000' in joined
     assert 'BENCHMARK_ITERATIONS = 20' in joined
-    assert 'controlled_lt_v2/seed0' in joined
-    assert 'cuda_training_smoke_v2.json' in joined
+    assert 'controlled_lt_fast_v1/seed0' in joined
+    assert 'cuda_benchmark_fast_v1.json' in joined
     assert '"--stop-at-unix"' in joined
-    assert "SOFT_STOP_RESERVE_SECONDS" in joined
+    assert "SAFETY_RESERVE_SECONDS = 1800" in joined
     assert "pip\", \"install\", \"-r" not in notebook_path.read_text(encoding="utf-8")
     assert "CONTROLLED LT ANCHOR PREFLIGHT PASS" not in joined  # emitted only by the tool
-    assert "ANCHOR BENCHMARK/RESUME POINT COMPLETE" in joined
+    assert "comparison withheld until LT10/LT50/LT100 are all DONE" in joined
 
 
 def test_combined_report_requires_valid_done_anchors(compare_tool, tmp_path):
