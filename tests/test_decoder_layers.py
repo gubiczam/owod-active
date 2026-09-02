@@ -204,9 +204,8 @@ def test_working_directory_restores_cwd_when_the_block_raises(tmp_path):
     from tools.export_decoder_layers import working_directory
 
     before = os.getcwd()
-    with pytest.raises(FileNotFoundError, match="dino"):
-        with working_directory(tmp_path):
-            raise FileNotFoundError("models/dino_resnet50_pretrain.pth")
+    with pytest.raises(FileNotFoundError, match="dino"), working_directory(tmp_path):
+        raise FileNotFoundError("models/dino_resnet50_pretrain.pth")
     assert os.getcwd() == before
 
 
