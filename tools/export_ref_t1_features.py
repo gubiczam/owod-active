@@ -47,6 +47,36 @@ from tools.export_dinov2_features import git_sha, load_backbone
 REF_EXPORT_VERSION = "ref_t1_dinov2_vitb14_v1"
 
 
+def candidate_overlap(selection: ref.ReferenceObjects, pool: Path) -> dict:
+    """How many REF-T1 images also appear in the candidate pool and in eval.
+
+    **Not leakage for the primary protocol**: Task-1 labelled objects are
+    legitimately available prior-task supervision, so a candidate sitting on a
+    T1-labelled object *should* score low novelty. Same-image references are
+    deliberately kept and no no-same-image variant is built for the primary
+    analysis.
+
+    Recorded because same-image visual context is a secondary confound worth
+    being able to point at later. Overlap with **eval** would be a different
+    matter, so it is measured too.
+    """
+
+    payload = np.load(pool, allow_pickle=True)
+    splits = np.asarray(payload["split"], dtype=str)
+    ids = np.asarray(payload["image_ids"], dtype=str)
+    reference_images = set(selection.images)
+    candidate_images = set(ids[splits == "pool"].tolist())
+    eval_images = set(ids[splits == "eval"].tolist())
+    return {
+        "reference_images": len(reference_images),
+        "candidate_pool_images": len(candidate_images),
+        "reference_and_candidate_pool": len(reference_images & candidate_images),
+        "reference_and_eval": len(reference_images & eval_images),
+        "note": "same-image references are kept by design; T1 labels are "
+                "legitimate prior-task supervision. Any eval overlap would not be.",
+    }
+
+
 def preflight(selection: ref.ReferenceObjects, data_root: Path, out: Path) -> Path:
     """Assert the images exist before a GPU session discovers they do not."""
 
@@ -194,8 +224,12 @@ def main() -> None:
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--per-class-cap", type=int, required=True,
-                        help="objects per T1 class; selections are nested across "
-                             "caps under the fixed seed")
+                        help=f"objects per T1 class. The frozen primary value is "
+                             f"{ref.PRIMARY_REF_T1_CAP_PER_CLASS}; "
+                             f"{ref.SENSITIVITY_CAPS} are the predeclared "
+                             "descriptive sensitivity subsets and are literal "
+                             "per-class prefixes of it")
+    parser.add_argument("--pool", default=str(sf.POOL))
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--smoke-images", type=int, default=0)
@@ -206,6 +240,29 @@ def main() -> None:
     grouped = ref.enumerate_objects()
     selection = ref.select_balanced(grouped, per_class_cap=arguments.per_class_cap)
     print(f"[selection] {selection.summary()}")
+    print(f"[selection] manifest SHA256 {selection.provenance['manifest_sha256']}")
+    if arguments.per_class_cap == ref.PRIMARY_REF_T1_CAP_PER_CLASS:
+        print("[selection] this is the FROZEN PRIMARY reference "
+              f"({ref.PRIMARY_REF_T1_CAP_PER_CLASS}/class)")
+    elif arguments.per_class_cap in ref.SENSITIVITY_CAPS:
+        print(f"[selection] this is a predeclared DESCRIPTIVE SENSITIVITY subset "
+              f"({arguments.per_class_cap}/class); it cannot carry a verdict")
+    else:
+        raise ref.ExportError(
+            f"--per-class-cap {arguments.per_class_cap} is neither the frozen "
+            f"primary ({ref.PRIMARY_REF_T1_CAP_PER_CLASS}) nor a predeclared "
+            f"sensitivity subset {ref.SENSITIVITY_CAPS}. Choosing a cap outside "
+            "the pre-registration is how a reference size gets tuned; refusing."
+        )
+    overlap = candidate_overlap(selection, Path(arguments.pool))
+    print(f"[overlap] {overlap['reference_and_candidate_pool']:,} reference images "
+          f"also in the candidate pool (kept by design); "
+          f"{overlap['reference_and_eval']:,} in eval")
+    if overlap["reference_and_eval"]:
+        raise ref.ExportError(
+            f"{overlap['reference_and_eval']} reference images appear in the eval "
+            "split. That would be leakage, unlike the candidate-pool overlap."
+        )
 
     out = Path(arguments.out)
     jpeg = preflight(selection, Path(arguments.data_root), out)
@@ -259,6 +316,8 @@ def main() -> None:
         "objects": int(keys.size),
         "images": len(selection.images),
         "feature_dim": sf.FEATURE_DIM,
+        "candidate_overlap": overlap,
+        "is_frozen_primary": arguments.per_class_cap == ref.PRIMARY_REF_T1_CAP_PER_CLASS,
         "wall_clock_seconds": round(time.time() - started, 1),
     }
     report = validate(keys, features, selection.class_name)

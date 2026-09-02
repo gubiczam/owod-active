@@ -31,6 +31,7 @@ yields the same identities and the same selection under a fixed seed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tarfile
 from dataclasses import dataclass
@@ -57,6 +58,46 @@ REFERENCE_VERSION = "ref_t1_balanced_v1"
 
 #: Fixed before any selection was made. Not chosen by looking at an endpoint.
 SELECTION_SEED = 0
+
+#: The frozen primary reference size: 19 classes x 1,000 = 19,000 labelled
+#: references. Approved 2026-09-02, before any Stage-2 D/R/C endpoint existed.
+#: ``bear`` holds 1,294 objects, so 1,000 per class needs no oversampling and
+#: every class receives equal reference support.
+PRIMARY_REF_T1_CAP_PER_CLASS = 1000
+
+#: Predeclared descriptive sensitivity subsets. Because each class is permuted
+#: independently and rows are stored in permutation order, these are literal
+#: per-class prefixes of the primary selection. They may not replace the primary
+#: verdict, be chosen after seeing an endpoint, or rescue a failed primary result.
+SENSITIVITY_CAPS = (250, 500)
+
+
+def class_seed(name: str, seed: int = SELECTION_SEED) -> int:
+    """A per-class seed derived from ``(seed, class name)``, stable across runs.
+
+    Independence per class is the point. A single shared generator advanced across
+    classes makes each class's permutation depend on how many classes preceded it
+    **and on their sizes**, so one extra annotation anywhere would resample every
+    class after it. Deriving the seed from the class name alone removes that
+    coupling: a class's sample depends on nothing but its own identity list.
+
+    SHA-256 rather than :func:`hash`, which is salted per interpreter run.
+    """
+
+    digest = hashlib.sha256(f"{seed}:{name}".encode()).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+def manifest_fingerprint(keys: np.ndarray) -> str:
+    """SHA-256 of the ordered identity manifest -- the selection's identity.
+
+    Order-sensitive on purpose: two selections holding the same objects in a
+    different order are different manifests, and the fingerprint is what lets a
+    later run prove it reproduced this exact reference set.
+    """
+
+    payload = "\n".join(str(key) for key in keys).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 #: The annotation XMLs carry **COCO** class names where this project, following
 #: PROB's ``VOC_COCO_CLASS_NAMES``, uses the VOC spelling. Exactly two of the 19
@@ -213,11 +254,27 @@ def select_balanced(
 ) -> ReferenceObjects:
     """Take exactly ``per_class_cap`` objects per class, deterministically.
 
-    Each class's objects are sorted by ``(image_id, object_index)`` -- a canonical
-    order that does not depend on archive iteration -- then permuted with a fixed
-    seed and truncated. A seeded permutation rather than the first N of the sorted
-    order, because COCO ids are arbitrary but not guaranteed unbiased, and the
-    permutation makes the choice explicit and reproducible.
+    Four steps, in this order:
+
+    1. the class's complete canonical identity list;
+    2. sorted by ``(image_id, object_index)`` -- a canonical order independent of
+       how the archive happened to iterate;
+    3. permuted by a generator seeded from :func:`class_seed`, i.e. **independently
+       per class**;
+    4. the first ``per_class_cap`` entries of that permutation, **kept in
+       permutation order**.
+
+    Step 3 is not a shared generator walked across classes: that would make each
+    class's permutation depend on the classes before it and their sizes. Step 4
+    keeps permutation order rather than re-sorting, which is what makes the
+    smaller caps **literal per-class prefixes** --
+    ``REF250_c = permuted_c[:250] ⊂ REF500_c ⊂ REF1000_c`` -- rather than merely
+    nested sets.
+
+    Step 2 matters on its own: taking a dataset-order prefix would inherit
+    whatever ordering the annotation archive carries, which for COCO ids
+    correlates with capture batch. The permutation removes that; it does not
+    remove every source of nearest-neighbour bias, and no such claim is made.
 
     A class holding fewer than ``per_class_cap`` objects contributes all of them
     and the selection is reported as **not balanced**, which callers must surface
@@ -227,16 +284,19 @@ def select_balanced(
     if per_class_cap < 1:
         raise ExportError("per_class_cap must be at least 1")
 
-    generator = np.random.default_rng(seed)
     rows: list[tuple[str, int, str, tuple[float, float, float, float]]] = []
     per_class_available = {}
+    per_class_seed = {}
     for name in sorted(grouped):
         items = sorted(grouped[name], key=lambda entry: (entry[0], entry[1]))
         per_class_available[name] = len(items)
         if not items:
             continue
-        order = generator.permutation(len(items))[:per_class_cap]
-        rows.extend(items[int(position)] for position in sorted(order))
+        derived = class_seed(name, seed)
+        per_class_seed[name] = derived
+        order = np.random.default_rng(derived).permutation(len(items))
+        # permutation order is preserved, so a smaller cap is a literal prefix
+        rows.extend(items[int(position)] for position in order[:per_class_cap])
 
     if not rows:
         raise ExportError("no T1 reference objects were selected")
@@ -262,7 +322,18 @@ def select_balanced(
             "classes": list(TASK1),
             "per_class_cap": per_class_cap,
             "seed": seed,
+            "sampling_algorithm": (
+                "per class: canonical identity list -> sort by "
+                "(image_id, object_index) -> permute with default_rng("
+                "sha256('<seed>:<class>')[:8]) -> take the first per_class_cap, "
+                "kept in permutation order"
+            ),
+            "canonical_identity": "(image_id, object_index) where object_index is "
+                                  "the object's position among all <object> nodes "
+                                  "in its own annotation file",
+            "per_class_seed": per_class_seed,
             "per_class_available": per_class_available,
+            "manifest_sha256": manifest_fingerprint(keys),
             "t1_objects_total": EXPECTED_T1_OBJECTS,
             "t1_images_total": EXPECTED_T1_IMAGES,
             "note": "Task-1 labelled training GT only; no T2 or later annotation "

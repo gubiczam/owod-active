@@ -119,10 +119,14 @@ and `D` would have called every aeroplane and motorbike in the pool novel.
 `owl.reference_t1.COCO_TO_VOC` maps them and the enumerator now **fails closed**
 unless the total reproduces exactly.
 
-**Why the reference must be class-balanced.** `D` is a *maximum* over the
-reference set, so a frequency-proportional reference would be 62% `person` and `D`
-would collapse into "distance to the nearest person" rather than "distance from
-known classes". Balance is a correctness requirement.
+**Why the reference is class-balanced.** `D` is a *maximum* over the reference
+set, so a frequency-proportional reference would be 62% `person` and the estimator
+would inherit that skew directly: the nearest reference would almost always be a
+person, whatever the candidate. Balancing **prevents reference-set frequency
+imbalance from being inherited by the max-cosine novelty estimator.** It is *not*
+claimed to eliminate all nearest-neighbour bias — appearance-manifold density,
+crop scale and class visual diversity all remain, and none of them is addressed
+here.
 
 **Why a cap is required, and its cost.** The full set spans 89,490 source images —
 **55.9×** the 1,600 the candidate export needed — so the binding cost is fetching
@@ -143,9 +147,81 @@ Every cap ≤ 1,294 is *exactly* balanced, because 1,294 is the smallest class.
 verified for both objects and images — so one export at the largest cap yields the
 smaller caps as free subsets and a sensitivity check needs no second GPU pass.
 
-`--per-class-cap` is a required argument with no default: the value is a recorded
-decision, not something a script picks silently. It is **never** selected by
-looking at a D or R endpoint.
+### Frozen cap
+
+```
+PRIMARY_REF_T1_CAP_PER_CLASS = 1000        ->  19 x 1,000 = 19,000 references
+SENSITIVITY_CAPS             = (250, 500)  ->  descriptive only
+```
+
+Approved 2026-09-02, **before any real Stage-2 D/R/C endpoint existed**. Rationale:
+
+* all 19 classes receive **equal** reference support;
+* `bear` holds 1,294 objects, so 1,000/class requires **no oversampling**;
+* 19,000 references give substantial semantic coverage — 8× the 2,345 REF-A
+  vectors they replace, and the same order as the 15,518-row P2 population they
+  are queried against;
+* runtime and storage stay feasible: 14,901 source images, ~30–50 min end to end;
+* the cap was chosen from population statistics and cost alone.
+
+The 250 and 500 subsets are **predeclared descriptive sensitivity checks**. They
+may **not** replace the 1,000/class primary verdict, be selected after seeing an
+endpoint, or rescue a failed primary result. `--per-class-cap` is required with no
+default, and the exporter **refuses** any value that is neither the frozen primary
+nor a predeclared subset.
+
+### Sampling construction — verified, and corrected before extraction
+
+Per class, in this order:
+
+1. the class's complete canonical identity list;
+2. sorted by `(image_id, object_index)` — canonical, independent of archive
+   iteration order;
+3. permuted by `default_rng(sha256("<seed>:<class>")[:8])`, i.e. **independently
+   per class**;
+4. the first `cap` entries, **kept in permutation order**.
+
+**Two defects were found by this check and fixed before any feature was
+extracted.** The first implementation used a *single* generator walked across
+classes, so each class's permutation depended on the classes before it and on
+their sizes — one extra annotation anywhere would have resampled every class
+after it. And it re-sorted the chosen indices, so the subsets nested only as
+*sets*. Both are corrected: seeding is per class from the class name, and rows are
+stored in permutation order, which makes the subsets **literal per-class
+prefixes**:
+
+```
+REF250_c = permuted_c[:250]  ⊂  REF500_c = permuted_c[:500]  ⊂  REF1000_c
+```
+
+Verified on all 19 classes, and verified that sampling `bear`+`person` alone
+yields byte-identical rows to sampling them within all 19.
+
+Step 2 matters on its own: a dataset-order prefix would inherit whatever ordering
+the archive carries, which for COCO ids correlates with capture batch.
+
+| | |
+|---|---|
+| sampling seed | **0** |
+| per-class seed | `int(sha256("0:<class>").digest()[:8])`, recorded per class |
+| canonical identity | `(image_id, object_index)`, `object_index` = position among **all** `<object>` nodes in its own annotation file |
+| **REF1000 ordered manifest SHA-256** | **`a062fc8f4fd43ea52842725aeaa5eccc0e06eab1894b867b248927bd9d2a2a63`** |
+| REF500 manifest SHA-256 | `0d73e5490b80a4f1…` |
+| REF250 manifest SHA-256 | `fb9f967bb1401175…` |
+| primary population | 19,000 objects · 14,901 images · exactly balanced |
+
+### Candidate / T1 image overlap — recorded, not removed
+
+**1,027 of the 1,600 candidate-pool images also occur in the canonical T1
+training data.** This is **not leakage** for the primary protocol: T1 labelled
+objects are legitimately available prior-task supervision, and a candidate sitting
+on a T1-labelled object *should* score low novelty. Same-image references are
+**kept**, and **no no-same-image variant is built for the primary analysis**.
+
+It is recorded in the export's provenance because same-image visual context is a
+secondary confound worth being able to point at later. Overlap with **eval** would
+be a different matter — measured at **0**, and the exporter fails closed if it is
+ever non-zero.
 
 ### Leakage rules, absolute
 

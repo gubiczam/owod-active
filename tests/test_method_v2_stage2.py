@@ -665,3 +665,104 @@ def test_a_nan_auc_cannot_pass_a_threshold():
 
     assert verdict["go"] is False
     assert verdict["checks"]["unknown_vs_background_auc>=0.60"] is False
+
+
+# ------------------------ the frozen cap and the sampling construction ---
+
+
+def test_the_frozen_primary_cap_is_1000_with_250_500_as_sensitivity():
+    from owl import reference_t1 as ref
+
+    assert ref.PRIMARY_REF_T1_CAP_PER_CLASS == 1000
+    assert ref.SENSITIVITY_CAPS == (250, 500)
+    # 1,000 needs no oversampling: the smallest class holds 1,294
+    assert min(ref.class_totals().values()) >= ref.PRIMARY_REF_T1_CAP_PER_CLASS
+
+
+def test_per_class_seeds_are_derived_from_the_class_name_only():
+    """Independence per class: a shared generator would couple them together."""
+
+    from owl import reference_t1 as ref
+
+    assert ref.class_seed("bear") == ref.class_seed("bear")
+    assert ref.class_seed("bear") != ref.class_seed("person")
+    assert ref.class_seed("bear", seed=0) != ref.class_seed("bear", seed=1)
+
+
+def test_a_class_sample_does_not_depend_on_the_other_classes():
+    """The defect this replaced: one generator walked across classes.
+
+    Under that scheme a class's permutation depended on how many classes preceded
+    it and on their sizes, so one extra annotation anywhere resampled everything
+    downstream.
+    """
+
+    from owl import reference_t1 as ref
+
+    grouped = ref.enumerate_objects()
+    subset = {name: grouped[name] for name in ("bear", "person")}
+
+    within_all = ref.select_balanced(grouped, per_class_cap=50)
+    alone = ref.select_balanced(subset, per_class_cap=50)
+
+    for name in ("bear", "person"):
+        a = [k for k, c in zip(within_all.keys, within_all.class_name) if c == name]
+        b = [k for k, c in zip(alone.keys, alone.class_name) if c == name]
+        assert a == b, f"{name} was resampled by the presence of other classes"
+
+
+def test_subsets_are_literal_per_class_prefixes_not_merely_nested_sets():
+    from owl import reference_t1 as ref
+
+    grouped = ref.enumerate_objects()
+    small = ref.select_balanced(grouped, per_class_cap=25)
+    large = ref.select_balanced(grouped, per_class_cap=50)
+
+    for name in sorted(set(large.class_name.tolist())):
+        a = [k for k, c in zip(small.keys, small.class_name) if c == name]
+        b = [k for k, c in zip(large.keys, large.class_name) if c == name]
+        assert b[: len(a)] == a, f"{name}: REF25 is not a prefix of REF50"
+
+
+def test_the_selection_is_not_a_dataset_order_prefix():
+    """A dataset-order prefix would inherit the archive's own ordering."""
+
+    from owl import reference_t1 as ref
+
+    grouped = ref.enumerate_objects()
+    selection = ref.select_balanced(grouped, per_class_cap=50)
+
+    for name in ("bear", "person"):
+        canonical = sorted(grouped[name], key=lambda e: (e[0], e[1]))[:50]
+        expected_prefix = ref.reference_keys(
+            np.asarray([e[0] for e in canonical]),
+            np.asarray([e[1] for e in canonical]),
+        ).tolist()
+        chosen = [k for k, c in zip(selection.keys, selection.class_name)
+                  if c == name]
+        assert chosen != expected_prefix, f"{name} looks like a dataset-order prefix"
+
+
+def test_the_manifest_fingerprint_is_order_sensitive_and_recorded():
+    from owl import reference_t1 as ref
+
+    grouped = ref.enumerate_objects()
+    selection = ref.select_balanced(grouped, per_class_cap=25)
+    fingerprint = selection.provenance["manifest_sha256"]
+
+    assert len(fingerprint) == 64
+    assert fingerprint == ref.manifest_fingerprint(selection.keys)
+    assert fingerprint != ref.manifest_fingerprint(selection.keys[::-1])
+
+
+def test_provenance_records_the_sampler_and_the_identity_definition():
+    from owl import reference_t1 as ref
+
+    provenance = ref.select_balanced(
+        ref.enumerate_objects(), per_class_cap=25).provenance
+
+    assert provenance["seed"] == 0
+    assert "sha256" in provenance["sampling_algorithm"]
+    assert "permutation order" in provenance["sampling_algorithm"]
+    assert "object_index" in provenance["canonical_identity"]
+    assert set(provenance["per_class_seed"]) == set(ref.TASK1)
