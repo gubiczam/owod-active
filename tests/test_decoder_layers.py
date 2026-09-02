@@ -173,3 +173,75 @@ def test_shape_disagreement_is_caught_at_construction(pool_like):
         _export(features, keys, layers=(0, 1, 2))
     with pytest.raises(dl.ExportError, match="rows against"):
         _export(features[:, :-1], keys)
+
+
+# ------------------------------------------------- the cwd guard (PROB build) ---
+
+
+def test_working_directory_restores_cwd_on_success(tmp_path):
+    """PROB's backbone loads 'models/dino_resnet50_pretrain.pth' relatively, so
+    construction must run inside the checkout -- and must not leave it there."""
+
+    import os
+
+    from tools.export_decoder_layers import working_directory
+
+    before = os.getcwd()
+    with working_directory(tmp_path):
+        assert os.path.realpath(os.getcwd()) == os.path.realpath(tmp_path)
+    assert os.getcwd() == before
+
+
+def test_working_directory_restores_cwd_when_the_block_raises(tmp_path):
+    """The failure that matters: a build that dies must not strand the process.
+
+    Without the ``finally`` the next notebook cell fails somewhere unrelated,
+    which is far harder to read than the original error.
+    """
+
+    import os
+
+    from tools.export_decoder_layers import working_directory
+
+    before = os.getcwd()
+    with pytest.raises(FileNotFoundError, match="dino"):
+        with working_directory(tmp_path):
+            raise FileNotFoundError("models/dino_resnet50_pretrain.pth")
+    assert os.getcwd() == before
+
+
+def test_preflight_names_the_relative_path_initialisation(tmp_path):
+    """A missing backbone init must be reported before a GPU session is spent."""
+
+    from owl.decoder_layers import ExportError
+    from tools.export_decoder_layers import preflight
+
+    prob = tmp_path / "PROB"
+    (prob / "models").mkdir(parents=True)
+    (prob / "main_open_world.py").touch()
+    (prob / "models" / "__init__.py").touch()
+    data = tmp_path / "data"
+    (data / "JPEGImages").mkdir(parents=True)
+    (data / "Annotations").mkdir(parents=True)
+    checkpoint = tmp_path / "t1.pth"
+    checkpoint.touch()
+
+    with pytest.raises(ExportError, match="dino_resnet50_pretrain.pth"):
+        preflight(prob, checkpoint, data)
+
+    (prob / "models" / "dino_resnet50_pretrain.pth").touch()
+    preflight(prob, checkpoint, data)          # now passes
+
+
+def test_preflight_reports_every_problem_at_once(tmp_path):
+    """One round trip per session, not one per missing file."""
+
+    from owl.decoder_layers import ExportError
+    from tools.export_decoder_layers import preflight
+
+    with pytest.raises(ExportError) as error:
+        preflight(tmp_path / "nope", tmp_path / "missing.pth", tmp_path / "nodata")
+    message = str(error.value)
+    assert "main_open_world.py" in message
+    assert "checkpoint" in message
+    assert "JPEGImages" in message

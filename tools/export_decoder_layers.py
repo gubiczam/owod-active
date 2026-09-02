@@ -31,7 +31,9 @@ The export is gated: ``hs[5]`` must reproduce the pool's committed ``embeddings`
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import platform
 import sys
 import time
@@ -56,6 +58,57 @@ ARCHITECTURE_CANDIDATES = (
 )
 
 
+@contextlib.contextmanager
+def working_directory(path: Path):
+    """Run a block with ``path`` as the process cwd, restoring it whatever happens.
+
+    PROB's backbone loads its self-supervised initialisation through a **relative**
+    path -- ``torch.load('models/dino_resnet50_pretrain.pth')`` -- so the model can
+    only be constructed from inside the PROB checkout. Every other path this tool
+    handles is absolute, so the change is scoped to construction alone rather than
+    to the whole run: a global chdir would silently reinterpret ``--out`` and
+    ``--pool`` if either were ever passed as a relative path.
+
+    ``finally`` rather than a plain pair of calls because a failed build must not
+    leave the interpreter in another directory -- the next cell in a notebook
+    would then fail somewhere unrelated, which is the hard kind of bug to read.
+    """
+
+    previous = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+def preflight(prob_root: Path, checkpoint: Path, data_root: Path) -> None:
+    """Assert what must exist before a GPU session is spent on discovering it."""
+
+    problems = []
+    if not (prob_root / "main_open_world.py").is_file():
+        problems.append(f"{prob_root}/main_open_world.py missing -- not a PROB checkout")
+    if not (prob_root / "models" / "__init__.py").is_file():
+        problems.append(f"{prob_root}/models/__init__.py missing")
+    # the relative-path initialisation the cwd fix exists for
+    backbone = prob_root / "models" / "dino_resnet50_pretrain.pth"
+    if not backbone.is_file():
+        problems.append(
+            f"{backbone} missing. PROB loads it by the relative path "
+            "'models/dino_resnet50_pretrain.pth' during backbone construction, so "
+            "it must sit inside the PROB checkout."
+        )
+    if not Path(checkpoint).is_file():
+        problems.append(f"checkpoint {checkpoint} missing")
+    if not (Path(data_root) / "JPEGImages").is_dir():
+        problems.append(f"{data_root}/JPEGImages missing -- run materialize_pool_images.py")
+    if not (Path(data_root) / "Annotations").is_dir():
+        problems.append(f"{data_root}/Annotations missing -- run materialize_pool_images.py")
+    if problems:
+        raise dl.ExportError("preflight failed:\n  " + "\n  ".join(problems))
+    print("[preflight] PROB checkout, backbone init, checkpoint and data root all present")
+
+
 def build_model(prob_root: Path, checkpoint: Path, device: str):
     """Build PROB and load the checkpoint strictly. Returns (model, chosen args)."""
 
@@ -67,6 +120,7 @@ def build_model(prob_root: Path, checkpoint: Path, device: str):
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     weights = state.get("model", state)
 
+    entry_cwd = os.getcwd()
     failures = []
     for candidate in ARCHITECTURE_CANDIDATES:
         args = get_args_parser().parse_args([])
@@ -79,14 +133,24 @@ def build_model(prob_root: Path, checkpoint: Path, device: str):
         for name, value in candidate.items():
             setattr(args, name, value)
         try:
-            model = prob_build_model(args, mode=args.model_type)[0]
-            model.load_state_dict(weights, strict=True)
-        except (RuntimeError, KeyError, TypeError) as error:
+            # cwd must be the PROB checkout: the backbone's DINO initialisation is
+            # loaded by a relative path during construction.
+            with working_directory(prob_root):
+                model = prob_build_model(args, mode=args.model_type)[0]
+                model.load_state_dict(weights, strict=True)
+        except (RuntimeError, KeyError, TypeError, FileNotFoundError) as error:
             failures.append(f"{candidate}: {str(error)[:300]}")
             continue
         print(f"[build] strict load succeeded with {candidate}")
+        if os.getcwd() != entry_cwd:
+            raise dl.ExportError(
+                f"cwd is {os.getcwd()} after construction, expected {entry_cwd}; "
+                "the working_directory guard did not restore it."
+            )
         return model.to(device).eval(), args
 
+    if os.getcwd() != entry_cwd:
+        os.chdir(entry_cwd)
     raise dl.ExportError(
         "No reconstruction of PROB's arguments loaded this checkpoint strictly. "
         "Refusing to export from a model whose architecture is not the trained "
@@ -129,12 +193,18 @@ def main() -> None:
     parser.add_argument("--image-set", default="owl_layer_test",
                         help="ImageSets/OWDETR/<name>.txt written by "
                              "tools/materialize_pool_images.py")
+    parser.add_argument("--smoke-images", type=int, default=0,
+                        help="run the full path on N images, apply the gate to their "
+                             "own pool rows, write nothing, and exit")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     arguments = parser.parse_args()
 
+    preflight(Path(arguments.prob_root), Path(arguments.checkpoint),
+              Path(arguments.data_root))
+
     out = Path(arguments.out)
-    if out.exists():
+    if out.exists() and not arguments.smoke_images:
         print(f"[resume] {out} exists; verifying instead of re-exporting")
         export = dl.read(out)
         pool = proposals_module.from_frozen_pool(arguments.pool, split="pool")
@@ -224,29 +294,78 @@ def main() -> None:
             "tools/materialize_pool_images.py."
         )
 
-    collected: dict[str, np.ndarray] = {}
     started = time.time()
-    with torch.no_grad():
-        for position in range(0, len(image_list), arguments.batch_size):
-            batch = image_list[position:position + arguments.batch_size]
-            tensors = [dataset[index_of[name]][0].to(arguments.device) for name in batch]
-            sizes = torch.stack([
-                torch.tensor(t.shape[-2:], device=arguments.device) for t in tensors
-            ])
-            from util.misc import nested_tensor_from_tensor_list
-            model(nested_tensor_from_tensor_list(tensors))
+    from util.misc import nested_tensor_from_tensor_list
 
-            # store[l] is (batch, queries, dim); one row per (image, query)
-            block = torch.stack([store[l] for l in range(dl.N_DECODER_LAYERS)])
-            block = block.float().cpu().numpy()
-            for offset, name in enumerate(batch):
-                collected[name] = block[:, offset].astype(np.float16)
-            del sizes
-            if position % (arguments.batch_size * 50) == 0:
-                done = position + len(batch)
-                rate = done / max(time.time() - started, 1e-6)
-                print(f"[export] {done:,}/{len(image_list):,} images "
-                      f"({rate:.1f} img/s, eta {(len(image_list) - done) / max(rate, 1e-6) / 60:.1f} min)")
+    def run_images(names: list[str], *, label: str) -> dict[str, np.ndarray]:
+        """One forward pass per batch; returns {image_id: (layers, queries, dim)}."""
+
+        out: dict[str, np.ndarray] = {}
+        begun = time.time()
+        with torch.no_grad():
+            for position in range(0, len(names), arguments.batch_size):
+                batch = names[position:position + arguments.batch_size]
+                tensors = [dataset[index_of[name]][0].to(arguments.device)
+                           for name in batch]
+                model(nested_tensor_from_tensor_list(tensors))
+                # store[l] is (batch, queries, dim); one row per (image, query)
+                block = torch.stack(
+                    [store[l] for l in range(dl.N_DECODER_LAYERS)]
+                ).float().cpu().numpy()
+                for offset, name in enumerate(batch):
+                    out[name] = block[:, offset].astype(np.float16)
+                if position % (arguments.batch_size * 50) == 0:
+                    done = position + len(batch)
+                    rate = done / max(time.time() - begun, 1e-6)
+                    print(f"[{label}] {done:,}/{len(names):,} images "
+                          f"({rate:.1f} img/s, eta "
+                          f"{(len(names) - done) / max(rate, 1e-6) / 60:.1f} min)")
+        return out
+
+    # ---- smoke test: the full path on a handful of images, gated the same way --
+    #
+    # A shape check alone would pass while the join was wrong, so this runs the
+    # real gate on the subset: hs[5] for these images' own pool rows must
+    # reproduce the pool's committed embeddings. Everything the full run can get
+    # wrong -- checkpoint, reconstructed arguments, cwd, hooks, transforms
+    # convention, key join -- is exercised here, in seconds instead of 25 minutes.
+    if arguments.smoke_images:
+        names = image_list[:arguments.smoke_images]
+        produced = run_images(names, label="smoke")
+        for handle in handles:
+            handle.remove()
+        block = produced[names[0]]
+        print(f"[smoke] per-image block {block.shape} = (layers, queries, dim)")
+        if block.shape[0] != dl.N_DECODER_LAYERS:
+            raise dl.ExportError(
+                f"captured {block.shape[0]} layers, expected {dl.N_DECODER_LAYERS}"
+            )
+        n_queries = block.shape[1]
+        subset = np.isin(pool_images, names)
+        keys = dl.proposal_keys(
+            np.repeat(np.asarray(names, dtype=str), n_queries),
+            np.tile(np.arange(n_queries), len(names)),
+        )
+        stacked = np.concatenate(
+            [produced[name].transpose(1, 0, 2) for name in names], axis=0
+        )
+        rows = dl.align(keys, pool_keys[subset])
+        pool = proposals_module.from_frozen_pool(arguments.pool, split="pool")
+        similarity = dl.validate(
+            dl.LayerExport(
+                features=stacked[rows].transpose(1, 0, 2),
+                keys=pool_keys[subset],
+                layer_indices=tuple(range(dl.N_DECODER_LAYERS)),
+                provenance={},
+            ),
+            pool.embeddings[subset],
+        )
+        print(f"[smoke] {int(subset.sum())} pool proposals over {len(names)} image(s); "
+              f"hs[5] reproduces the pool at mean cosine {similarity:.6f}  PASS")
+        print("[smoke] the full export is safe to run")
+        return
+
+    collected = run_images(image_list, label="export")
     for handle in handles:
         handle.remove()
 
