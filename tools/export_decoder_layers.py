@@ -169,16 +169,59 @@ def main() -> None:
     # is exactly what the gate below would catch.
     from owl.evaluation_subset import check_split_name
     check_split_name(arguments.image_set)
-    dataset = OWDetection(
-        args, Path(arguments.data_root), image_set=arguments.image_set,
-        dataset="OWDETR", transforms=make_coco_transforms("test"),
-    )
-    index_of = {name: position for position, name in enumerate(dataset.imgids)}
+
+    # OWDetection subscripts `transforms`: __getitem__ reads `self.transforms[0]`
+    # as the image-set *string* to pick the annotation filter, and calls
+    # `self.transforms[-1](img, target)`. So it wants a (marker, callable) pair,
+    # not a bare transform -- and the marker being a substring match is the same
+    # trap owl.evaluation_subset guards. The bare form is tried as a fallback
+    # only because a fork may differ; either way the smoke test below decides.
+    dataset = None
+    failures = []
+    for description, transforms in (
+        ("(marker, callable) pair", (arguments.image_set, make_coco_transforms("test"))),
+        ("bare callable", make_coco_transforms("test")),
+    ):
+        try:
+            candidate = OWDetection(
+                args, Path(arguments.data_root), image_set=arguments.image_set,
+                dataset="OWDETR", transforms=transforms,
+            )
+            # Pull one sample now. A convention mismatch must cost seconds, not
+            # 1,600 images: this is the only place it can be detected cheaply.
+            sample = candidate[0][0]
+            if not isinstance(sample, torch.Tensor) or sample.ndim != 3:
+                raise TypeError(
+                    f"sample 0 came back as {type(sample).__name__} "
+                    f"{getattr(sample, 'shape', '')}, not a 3-d image tensor"
+                )
+            dataset = candidate
+            print(f"[dataset] {description}: sample 0 is {tuple(sample.shape)}")
+            break
+        except Exception as error:            # noqa: BLE001 - report and try the next form
+            failures.append(f"{description}: {type(error).__name__}: {str(error)[:200]}")
+    if dataset is None:
+        raise dl.ExportError(
+            "PROB's OWDetection would not yield an image tensor under either "
+            "transforms convention. Refusing to export.\n  " + "\n  ".join(failures)
+        )
+
+    # `imgids` holds integers (convert_image_id(..., to_integer=True)); the raw
+    # zero-padded string ids the pool uses live in `image_set`.
+    names = [str(name) for name in dataset.image_set]
+    index_of = {name: position for position, name in enumerate(names)}
+    if len(index_of) != len(names):
+        raise dl.ExportError(
+            f"the dataset lists {len(names)} images but only {len(index_of)} are "
+            "distinct; a duplicated id would make the key join ambiguous."
+        )
     missing = [name for name in image_list if name not in index_of]
     if missing:
         raise dl.ExportError(
             f"{len(missing)} pool images are absent from the dataset index "
-            f"(first: {missing[:3]}). The data root does not hold the pool's images."
+            f"(first: {missing[:3]}). Check that "
+            f"ImageSets/OWDETR/{arguments.image_set}.txt was written by "
+            "tools/materialize_pool_images.py."
         )
 
     collected: dict[str, np.ndarray] = {}
