@@ -149,6 +149,20 @@ layer-5 / P2 the open-pool kNN was **0.0714**, so 0.15 is a genuine bar, whereas
 unknown NMI on the unknown subset was **0.4061**, so 0.15 would already be cleared
 by PROB and the criterion would be vacuous.
 
+**Measured before any DINOv2 feature existed.** Running the audit on a fixed-seed
+**random unit-norm** matrix of the same shape — pure noise, no information —
+produced **open-pool NMI 0.3022 on P2**, twice the 0.15 threshold, while its
+open-pool kNN was **0.0038** against PROB's 0.0665. NMI between a 120-cluster
+k-means partition and 58 true classes is inflated by cluster count and does not
+approach zero for an uninformative space. **So the NMI ≥ 0.15 criterion is
+satisfied by noise and cannot discriminate anything.** The kNN form of the same
+threshold is discriminative.
+
+Because of that, the audit now measures the random noise floor alongside every
+real representation and prints it beside each metric, in the same spirit as the
+"chance kNN agreement = 0.0564" line the decoder-layer audit already prints. That
+is calibration, not a new threshold, and it changes no decision rule.
+
 Resolution taken: the verdict applies the threshold **literally as specified**, to
 open-pool NMI — NMI computed by clustering the whole population and scoring
 unknown class against that partition, which is the sense in which it is
