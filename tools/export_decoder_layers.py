@@ -126,6 +126,9 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--pool", default=str(POOL))
+    parser.add_argument("--image-set", default="owl_layer_test",
+                        help="ImageSets/OWDETR/<name>.txt written by "
+                             "tools/materialize_pool_images.py")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     arguments = parser.parse_args()
@@ -158,11 +161,16 @@ def main() -> None:
     from datasets.open_world import make_coco_transforms
     from datasets.torchvision_datasets.open_world import OWDetection
 
-    # 'test' is the only marker that applies the evaluation transform without the
-    # training-only annotation filters; owl.evaluation_subset explains why the
-    # substring matters. Images are all we need -- annotations come from the pool.
+    # The split *name* decides which annotation filters PROB runs, by substring.
+    # owl.evaluation_subset.check_split_name refuses anything but a test-only
+    # marker, so the transform applied here is the inference one. The target is
+    # discarded -- annotations come from the committed pool -- but the image
+    # preprocessing must be PROB's own or hs[5] will not reproduce the pool, which
+    # is exactly what the gate below would catch.
+    from owl.evaluation_subset import check_split_name
+    check_split_name(arguments.image_set)
     dataset = OWDetection(
-        args, Path(arguments.data_root), image_set="test",
+        args, Path(arguments.data_root), image_set=arguments.image_set,
         dataset="OWDETR", transforms=make_coco_transforms("test"),
     )
     index_of = {name: position for position, name in enumerate(dataset.imgids)}
