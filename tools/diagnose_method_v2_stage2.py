@@ -59,8 +59,15 @@ def write_csv(name: str, rows: list[dict]) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--export", required=True, help="frozen DINOv2 base export")
+    parser.add_argument("--ref-t1", required=True,
+                        help="REF-T1 export from tools/export_ref_t1_features.py -- "
+                             "the canonical Task-1 labelled reference, and the only "
+                             "reference that decides D_GO")
     parser.add_argument("--views", default=None,
                         help="Stage-2 view export; omit to skip component C")
+    parser.add_argument("--with-pseudo-reference", action="store_true",
+                        help="also report the REF-A pseudo-known manifold as a "
+                             "secondary diagnostic (never decides a verdict)")
     parser.add_argument("--pool", default=str(sf.POOL))
     arguments = parser.parse_args()
 
@@ -89,24 +96,20 @@ def main() -> None:
     p2_rows = np.flatnonzero(p2)
     admissibility = scoring.admissibility(candidates)
 
-    # ---- REF-A: detector-predicted-known, NMS-deduplicated. Oracle-free. ---
-    saved = pool["pred_obj"].copy()
-    pool["pred_obj"] = -admissibility
-    try:
-        deduplicated = nms_keep(pool, np.ones(len(candidates), dtype=bool),
-                                stage2.NMS_IOU)
-    finally:
-        pool["pred_obj"] = saved
-    ref_mask = stage2.reference_mask(
-        candidates.posterior, admissibility, pool["raw_boxes"],
-        pool["image_ids"], nms=deduplicated)
-    ref_rows = np.flatnonzero(ref_mask)
-    reference = features[ref_mask]
-    print(f"[REF-A] {ref_rows.size:,} predicted-known, NMS-deduplicated reference "
-          f"vectors (oracle-free)")
+    # ---- REF-T1: the canonical Task-1 labelled reference. PRIMARY. ----------
+    from tools.export_ref_t1_features import read as read_reference
+    from tools.export_ref_t1_features import validate as validate_reference
 
-    position_in_reference = np.full(len(candidates), -1, dtype=np.int64)
-    position_in_reference[ref_rows] = np.arange(ref_rows.size)
+    ref_payload = read_reference(arguments.ref_t1)
+    ref_report = validate_reference(
+        ref_payload["keys"], ref_payload["embeddings"], ref_payload["class_name"])
+    reference = ref_payload["embeddings"].astype(np.float32)
+    print(f"[REF-T1] {ref_report}  PASS")
+    print("[REF-T1] Task-1 labelled GT boxes only; no candidate oracle label and "
+          "no future-task annotation is read")
+    # REF-T1 is disjoint from the candidate pool by construction: its rows are GT
+    # objects, not proposals, so no candidate can be its own reference.
+    position_in_reference = None
 
     local = features[p2]
     local_kind, local_group = kind[p2], group[p2]
@@ -122,12 +125,13 @@ def main() -> None:
         candidates, p2_rows, groups=groups, name="random")
 
     rankings = list(baseline_a) + list(random_rank)
-    summary: dict = {"p2": report, "reference_vectors": int(ref_rows.size),
+    summary: dict = {"p2": report,
+                     "reference": "REF-T1 (canonical Task-1 labelled GT)",
+                     "reference_vectors": int(reference.shape[0]),
                      "seeds": list(SEEDS)}
 
     # ================= component D =========================================
-    d_values = stage2.novelty(local, reference,
-                              exclude_self=position_in_reference[p2])
+    d_values = stage2.novelty(local, reference, exclude_self=position_in_reference)
     d_rows = stage2.group_summary(d_values, local_kind, local_group, name="D")
     d_table = stage2.rank_table(d_values, candidates, p2_rows, groups=groups, name="D")
     rankings += d_table
@@ -140,8 +144,40 @@ def main() -> None:
                {"score": "D", "stratum": "auc_unknown_vs_background", "n": 0,
                 "median": d_auc_background, "mean": d_auc_background,
                 "q25": "", "q75": ""}]
+    # secondary, never decisive: the REF-A pseudo-known manifold, for comparison
+    if arguments.with_pseudo_reference:
+        saved = pool["pred_obj"].copy()
+        pool["pred_obj"] = -admissibility
+        try:
+            deduplicated = nms_keep(pool, np.ones(len(candidates), dtype=bool),
+                                    stage2.NMS_IOU)
+        finally:
+            pool["pred_obj"] = saved
+        pseudo_mask = stage2.pseudo_reference_mask(
+            candidates.posterior, admissibility, pool["raw_boxes"],
+            pool["image_ids"], nms=deduplicated)
+        pseudo_rows = np.flatnonzero(pseudo_mask)
+        mapping = np.full(len(candidates), -1, dtype=np.int64)
+        mapping[pseudo_rows] = np.arange(pseudo_rows.size)
+        pseudo_values = stage2.novelty(local, features[pseudo_mask],
+                                       exclude_self=mapping[p2])
+        print(f"[REF-A] SECONDARY pseudo-known manifold, {pseudo_rows.size:,} "
+              "vectors; reported only, decides nothing")
+        d_rows += stage2.group_summary(pseudo_values, local_kind, local_group,
+                                       name="D_pseudo_REF_A_secondary")
+        rankings += stage2.rank_table(pseudo_values, candidates, p2_rows,
+                                      groups=groups,
+                                      name="D_pseudo_REF_A_secondary")
+        summary["D_pseudo_reference_secondary"] = {
+            "vectors": int(pseudo_rows.size),
+            "auc_unknown_vs_known": stage2.auc(pseudo_values, unknown, known),
+            "note": "pseudo-known manifold estimated from the candidate pool; not "
+                    "the labelled set and not part of any verdict",
+        }
+
     write_csv("method_v2_stage2_d.csv", d_rows)
-    summary["D"] = d_verdict | {"auc_unknown_vs_background": d_auc_background}
+    summary["D"] = d_verdict | {"auc_unknown_vs_background": d_auc_background,
+                                "reference": "REF-T1", "reference_report": ref_report}
 
     # ================= component R =========================================
     counts = owl_protocol.load_train_counts()
@@ -155,6 +191,9 @@ def main() -> None:
         ("R2_labelled_deficit", stage2.rarity_r2(local, reference)),
         ("R3_partition_undercoverage", stage2.rarity_r3(local, reference, seed=0)),
     ):
+        # R3 is the only stochastic definition. Seed 0 carries the verdict, as
+        # declared; seeds 1 and 2 are reported as stability rows so a k-means
+        # initialisation cannot be the thing that decides R_GO unnoticed.
         strata = stage2.group_summary(values, local_kind, local_group, name=name)
         table = stage2.rank_table(values, candidates, p2_rows, groups=groups, name=name)
         rankings += table
@@ -172,6 +211,13 @@ def main() -> None:
             {"score": name, "stratum": "spearman_inverse_frequency",
              "n": int(usable.sum()), "median": -rho, "mean": -rho, "q25": "", "q75": ""},
         ]
+    for seed in SEEDS[1:]:
+        stability = stage2.rarity_r3(local, reference, seed=seed)
+        r_rows += [row | {"score": f"R3_partition_undercoverage_seed{seed}"}
+                   for row in stage2.group_summary(
+                       stability, local_kind, local_group,
+                       name=f"R3_partition_undercoverage_seed{seed}")]
+
     write_csv("method_v2_stage2_r.csv", r_rows)
     r_verdict = stage2.evaluate_r(definitions)
     summary["R"] = {key: value for key, value in r_verdict.items()
@@ -204,8 +250,9 @@ def main() -> None:
         tail = unknown & (local_group == "tail")
         c_auc_tail = stage2.auc(c_values, tail, unknown & ~tail)
         # C as a weight on the Stage-1 ranking, the protocol's filter/weight test
-        weighted = stage2.rank_table(admissibility[p2] * c_values, candidates,
-                                     p2_rows, groups=groups, name="A_times_C")
+        weighted = stage2.rank_table(
+            stage2.score_c(admissibility[p2], c_values),
+            candidates, p2_rows, groups=groups, name="A_times_C_frozen")
         rankings += weighted
         c_verdict = stage2.evaluate_c(unknown_vs_background_auc=c_auc,
                                       table=weighted, baseline=baseline_a)
@@ -245,10 +292,13 @@ def main() -> None:
               f"{gain['unknown_objects']:+.1%}, tail-object gain "
               f"{gain['tail_objects']:+.1%}")
     print(f"  R  passing definitions: {r_verdict['passing_definitions'] or 'none'}")
+    print("     primary coverage endpoint: distinct medium+tail oracle OBJECTS; "
+          "class coverage is descriptive")
     for name, entry in r_verdict["definitions"].items():
         print(f"     {name:30s} monotone={entry['monotone_head_medium_tail']}  "
-              f"coverage={entry['coverage_gain_within_background_budget']}  "
-              f"medians={entry['medians']}")
+              f"object_gain+background_same_fraction="
+              f"{entry['object_gain_and_background_at_same_fraction']}  "
+              f"at={entry['satisfying_fraction']}  medians={entry['medians']}")
     print(f"  C  unknown-vs-background AUC = "
           f"{c_verdict.get('unknown_vs_background_auc', float('nan')):.4f}  >= "
           f"{stage2.C_GO_UNKNOWN_VS_BACKGROUND_AUC:.2f}")

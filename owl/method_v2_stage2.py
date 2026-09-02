@@ -87,7 +87,7 @@ def verify_p2(mask: np.ndarray, kind: np.ndarray) -> dict:
     return {"rows": rows, "background_share": background}
 
 
-def reference_mask(
+def pseudo_reference_mask(
     posterior: np.ndarray,
     admissibility: np.ndarray,
     boxes: np.ndarray,
@@ -95,17 +95,20 @@ def reference_mask(
     *,
     nms: np.ndarray | None = None,
 ) -> np.ndarray:
-    """REF-A: detector-predicted-known proposals, NMS-deduplicated. Oracle-free.
+    """REF-A, the **pseudo-known manifold**. SECONDARY diagnostic only.
 
-    The repository's established stand-in for "what is already labelled" --
-    ``clustering.predicted_known`` is what ``clustering.contamination`` already
-    runs on, and the detector recognises its own 19 classes at 0.83 accuracy. It
-    mimics the round-0 labelled state without reading one oracle label.
+    Detector-predicted-known proposals, NMS-deduplicated. Oracle-free, but **not
+    the labelled reference set**, and it must never decide ``D_GO``.
 
-    Deduplicated because a crowded object otherwise contributes a dozen nearly
-    identical reference vectors and dominates every nearest-neighbour query made
-    against the set. ``nms`` is injected so the caller supplies the repository's
-    own suppression rather than this module growing a second implementation.
+    The distinction is the method's meaning, not bookkeeping: this estimates a
+    known-looking manifold *from the same unlabelled candidate population it is
+    then used to judge*, so novelty measured against it is "novelty relative to a
+    manifold inferred from the current pool" -- a different quantity from
+    "novelty relative to already-labelled knowledge". The primary reference is
+    :mod:`owl.reference_t1`.
+
+    Retained because the comparison between the two is informative: it prices what
+    a pseudo-reference costs against real labels.
     """
 
     predicted = clustering.predicted_known(posterior, N_KNOWN_AT_T1)
@@ -250,6 +253,26 @@ def consistency(base: np.ndarray, view_a: np.ndarray,
     }
 
 
+def score_c(admissibility: np.ndarray, consistency_values: np.ndarray) -> np.ndarray:
+    """The frozen C ranking: ``score_C(x) = A(x) * C(x)``. Nothing else.
+
+    Written down before any C value was computed, because "use C as a weight"
+    leaves the ranking undefined and the space of alternatives -- ``A + C``,
+    ``A * C**p``, a threshold on C, a rescaled C -- is exactly where a result can
+    be manufactured after the fact. No exponent, no rescaling, no threshold, no
+    learned coefficient.
+    """
+
+    admissibility = np.asarray(admissibility, dtype=np.float64)
+    consistency_values = np.asarray(consistency_values, dtype=np.float64)
+    if admissibility.shape != consistency_values.shape:
+        raise Stage2Error(
+            f"A is {admissibility.shape} and C is {consistency_values.shape}; the "
+            "frozen C ranking multiplies them row-wise on the same P2 rows"
+        )
+    return admissibility * consistency_values
+
+
 # ------------------------------------------------------- ranking and accounting ---
 
 
@@ -348,9 +371,20 @@ def _at(table: Sequence[Mapping], fraction: float) -> Mapping | None:
 
 
 def _relative_gain(candidate: float, baseline: float) -> float:
+    """Relative gain, or NaN when the baseline is zero.
+
+    A zero denominator cannot satisfy a *relative* criterion, so it returns NaN
+    rather than infinity: reporting an infinite improvement over nothing would let
+    an endpoint pass on an artefact of the baseline being empty at that fraction.
+    """
+
     if baseline <= 0:
-        return float("inf") if candidate > 0 else 0.0
+        return float("nan")
     return (candidate - baseline) / baseline
+
+
+def _meets(value: float, threshold: float) -> bool:
+    return bool(not np.isnan(value) and value >= threshold)
 
 
 def evaluate_d(*, unknown_vs_known_auc: float, table: Sequence[Mapping],
@@ -368,13 +402,13 @@ def evaluate_d(*, unknown_vs_known_auc: float, table: Sequence[Mapping],
         tail = _relative_gain(float(row["tail_objects"]),
                               float(reference["tail_objects"]))
         gains[fraction] = {"unknown_objects": objects, "tail_objects": tail}
-        if max(objects, tail) >= D_GO_RELATIVE_IMPROVEMENT:
+        # the predeclared OR: either endpoint may carry the improvement
+        if (_meets(objects, D_GO_RELATIVE_IMPROVEMENT)
+                or _meets(tail, D_GO_RELATIVE_IMPROVEMENT)):
             improved = True
     checks = {
-        "unknown_vs_known_auc>=0.65": bool(
-            not np.isnan(unknown_vs_known_auc)
-            and unknown_vs_known_auc >= D_GO_UNKNOWN_VS_KNOWN_AUC
-        ),
+        "unknown_vs_known_auc>=0.65": _meets(unknown_vs_known_auc,
+                                             D_GO_UNKNOWN_VS_KNOWN_AUC),
         "relative_gain>=10pct_at_some_fraction": bool(improved),
     }
     return {"component": "D", "go": all(checks.values()), "checks": checks,
@@ -382,11 +416,20 @@ def evaluate_d(*, unknown_vs_known_auc: float, table: Sequence[Mapping],
 
 
 def evaluate_r(definitions: Mapping[str, Mapping]) -> dict:
-    """Protocol section 9: monotone head->medium->tail median, plus coverage gain.
+    """Protocol section 9, unambiguous form.
 
-    ``definitions`` maps an R name to
-    ``{"medians": {band: value}, "table": [...], "baseline": [...]}``.
-    R is GO if **any one** predeclared definition satisfies both conditions.
+    R is GO if **any one** predeclared definition satisfies all three:
+
+    A. median rarity is monotone ``head <= medium <= tail``;
+    B. **distinct medium+tail oracle objects** -- the *primary* coverage endpoint --
+       gain >= 10% relative over A-only at one of the predeclared fractions;
+    C. background proposal share rises by <= 10 percentage points **at that same
+       fraction**.
+
+    Distinct medium+tail *classes* are computed and reported but **cannot rescue a
+    failure on the object endpoint**, and B and C must hold together at one
+    fraction rather than being satisfied at two different ones -- otherwise a
+    definition could buy coverage at 5% and pay for the background at 20%.
     """
 
     per_definition = {}
@@ -394,40 +437,43 @@ def evaluate_r(definitions: Mapping[str, Mapping]) -> dict:
         medians = payload["medians"]
         monotone = bool(
             medians.get("head") is not None
+            and medians.get("medium") is not None
+            and medians.get("tail") is not None
             and medians["head"] <= medians["medium"] <= medians["tail"]
         )
-        coverage = False
-        background_ok = False
+        satisfying_fraction = None
         details = {}
         for fraction in GO_FRACTIONS:
             row = _at(payload["table"], fraction)
             reference = _at(payload["baseline"], fraction)
             if row is None or reference is None:
                 continue
-            mid_tail_objects = (float(row["medium_objects"]) + float(row["tail_objects"]))
-            mid_tail_reference = (float(reference["medium_objects"])
-                                  + float(reference["tail_objects"]))
-            mid_tail_classes = (float(row["medium_classes"]) + float(row["tail_classes"]))
-            mid_tail_class_ref = (float(reference["medium_classes"])
-                                  + float(reference["tail_classes"]))
-            object_gain = _relative_gain(mid_tail_objects, mid_tail_reference)
-            class_gain = _relative_gain(mid_tail_classes, mid_tail_class_ref)
+            object_gain = _relative_gain(
+                float(row["medium_objects"]) + float(row["tail_objects"]),
+                float(reference["medium_objects"]) + float(reference["tail_objects"]),
+            )
+            class_gain = _relative_gain(              # reported, never decisive
+                float(row["medium_classes"]) + float(row["tail_classes"]),
+                float(reference["medium_classes"]) + float(reference["tail_classes"]),
+            )
             increase = float(row["background_share"]) - float(reference["background_share"])
+            holds = (_meets(object_gain, R_GO_RELATIVE_IMPROVEMENT)
+                     and increase <= R_GO_MAX_BACKGROUND_INCREASE)
             details[fraction] = {
-                "medium_tail_object_gain": object_gain,
-                "medium_tail_class_gain": class_gain,
+                "medium_tail_object_gain": object_gain,       # PRIMARY
+                "medium_tail_class_gain": class_gain,         # descriptive only
                 "background_increase": increase,
+                "both_hold_at_this_fraction": bool(holds),
             }
-            if (max(object_gain, class_gain) >= R_GO_RELATIVE_IMPROVEMENT
-                    and increase <= R_GO_MAX_BACKGROUND_INCREASE):
-                coverage = True
-                background_ok = True
+            if holds and satisfying_fraction is None:
+                satisfying_fraction = fraction
         per_definition[name] = {
             "monotone_head_medium_tail": monotone,
-            "coverage_gain_within_background_budget": bool(coverage and background_ok),
+            "object_gain_and_background_at_same_fraction": satisfying_fraction is not None,
+            "satisfying_fraction": satisfying_fraction,
             "medians": dict(medians),
             "fractions": details,
-            "go": bool(monotone and coverage and background_ok),
+            "go": bool(monotone and satisfying_fraction is not None),
         }
     winners = [name for name, entry in per_definition.items() if entry["go"]]
     return {"component": "R", "go": bool(winners), "passing_definitions": winners,
@@ -437,12 +483,13 @@ def evaluate_r(definitions: Mapping[str, Mapping]) -> dict:
 def evaluate_c(*, unknown_vs_background_auc: float,
                table: Sequence[Mapping] | None = None,
                baseline: Sequence[Mapping] | None = None) -> dict:
-    """Protocol section 9: AUC >= 0.60 OR a >= 10% gain that keeps the tail."""
+    """Protocol section 9: AUC >= 0.60 OR a >= 10% gain that keeps the tail.
 
-    auc_ok = bool(
-        not np.isnan(unknown_vs_background_auc)
-        and unknown_vs_background_auc >= C_GO_UNKNOWN_VS_BACKGROUND_AUC
-    )
+    ``table`` must be the ranking of :func:`score_c` -- ``A(x) * C(x)`` -- against
+    ``baseline`` = the ranking of ``A(x)`` alone, on the same P2 rows.
+    """
+
+    auc_ok = _meets(unknown_vs_background_auc, C_GO_UNKNOWN_VS_BACKGROUND_AUC)
     filter_ok = False
     details = {}
     if table is not None and baseline is not None:
@@ -454,7 +501,7 @@ def evaluate_c(*, unknown_vs_background_auc: float,
                                   float(reference["unknown_objects"]))
             tail_kept = float(row["tail_objects"]) >= float(reference["tail_objects"])
             details[fraction] = {"unknown_object_gain": gain, "tail_kept": tail_kept}
-            if gain >= C_GO_RELATIVE_IMPROVEMENT and tail_kept:
+            if _meets(gain, C_GO_RELATIVE_IMPROVEMENT) and tail_kept:
                 filter_ok = True
     checks = {
         "unknown_vs_background_auc>=0.60": auc_ok,

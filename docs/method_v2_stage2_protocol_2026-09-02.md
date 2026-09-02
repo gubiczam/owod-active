@@ -77,25 +77,75 @@ D(x) = 1 - max_{r in REF} cos(z_x, z_r)
 `z` are the frozen DINOv2 embeddings. The candidate's own row is excluded from
 `REF` so a proposal cannot be its own reference.
 
-### The labelled reference set, `REF`
+### The labelled reference set — corrected before any Stage-2 endpoint ran
 
-**REF-A (primary, no new GPU, oracle-free).** The proposals the *detector itself*
-calls a known class — `owl.clustering.predicted_known(posterior, 19)` — taken
-within the pool and then **NMS-deduplicated at IoU 0.60 by `A(x)`**, so the
-reference is object-level rather than proposal-level and a crowded object cannot
-dominate it. This is the repository's established oracle-free stand-in for "what
-is already labelled": it is what `clustering.contamination()` already runs on, and
-the detector labels its own 19 known classes at 0.83 accuracy.
+**History, recorded rather than erased.**
 
-It mimics the initial labelled state at round 0 without reading a single oracle
-label, and it reuses the frozen candidate export — no second representation
-pipeline.
+1. The first implementation proposed **REF-A**: `predicted_known(candidate pool) ∩ NMS`.
+2. Review identified that REF-A is a **pseudo-known manifold, not the labelled
+   set** — it estimates known-looking structure *from the same unlabelled candidate
+   population it is then used to judge*, so `D` would have measured "novelty
+   relative to a manifold inferred from the current pool" rather than "novelty
+   relative to already-labelled knowledge". Those are different methods.
+3. **Before any real Stage-2 endpoint was computed**, the primary reference was
+   corrected to the canonical Task-1 labelled GT objects.
+4. REF-A is retained **only** as an explicitly secondary *pseudo-reference*
+   diagnostic, behind `--with-pseudo-reference`, and cannot determine `D_GO`.
 
-**Why not the T1 ground-truth boxes.** They would be legitimate (T1 labels are
-*present* at round 0, not future), but they need a separate DINOv2 export over T1
-*training* images. REF-B is therefore recorded as an available fallback and is
-**not** run in this stage. If it is ever run it must use the identical model,
-crop geometry, preprocessing, CLS extraction and L2 normalisation.
+**REF-T1 (primary).** Ground-truth boxes of the **19 Task-1 classes** from the
+canonical T1 *training* annotations (`data/staging/owdetr_replay_annotations.tar.gz`,
+counts cross-checked against `data/reference/t1_replay_class_counts.json`). GT is
+legitimate here precisely because these are already-labelled training examples at
+round 0 — not candidate oracle information, and not a future task's labels. No T2
+or later annotation is read. REF-T1 rows are GT objects, not proposals, so no
+candidate can be its own reference and no self-exclusion is needed.
+
+```
+D_T1(x) = 1 - max_{r in REF-T1} cos(z_x, z_r)          <- PRIMARY, decides D_GO
+D_A(x)  = 1 - max_{r in REF-A}  cos(z_x, z_r)          <- secondary, decides nothing
+```
+
+**Measured population.** 421,243 T1 GT objects over 89,490 images, per-class
+min 1,294 (`bear`) / median 6,587 / max 262,465 (`person`) — an imbalance of
+**202.8:1**.
+
+**A class-name convention bug found during the count inspection, before any
+extraction.** The annotation XMLs carry **COCO** names where this project follows
+PROB's VOC spelling. Exactly two Task-1 classes differ — `airplane`/`aeroplane`
+and `motorcycle`/`motorbike` — and parsing without the alias yielded 407,383
+objects against the expected 421,243 with **those two classes at zero**. Left
+unmapped, REF-T1 would have held no example of two of the nineteen known classes
+and `D` would have called every aeroplane and motorbike in the pool novel.
+`owl.reference_t1.COCO_TO_VOC` maps them and the enumerator now **fails closed**
+unless the total reproduces exactly.
+
+**Why the reference must be class-balanced.** `D` is a *maximum* over the
+reference set, so a frequency-proportional reference would be 62% `person` and `D`
+would collapse into "distance to the nearest person" rather than "distance from
+known classes". Balance is a correctness requirement.
+
+**Why a cap is required, and its cost.** The full set spans 89,490 source images —
+**55.9×** the 1,600 the candidate export needed — so the binding cost is fetching
+JPEGs, not the GPU forward pass. Measured, class-balanced, deterministic
+(seed 0, objects sorted by `(image_id, object_index)` then permuted and truncated):
+
+| cap per class | objects | distinct images | exactly balanced |
+|---:|---:|---:|:--:|
+| 100 | 1,900 | 1,842 | yes |
+| 250 | 4,750 | 4,418 | yes |
+| 500 | 9,500 | 8,329 | yes |
+| **1,000** | **19,000** | **14,944** | **yes** |
+| 1,294 | 24,586 | 18,238 | yes |
+| full | 421,243 | 89,490 | no (202.8:1) |
+
+Every cap ≤ 1,294 is *exactly* balanced, because 1,294 is the smallest class.
+**The selections are nested under the fixed seed** — cap 250 ⊂ cap 500 ⊂ cap 1000,
+verified for both objects and images — so one export at the largest cap yields the
+smaller caps as free subsets and a sensitivity check needs no second GPU pass.
+
+`--per-class-cap` is a required argument with no default: the value is a recorded
+decision, not something a script picks silently. It is **never** selected by
+looking at a D or R endpoint.
 
 ### Leakage rules, absolute
 
@@ -128,6 +178,12 @@ Every parameter reuses a value already frozen in this repository:
 `R1(x) = d_k(x)`, the distance to the k-th nearest *other candidate* in P2 DINO
 space. Larger = locally sparser. Predeclared as the definition closest to the
 falsified isolation signal, and expected to be the weakest.
+
+**R2 and R3 use REF-T1** wherever "labelled support" appears; REF-A versions are
+secondary pseudo-reference diagnostics only. **R1 is candidate-only** by
+definition. R3 is the only stochastic definition: seed 0 carries the verdict as
+declared, and seeds 1 and 2 are reported as stability rows so a k-means
+initialisation cannot decide `R_GO` unnoticed.
 
 **R2 — labelled coverage deficit.** A bounded log-ratio of how far the labelled
 material is versus how far other candidates are:
@@ -228,15 +284,37 @@ Predeclared top fractions for the improvement tests: **{5%, 10%, 20%}**.
    OR distinct tail-object count** over the `A`-only ordering on the same fixed P2
    rows by **≥ 10% relative**.
 
-**R is GO if** at least one predeclared R definition shows a **monotonic
-head → medium → tail increase in median rarity** *and* improves **medium+tail
-class or object coverage** over `A`-only at one or more predeclared top fractions
-**without increasing background share by more than 10 percentage points**.
+**R is GO if** at least one predeclared R definition satisfies **all three**:
 
-**C is GO if** unknown-vs-background ROC AUC **≥ 0.60**, **or** using C as a
-diagnostic filter/weight yields **≥ 10% relative improvement in distinct
-unknown-object count** at one or more predeclared top fractions **without reducing
-the distinct tail-object count**.
+* **A.** median rarity is monotone `head ≤ medium ≤ tail`;
+* **B.** **distinct medium+tail oracle objects** — the *primary* coverage
+  endpoint — gain **≥ 10% relative** over `A`-only at one of {5%, 10%, 20%};
+* **C.** background proposal share rises by **≤ 10 percentage points** **at that
+  same fraction**.
+
+Distinct medium+tail *classes* are reported but **cannot rescue a failure on the
+object endpoint**. B and C must hold together at one fraction — otherwise a
+definition could buy coverage at 5% and pay for the background at 20%.
+
+**C is GO if** unknown-vs-background ROC AUC **≥ 0.60**, **or** the frozen
+C ranking yields **≥ 10% relative improvement in distinct unknown-object count**
+at one or more predeclared top fractions **without reducing the distinct
+tail-object count**.
+
+The C ranking is frozen now, because "use C as a weight" leaves it undefined:
+
+```
+score_C(x) = A(x) * C(x)      compared against      score_A(x) = A(x)
+```
+
+on the same fixed P2 rows. **No exponent, no rescaling, no threshold on C, no
+learned coefficient, no `A + C`.** The direct unknown-vs-background AUC remains
+the first C diagnostic; the weighting test is secondary but part of the frozen
+rule.
+
+**Zero denominators.** If the `A`-only count is zero at a fraction, that endpoint
+**cannot** satisfy a relative-gain criterion there — the gain is reported as NaN
+and treated as not met, rather than as an infinite improvement over nothing.
 
 **These criteria are not reinterpreted after results.**
 
@@ -254,6 +332,11 @@ verdict reported separately regardless:
 
 If none pass, the negative result is reported and **no replacement semantic term
 is invented.**
+
+The ladder is **nested on purpose**. Even if C passes while R fails, we do *not*
+jump to `U+D+C`: the pre-registered object of study is the original four-factor
+nested formulation `U + λ·D + γ·R·C`, in which C gates R rather than standing
+alone. Every component's verdict is printed regardless of where the ladder stops.
 
 ## 10. Out of scope
 

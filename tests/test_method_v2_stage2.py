@@ -141,10 +141,10 @@ def test_novelty_refuses_an_empty_or_mismatched_reference():
         stage2.novelty(features, np.ones((2, 5), dtype=np.float32))
 
 
-def test_reference_construction_reads_no_oracle_label(tiny_pool):
+def test_pseudo_reference_construction_reads_no_oracle_label(tiny_pool):
     """REF-A comes from the posterior and NMS only. Handed no labels, by signature."""
 
-    mask = stage2.reference_mask(
+    mask = stage2.pseudo_reference_mask(
         tiny_pool.posterior, tiny_pool.objectness, tiny_pool.boxes,
         tiny_pool.image_ids, nms=np.ones(len(tiny_pool), dtype=bool),
     )
@@ -159,20 +159,20 @@ def test_reference_construction_reads_no_oracle_label(tiny_pool):
         iou=tiny_pool.oracle().iou[::-1],
     )
     assert permuted is not None                    # the oracle exists but is unused
-    again = stage2.reference_mask(
+    again = stage2.pseudo_reference_mask(
         tiny_pool.posterior, tiny_pool.objectness, tiny_pool.boxes,
         tiny_pool.image_ids, nms=np.ones(len(tiny_pool), dtype=bool),
     )
     assert np.array_equal(mask, again)
 
 
-def test_reference_construction_is_narrowed_by_nms(tiny_pool):
-    everything = stage2.reference_mask(
+def test_pseudo_reference_construction_is_narrowed_by_nms(tiny_pool):
+    everything = stage2.pseudo_reference_mask(
         tiny_pool.posterior, tiny_pool.objectness, tiny_pool.boxes,
         tiny_pool.image_ids, nms=np.ones(len(tiny_pool), dtype=bool))
     suppressed = np.zeros(len(tiny_pool), dtype=bool)
     suppressed[:4] = True
-    narrowed = stage2.reference_mask(
+    narrowed = stage2.pseudo_reference_mask(
         tiny_pool.posterior, tiny_pool.objectness, tiny_pool.boxes,
         tiny_pool.image_ids, nms=suppressed)
 
@@ -468,3 +468,200 @@ def test_the_frozen_thresholds_are_the_protocol_values():
     assert stage2.C_GO_RELATIVE_IMPROVEMENT == 0.10
     assert stage2.GO_FRACTIONS == (0.05, 0.10, 0.20)
     assert stage2.REPORT_FRACTIONS == (0.01, 0.05, 0.10, 0.20, 0.30)
+
+
+# ------------------------------- REF-T1: the corrected primary reference ---
+
+
+def test_ref_t1_alias_map_covers_the_two_coco_spellings():
+    """Without it, aeroplane and motorbike would be absent from the reference.
+
+    Parsing the archive without the map yielded 407,383 objects against the
+    expected 421,243, with those two classes at exactly zero -- so D would have
+    reported every aeroplane and motorbike in the pool as novel.
+    """
+
+    from owl.protocol import TASK1
+    from owl.reference_t1 import COCO_TO_VOC
+
+    assert COCO_TO_VOC == {"airplane": "aeroplane", "motorcycle": "motorbike"}
+    for voc in COCO_TO_VOC.values():
+        assert voc in TASK1
+
+
+def test_ref_t1_class_totals_match_the_committed_count_file():
+    from owl.protocol import TASK1
+    from owl.reference_t1 import EXPECTED_T1_OBJECTS, class_totals
+
+    totals = class_totals()
+
+    assert set(totals) == set(TASK1)
+    assert sum(totals.values()) == EXPECTED_T1_OBJECTS == 421_243
+    assert min(totals.values()) == 1_294          # bear
+    assert max(totals.values()) == 262_465        # person
+
+
+def test_ref_t1_enumeration_fails_closed_on_a_convention_mismatch(monkeypatch):
+    """A wrong total must raise, naming the empty classes, not proceed quietly."""
+
+    from owl import reference_t1 as ref
+
+    monkeypatch.setattr(ref, "COCO_TO_VOC", {})     # simulate the missing alias
+
+    with pytest.raises(ref.ExportError) as error:
+        ref.enumerate_objects()
+    message = str(error.value)
+    assert "expected 421,243" in message
+    assert "aeroplane" in message and "motorbike" in message
+
+
+def test_ref_t1_selection_is_exactly_balanced_and_deterministic():
+    from owl import reference_t1 as ref
+
+    grouped = ref.enumerate_objects()
+    first = ref.select_balanced(grouped, per_class_cap=100)
+    second = ref.select_balanced(grouped, per_class_cap=100)
+
+    assert np.array_equal(first.keys, second.keys)
+    summary = first.summary()
+    assert summary["objects"] == 19 * 100
+    assert summary["classes"] == 19
+    assert summary["balanced"] is True
+    assert summary["min_per_class"] == summary["max_per_class"] == 100
+    assert np.unique(first.keys).size == first.keys.size
+
+
+def test_ref_t1_selections_are_nested_across_caps():
+    """One export at the largest cap gives the smaller caps as free subsets."""
+
+    from owl import reference_t1 as ref
+
+    grouped = ref.enumerate_objects()
+    small = set(ref.select_balanced(grouped, per_class_cap=50).keys.tolist())
+    large = set(ref.select_balanced(grouped, per_class_cap=100).keys.tolist())
+
+    assert small <= large
+    assert len(small) * 2 == len(large)
+
+
+def test_ref_t1_holds_only_task_1_classes():
+    """No T2 or later annotation may reach the reference."""
+
+    from owl import reference_t1 as ref
+    from owl.protocol import CLASS_ORDER, TASK1
+
+    selection = ref.select_balanced(ref.enumerate_objects(), per_class_cap=50)
+
+    present = set(selection.class_name.tolist())
+    assert present == set(TASK1)
+    future = set(CLASS_ORDER[len(TASK1):])
+    assert not (present & future)
+
+
+def test_ref_t1_images_do_not_touch_the_eval_split():
+    from owl import reference_t1 as ref
+    from owl import semantic_features as sf
+
+    selection = ref.select_balanced(ref.enumerate_objects(), per_class_cap=100)
+    payload = np.load(sf.POOL, allow_pickle=True)
+    splits = np.asarray(payload["split"], dtype=str)
+    ids = np.asarray(payload["image_ids"], dtype=str)
+
+    assert not (set(selection.images) & set(ids[splits == "eval"].tolist()))
+
+
+def test_ref_t1_rejects_a_nonsense_cap():
+    from owl import reference_t1 as ref
+
+    with pytest.raises(ref.ExportError, match="at least 1"):
+        ref.select_balanced({"bear": [("a", 0, "bear", (0.5, 0.5, 0.1, 0.1))]},
+                            per_class_cap=0)
+
+
+# --------------------------------------------- the frozen C ranking, A * C ---
+
+
+def test_score_c_is_exactly_a_times_c():
+    admissibility = np.array([2.0, 4.0, 1.0])
+    consistency = np.array([0.5, 0.25, 1.0])
+
+    assert np.allclose(stage2.score_c(admissibility, consistency),
+                       [1.0, 1.0, 1.0])
+
+
+def test_score_c_refuses_a_shape_mismatch():
+    with pytest.raises(stage2.Stage2Error, match="row-wise on the same P2 rows"):
+        stage2.score_c(np.ones(4), np.ones(3))
+
+
+# ------------------------------- the corrected R_GO and zero denominators ---
+
+
+def test_r_requires_the_object_endpoint_and_class_gain_cannot_rescue_it():
+    """Class coverage is descriptive: a class-only gain must not pass R."""
+
+    baseline = _table(0.10, 100, 20, medium_objects=10, medium_classes=5,
+                      tail_classes=5, background_share=0.50)
+    # medium+tail objects flat (30 -> 30) but classes up 10 -> 14
+    class_only = _table(0.10, 100, 20, medium_objects=10, medium_classes=8,
+                        tail_classes=6, background_share=0.50)
+
+    verdict = stage2.evaluate_r({"R2": {
+        "medians": {"head": 0.1, "medium": 0.2, "tail": 0.3},
+        "table": class_only, "baseline": baseline}})
+
+    assert verdict["go"] is False
+    entry = verdict["definitions"]["R2"]
+    assert entry["monotone_head_medium_tail"] is True
+    assert entry["object_gain_and_background_at_same_fraction"] is False
+    assert entry["fractions"][0.10]["medium_tail_class_gain"] > 0.10   # reported
+
+
+def test_r_needs_the_gain_and_the_background_budget_at_the_same_fraction():
+    """Gain at 5% paid for by background at 20% must not pass."""
+
+    baseline = [
+        {"fraction": 0.05, "unknown_objects": 50, "tail_objects": 10,
+         "medium_objects": 10, "medium_classes": 5, "tail_classes": 5,
+         "background_share": 0.50},
+        {"fraction": 0.20, "unknown_objects": 100, "tail_objects": 20,
+         "medium_objects": 10, "medium_classes": 5, "tail_classes": 5,
+         "background_share": 0.50},
+    ]
+    split = [
+        # gain at 5%, but background blows the budget there
+        {"fraction": 0.05, "unknown_objects": 50, "tail_objects": 10,
+         "medium_objects": 20, "medium_classes": 5, "tail_classes": 5,
+         "background_share": 0.75},
+        # background fine at 20%, but no gain there
+        {"fraction": 0.20, "unknown_objects": 100, "tail_objects": 20,
+         "medium_objects": 10, "medium_classes": 5, "tail_classes": 5,
+         "background_share": 0.50},
+    ]
+
+    verdict = stage2.evaluate_r({"R2": {
+        "medians": {"head": 0.1, "medium": 0.2, "tail": 0.3},
+        "table": split, "baseline": baseline}})
+
+    assert verdict["go"] is False
+    assert verdict["definitions"]["R2"]["satisfying_fraction"] is None
+
+
+def test_a_zero_baseline_cannot_satisfy_a_relative_gain():
+    """An infinite improvement over nothing is an artefact, not a pass."""
+
+    baseline = _table(0.05, 0, 0)
+
+    verdict = stage2.evaluate_d(unknown_vs_known_auc=0.90,
+                                table=_table(0.05, 50, 10), baseline=baseline)
+
+    assert verdict["go"] is False
+    assert np.isnan(verdict["gains"][0.05]["unknown_objects"])
+    assert verdict["checks"]["relative_gain>=10pct_at_some_fraction"] is False
+
+
+def test_a_nan_auc_cannot_pass_a_threshold():
+    verdict = stage2.evaluate_c(unknown_vs_background_auc=float("nan"))
+
+    assert verdict["go"] is False
+    assert verdict["checks"]["unknown_vs_background_auc>=0.60"] is False
