@@ -96,6 +96,25 @@ def uncertainty(candidates: Candidates, method: str = "entropy") -> np.ndarray:
     raise ValueError(f"Unknown uncertainty method {method!r}.")
 
 
+def admissibility(candidates: Candidates) -> np.ndarray:
+    """``A(x) = objectness(x) * sqrt(area(x))`` — learning-free object-likeness.
+
+    The same quantity as ``uncertainty(method='objectness')``, named for the role
+    it plays in the multiplicative score rather than for the column it reads.
+    Two roles, and they are the reason it is worth its own name:
+
+    1. an **admissibility factor** in ``s(x) = A(x) * (...)``, so nothing rescues a
+       region that does not look like an object. It is used **raw**, never
+       rank-normalised — rank-normalising a multiplier removes the point of it;
+    2. the **scope** for density coherence. Background dominates density in this
+       pool, so a density gate is only meaningful on a population background has
+       already been filtered out of. See
+       :func:`owl.clustering.density_coherence`.
+    """
+
+    return uncertainty(candidates, "objectness")
+
+
 def novelty(candidates: Candidates, labelled: np.ndarray) -> np.ndarray:
     """``D_a(x)`` — distance to the **growing labelled pool**.
 
@@ -163,29 +182,57 @@ def coherence(
     method: str = "binary",
     minimum_size: int = 5,
     k: int = 5,
+    admissible_share: float = 0.30,
+    eps: float = 0.25,
+    min_samples: int = 5,
+    pca_dimensions: int | None = 32,
+    seed: int = 0,
 ) -> np.ndarray:
     """``coh(x)`` — does the candidate have local support, or is it alone.
 
-    ``binary``      the consultation's gate: 0 or 1, nothing in between. A
-                    candidate with no cluster support is not something we want
-                    to learn, so its rarity contribution is switched off
-                    entirely rather than merely reduced.
+    ``binary``      the k-means minimum-cluster-size gate. **Measured to be a
+                    no-op on this pool** and kept only so the committed results
+                    that used it stay reproducible: at K=1600 the smallest
+                    k-means cluster holds 5 members, so a ``minimum_size=5``
+                    floor closes on 0 of 80,000 candidates and this returns the
+                    same vector as ``off``. Do not use it for new work.
+    ``density``     the repaired gate, and the one that actually tests the
+                    consultation's idea: DBSCAN core/border = 1, noise = 0,
+                    fitted on the top ``admissible_share`` of the pool by
+                    ``A(x)``. ``admissible_share=1.0`` reproduces the full-pool
+                    control in the same code path.
     ``continuous``  the previous definition, ``1 / (1 + d_k / median(d_k))``.
                     Kept so the two can be compared one variable apart.
     ``off``         constant 1 — the ungated control, which is what isolates
                     what the gate itself does.
 
-    **Measured warning.** On PROB's own decoder features the gate removes real
-    unknown objects more often than it removes background, because in a pool
-    that is four-fifths background the densest region *is* background. Running
-    ``binary`` against ``off`` is the experiment; assuming the gate helps is
-    not supported here.
+    **Measured warning.** On the *full* pool of PROB decoder features a density
+    gate removes real unknown objects more often than background — 92% against
+    60% at eps 0.15 — because the pool is 81% background, background regions are
+    near copies, and so background sits in the densest part of the space.
+    ``density`` exists to test whether restricting the scope repairs that;
+    whether it does is H2, decided by ``tools/diagnose_coherence.py`` against a
+    grid fixed before it ran. Assuming the gate helps is not supported here.
     """
 
     if method == "off":
         return np.ones(len(candidates), dtype=np.float32)
     if method == "binary":
         return clustering.noise_gate(partition, minimum_size=minimum_size)
+    if method == "density":
+        scope = (
+            None
+            if admissible_share >= 1.0
+            else clustering.admissible_mask(admissibility(candidates), admissible_share)
+        )
+        return clustering.density_coherence(
+            candidates.embeddings,
+            scope=scope,
+            eps=eps,
+            min_samples=min_samples,
+            pca_dimensions=pca_dimensions,
+            seed=seed,
+        ).gate
     if method == "continuous":
         return _continuous_coherence(candidates, k)
     raise ValueError(f"Unknown coherence method {method!r}.")
@@ -232,9 +279,19 @@ class ScoreConfig:
     uncertainty_method: str = "entropy"
     diversity_source: str = "labelled"  # 'labelled' | 'clusters' | 'anchor_free'
     rarity_method: str = "log_inverse"
-    coherence_method: str = "binary"    # 'binary' | 'continuous' | 'off'
-    combination: str = "additive"       # 'additive' | 'multiplicative'
+    coherence_method: str = "binary"    # 'binary' | 'density' | 'continuous' | 'off'
+    combination: str = "additive"       # 'additive' | 'multiplicative' | 'admissible'
     coherence_minimum_size: int = 5
+
+    #: Only read when ``coherence_method='density'``. The scope is the experiment:
+    #: ``1.0`` fits DBSCAN on the whole pool (the control that inverts, because
+    #: background owns the dense region), anything less fits it on the top share
+    #: by ``A(x)``. Frozen at 0.30 / eps 0.25 / min_samples 5 in
+    #: ``docs/supervisor_week_protocol_2026-09-02.md`` before the grid was run.
+    coherence_admissible_share: float = 0.30
+    coherence_eps: float = 0.25
+    coherence_min_samples: int = 5
+    coherence_pca_dimensions: int | None = 32
     cluster_method: str = "kmeans"
     n_clusters: int = 1600
     random: bool = False               # the random baseline short-circuits everything
@@ -267,10 +324,17 @@ class Terms:
         if batch_diversity is not None and self.config.mu_batch:
             semantic = semantic + self.config.mu_batch * batch_diversity
 
-        if self.config.combination == "multiplicative":
+        if self.config.combination in ("multiplicative", "admissible"):
             if self.prior is None:
                 raise ValueError("A multiplicative score needs the object-likeness prior.")
-            return self.prior * (1.0 + semantic)
+            # 'multiplicative' replaces U with the constant 1 -- the form the
+            # committed 2026-08 arms measured, kept bit-identical. 'admissible'
+            # keeps U inside the bracket, which is the decomposition the
+            # 2026-09-02 protocol freezes:  A(x) * (U + lam*D + gam*R*C + mu*B).
+            # Running both is itself the ablation for whether U pays once A has
+            # already removed the regions that do not look like objects.
+            base = 1.0 if self.config.combination == "multiplicative" else self.uncertainty
+            return self.prior * (base + semantic)
         return self.uncertainty + semantic
 
     def table(self) -> dict[str, float]:
@@ -327,7 +391,7 @@ def terms(
         raise ValueError(f"Unknown diversity source {config.diversity_source!r}.")
 
     return Terms(
-        prior=uncertainty(candidates, "objectness"),
+        prior=admissibility(candidates),
         uncertainty=u,
         diversity=rank_normalise(d),
         rarity=rank_normalise(rarity(partition, config.rarity_method)),
@@ -336,6 +400,11 @@ def terms(
             partition,
             method=config.coherence_method,
             minimum_size=config.coherence_minimum_size,
+            admissible_share=config.coherence_admissible_share,
+            eps=config.coherence_eps,
+            min_samples=config.coherence_min_samples,
+            pca_dimensions=config.coherence_pca_dimensions,
+            seed=config.seed,
         ),
         partition=partition,
         config=config,

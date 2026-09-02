@@ -217,3 +217,77 @@ ARMS: dict[str, ScoreConfig] = {
         diversity_source="labelled", coherence_method="binary", mu_batch=0.3,
     ),
 }
+
+# --------------------------------------------------------------- arms, V2 ---
+
+#: The 2026-09-02 ablation ladder, frozen in
+#: ``docs/supervisor_week_protocol_2026-09-02.md`` §A1.3.
+#:
+#: Separate from :data:`ARMS` on purpose. ``ARMS`` and every CSV under
+#: ``data/results/`` that was produced from it stay untouched and reproducible;
+#: three of those arms are known to be defective as *controls* and this dict is
+#: where the repaired versions live:
+#:
+#: * ``consult`` and ``consult_no_gate`` in ``ARMS`` are bitwise identical,
+#:   because ``coherence_method='binary'`` closes on 0 of 80,000 candidates. The
+#:   gate-on / gate-off contrast here is ``a_u_d_r`` (off) against ``a_u_d_rc``
+#:   (density), which is a real one variable apart.
+#: * ``ARMS`` had no way to vary the *scope* a density gate is fitted on, which
+#:   is the whole of H2. ``a_u_d_rc_fullpool`` is that control.
+#: * ``combination='multiplicative'`` drops ``U``; ``'admissible'`` keeps it, per
+#:   the frozen decomposition. Both are present, so the difference is measurable
+#:   rather than assumed.
+#:
+#: Each rung adds exactly one term to the one above it, so the ladder reads as an
+#: ablation and not as a set of unrelated configurations.
+ARMS_V2: dict[str, ScoreConfig] = {
+    # --- controls ---------------------------------------------------------
+    # identical to ARMS['random'] / ['objectness'] / ['entropy']: reused rather
+    # than redefined, so the V1 and V2 tables agree on their shared rows.
+    # gamma=0 makes the coherence factor inert, so these declare 'off' instead
+    # of inheriting the default 'binary' and implying a gate they never apply.
+    "random": ScoreConfig(name="random", random=True, coherence_method="off"),
+    "objectness": ScoreConfig(
+        name="objectness", uncertainty_method="objectness",
+        lambda_diversity=0.0, gamma_rarity=0.0, coherence_method="off",
+    ),
+    "entropy": ScoreConfig(
+        name="entropy", lambda_diversity=0.0, gamma_rarity=0.0,
+        coherence_method="off",
+    ),
+    "plan": ScoreConfig(
+        name="plan", diversity_source="clusters", coherence_method="continuous",
+    ),
+    # --- the ladder: A * (U + lam*D_known + gam*R*C + mu*B) ---------------
+    "a_u": ScoreConfig(                      # does U pay, once A admits?
+        name="a_u", combination="admissible",
+        lambda_diversity=0.0, gamma_rarity=0.0, coherence_method="off",
+    ),
+    "a_u_d": ScoreConfig(                    # + novelty against the labelled pool
+        name="a_u_d", combination="admissible", diversity_source="labelled",
+        gamma_rarity=0.0, coherence_method="off",
+    ),
+    "a_u_d_r": ScoreConfig(                  # + rarity, gate OFF -- the gate control
+        name="a_u_d_r", combination="admissible", diversity_source="labelled",
+        coherence_method="off",
+    ),
+    "a_u_d_rc": ScoreConfig(                 # + the repaired density gate
+        name="a_u_d_rc", combination="admissible", diversity_source="labelled",
+        coherence_method="density", coherence_admissible_share=0.30,
+    ),
+    "a_u_d_rc_batch": ScoreConfig(           # + within-batch diversity: full method
+        name="a_u_d_rc_batch", combination="admissible", diversity_source="labelled",
+        coherence_method="density", coherence_admissible_share=0.30, mu_batch=0.3,
+    ),
+    # --- H2's scope control: the same gate fitted on the whole pool -------
+    "a_u_d_rc_fullpool": ScoreConfig(
+        name="a_u_d_rc_fullpool", combination="admissible", diversity_source="labelled",
+        coherence_method="density", coherence_admissible_share=1.0,
+    ),
+}
+
+#: Rungs of the ladder in ablation order, for tables that must not be alphabetised.
+LADDER_V2: tuple[str, ...] = (
+    "random", "objectness", "entropy", "plan",
+    "a_u", "a_u_d", "a_u_d_r", "a_u_d_rc", "a_u_d_rc_batch", "a_u_d_rc_fullpool",
+)

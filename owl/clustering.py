@@ -237,9 +237,15 @@ def noise_gate(partition: Partition, *, minimum_size: int = 5) -> np.ndarray:
     no noise points, so the same idea is applied to cluster size: a candidate in
     a cluster smaller than ``minimum_size`` has no support and is gated out.
 
-    **This gate is measured to hurt on PROB's decoder features** — it removes
-    real unknown objects more often than background. It is implemented so that
-    claim can be reproduced, not because it is recommended.
+    **Measured: on the committed pool this is a no-op, and that is a defect, not
+    a property.** At K=1600 the smallest k-means cluster holds 5 members, so a
+    ``minimum_size=5`` floor closes on **0 of 80,000** candidates and this
+    returns the same vector as no gate at all. It is why ``ARMS['consult']`` and
+    ``ARMS['consult_no_gate']`` are bitwise identical on every committed seed.
+
+    Kept unchanged so those committed results stay reproducible. For new work use
+    :func:`density_coherence`, which fits DBSCAN on a named scope and therefore
+    can actually fire.
     """
 
     gate = np.ones(partition.labels.shape[0], dtype=np.float32)
@@ -248,3 +254,138 @@ def noise_gate(partition: Partition, *, minimum_size: int = 5) -> np.ndarray:
     valid = partition.labels >= 0
     gate[valid & small[np.clip(partition.labels, 0, None)]] = 0.0
     return gate
+
+# ------------------------------------------------- density coherence (A1.1) ---
+
+
+@dataclass(frozen=True)
+class CoherenceGate:
+    """A binary ``C(x)``: 1 where a candidate has local density support, 0 where not.
+
+    The consultation asked for ``coh(x) in {0, 1}`` via DBSCAN core-vs-noise. Two
+    things had to be fixed before that idea could be tested at all.
+
+    **It was a no-op.** The registered ``binary`` coherence applied a minimum
+    *cluster size* under k-means, and on the committed pool at K=1600 the
+    smallest k-means cluster holds 5 members, so a ``min_samples=5`` floor closed
+    on **0 of 80,000** candidates. ``binary`` and ``off`` returned the identical
+    vector, which made ``consult`` and ``consult_no_gate`` the same experiment
+    run twice rather than a treatment and its control.
+
+    **On the full pool the idea inverts.** DBSCAN noise on all 80,000 proposals
+    marks *real objects* as noise more often than background — 92% against 60% at
+    eps 0.15 — because the pool is 81% background, background regions are near
+    copies of one another, and so background occupies the densest part of the
+    space. In this pool "you have many neighbours" means "you look like
+    background", which is the opposite of what the gate is for.
+
+    Hence ``scope``: DBSCAN runs on a *population*, and the population is the
+    experiment. On the objectness-admissible subpool the object-likeness prior has
+    already removed most background, so density can mean what it was meant to
+    mean. ``owl.clustering`` takes no position on whether it does; that is H2, and
+    ``tools/diagnose_coherence.py`` answers it against a predeclared grid.
+
+    ``labels`` uses ``-1`` for DBSCAN noise and ``-2`` for a candidate outside the
+    scope, so the two reasons a gate is closed stay distinguishable in the
+    diagnostic. Discrimination must be judged *within* the scope: comparing
+    in-scope core points against out-of-scope candidates would measure
+    admissibility, not density.
+    """
+
+    gate: np.ndarray       # (N,) float32 in {0, 1}
+    scope: np.ndarray      # (N,) bool — the population DBSCAN was fitted on
+    labels: np.ndarray     # (N,) int — >=0 cluster, -1 noise, -2 outside scope
+    params: dict
+
+    @property
+    def n_clusters(self) -> int:
+        if not (self.labels >= 0).any():
+            return 0
+        return self.labels.max().item() + 1
+
+    @property
+    def is_noise(self) -> np.ndarray:
+        """DBSCAN noise, **within the scope only**."""
+        return self.labels == -1
+
+    def summary(self) -> dict[str, float]:
+        in_scope = int(self.scope.sum())
+        return {
+            "scope_size": in_scope,
+            "clusters": self.n_clusters,
+            # criterion 4 is judged on this: does the gate do anything at all?
+            "noise_share_within_scope": (
+                float(self.is_noise.sum() / in_scope) if in_scope else float("nan")
+            ),
+            "gate_open_share_pool": float((self.gate > 0).mean()),
+        }
+
+
+def density_coherence(
+    embeddings: np.ndarray,
+    *,
+    scope: np.ndarray | None = None,
+    eps: float = 0.25,
+    min_samples: int = 5,
+    pca_dimensions: int | None = 32,
+    seed: int = 0,
+) -> CoherenceGate:
+    """Binary coherence from DBSCAN core/border-vs-noise on ``scope``.
+
+    ``scope`` is a boolean mask naming the population to fit on; ``None`` means
+    the whole pool. A candidate outside the scope gets ``C(x) = 0``: coherence
+    here means "has local support *among object-like candidates*", and something
+    the object prior would not admit has none by definition.
+
+    Core and border points are both kept — sklearn gives both a label ``>= 0``
+    and only noise gets ``-1`` — because a border point of a small real cluster is
+    exactly the rare-but-real case the gate must not throw away.
+    """
+
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    n = embeddings.shape[0]
+    mask = (
+        np.ones(n, dtype=bool)
+        if scope is None
+        else np.asarray(scope, dtype=bool).reshape(n)
+    )
+
+    labels = np.full(n, -2, dtype=np.int64)
+    gate = np.zeros(n, dtype=np.float32)
+    params = {
+        "eps": eps,
+        "min_samples": min_samples,
+        "pca_dimensions": pca_dimensions,
+        "scope_size": int(mask.sum()),
+        "pool_size": n,
+    }
+    if not mask.any():
+        return CoherenceGate(gate=gate, scope=mask, labels=labels, params=params)
+
+    # PCA is fitted on the scope, not on the pool: the axes should describe the
+    # population being clustered. Fitting on all 80,000 proposals would orient
+    # them along the background bulk, which is the variance we just excluded.
+    features = _reduce(embeddings[mask], pca_dimensions, seed)
+    fitted = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1).fit_predict(features)
+
+    labels[mask] = fitted
+    gate[mask] = (fitted >= 0).astype(np.float32)
+    return CoherenceGate(gate=gate, scope=mask, labels=labels, params=params)
+
+
+def admissible_mask(scores: np.ndarray, share: float) -> np.ndarray:
+    """The top ``share`` of the pool by ``scores`` — the coherence scope.
+
+    Ties are broken by a stable sort, so the mask is reproducible. ``share >= 1``
+    admits everything, which is how the ``full_pool`` control is expressed
+    without a second code path.
+    """
+
+    scores = np.asarray(scores, dtype=np.float64)
+    n = scores.shape[0]
+    if share >= 1.0:
+        return np.ones(n, dtype=bool)
+    keep = max(round(n * float(share)), 1)
+    mask = np.zeros(n, dtype=bool)
+    mask[np.argsort(-scores, kind="stable")[:keep]] = True
+    return mask
