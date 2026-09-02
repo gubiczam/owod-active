@@ -63,6 +63,7 @@ def select(
     n_known: int = 19,
     exclude: np.ndarray | None = None,
     partition=None,
+    precomputed: np.ndarray | None = None,
 ) -> Selection:
     """Spend ``budget`` regions over ``rounds`` recomputations.
 
@@ -72,9 +73,41 @@ def select(
     Between rounds the labelled pool grows by what was just picked, so ``D``
     moves — that is the feedback loop the research plan draws in figure 2, and
     ``rounds=1`` is the control that switches it off.
+
+    ``precomputed`` is a ranking supplied from outside instead of built from
+    :func:`owl.scoring.terms`. It exists because a score can be a *product* of
+    terms — ``A(x) * C(x)``, frozen in Method V3 — and :class:`ScoreConfig`
+    describes only the additive-plus-admissibility family. Passing it is an
+    explicit statement that the config's own terms are not used, so a config
+    that still carries a non-zero weight is refused rather than silently
+    ignored. The round structure, the exclusion of what has been bought, and the
+    order of the picks are the same code path as every other arm.
     """
 
     n = len(candidates)
+    if precomputed is not None:
+        precomputed = np.asarray(precomputed, dtype=np.float64)
+        if precomputed.shape != (n,):
+            raise ValueError(
+                f"precomputed has shape {precomputed.shape}, expected ({n},)."
+            )
+        if config.random:
+            raise ValueError(
+                "A random arm has no ranking; pass precomputed=None for it."
+            )
+        weighted = {
+            "lambda_diversity": config.lambda_diversity,
+            "gamma_rarity": config.gamma_rarity,
+            "mu_batch": config.mu_batch,
+        }
+        active = {name: value for name, value in weighted.items() if value}
+        if active:
+            raise ValueError(
+                "A precomputed ranking replaces the config's own terms, but this "
+                f"config still weights {sorted(active)}. Zero them, or drop "
+                "precomputed."
+            )
+
     available = np.ones(n, dtype=bool)
     if exclude is not None:
         available &= ~np.asarray(exclude, dtype=bool)
@@ -99,6 +132,10 @@ def select(
         if config.random:
             choice = generator.choice(np.flatnonzero(available), size=quota, replace=False)
             chosen_scores = np.zeros(quota)
+        elif precomputed is not None:
+            pool = np.flatnonzero(available)
+            choice = pool[np.argsort(-precomputed[pool], kind="mergesort")][:quota]
+            chosen_scores = precomputed[choice]
         else:
             round_terms = scoring.terms(
                 candidates,
