@@ -122,7 +122,7 @@ decoder-layer audit's own metric functions so the comparison is apples-to-apples
 1. known-class kNN accuracy
 2. unknown-class kNN accuracy
 3. unknown-tail kNN accuracy
-4. open-pool unknown semantic NMI
+4. open-pool unknown-class kNN (**primary gate**) and open-pool unknown semantic NMI (**descriptive only** -- see the correction below)
 5. unknown-vs-background ROC AUC
 6. PCA PC1 explained variance
 7. effective dimensionality — PCs explaining 90% of variance
@@ -136,70 +136,94 @@ populations, with the same metric code, in the same run.** It is not quoted from
 the earlier document. That makes the comparison exact rather than approximate, and
 costs nothing since the pool already carries `hs[5]`.
 
-### Two ambiguities recorded before any result
+### Correction to this protocol, made before any DINOv2 result existed
 
-Both are flagged here rather than resolved silently, because resolving them after
-seeing a number would be exactly the failure this document exists to prevent.
+This section is a record, not a rewrite. The criterion below was **wrong when
+first written**, the error was found before any DINOv2 feature was extracted, and
+it is corrected here with the reasoning intact. Nothing about the mistake is
+hidden, because the value of a pre-registration is precisely that its history is
+visible.
 
-**(a) Which quantity carries the 0.15 threshold.** The specification says
-"open-pool semantic **NMI** ≥ 0.15". The frozen decoder-layer protocol
-(`docs/decoder_layer_protocol_2026-09-02.md` §4) put the 0.15 threshold on
-"open-pool unknown-class **kNN** agreement". These are not interchangeable: at
-layer-5 / P2 the open-pool kNN was **0.0714**, so 0.15 is a genuine bar, whereas
-unknown NMI on the unknown subset was **0.4061**, so 0.15 would already be cleared
-by PROB and the criterion would be vacuous.
+**What was wrong.** The first version of this protocol put the 0.15 threshold on
+**open-pool NMI**. The frozen decoder-layer protocol
+(`docs/decoder_layer_protocol_2026-09-02.md` §4) put it on **open-pool unknown-class
+kNN agreement**. Those are not interchangeable, and the NMI form is not a usable
+gate.
 
-**Measured before any DINOv2 feature existed.** Running the audit on a fixed-seed
-**random unit-norm** matrix of the same shape — pure noise, no information —
-produced **open-pool NMI 0.3022 on P2**, twice the 0.15 threshold, while its
-open-pool kNN was **0.0038** against PROB's 0.0665. NMI between a 120-cluster
-k-means partition and 58 true classes is inflated by cluster count and does not
-approach zero for an uninformative space. **So the NMI ≥ 0.15 criterion is
-satisfied by noise and cannot discriminate anything.** The kNN form of the same
-threshold is discriminative.
+**The calibration evidence, obtained without any DINOv2 feature.** The audit was
+dry-run on a **fixed-seed random unit-norm matrix** of the same shape as the
+planned export — pure noise, carrying no information at all:
 
-Because of that, the audit now measures the random noise floor alongside every
-real representation and prints it beside each metric, in the same spirit as the
-"chance kNN agreement = 0.0564" line the decoder-layer audit already prints. That
-is calibration, not a new threshold, and it changes no decision rule.
+| representation / P2 | unknown kNN | open-pool kNN | **open-pool NMI** | unknown/bg AUC |
+|---|---:|---:|---:|---:|
+| random noise, `unit` | 0.0642 | 0.0038 | **0.3022** | 0.4961 |
+| random noise, `whitened32` | 0.0652 | — | **0.3356** | 0.5024 |
+| PROB `hs[5]`, `unit` | 0.1592 | 0.0665 | 0.3415 | 0.7716 |
 
-Resolution taken: the verdict applies the threshold **literally as specified**, to
-open-pool NMI — NMI computed by clustering the whole population and scoring
-unknown class against that partition, which is the sense in which it is
-"open-pool". **Open-pool unknown kNN is printed beside it with the layer-5 value,
-so the stricter reading is visible and nothing is hidden.** If you intended the
-kNN form, say so before running; after a result is seen the choice is no longer
-free.
+**Noise scores open-pool NMI 0.30–0.34, twice the proposed 0.15 threshold.** NMI
+between a 120-cluster k-means partition and 58 true classes is inflated by cluster
+count and does not approach zero for an uninformative space. A criterion that pure
+noise satisfies cannot discriminate anything. The kNN form does: noise reaches
+0.0038 where PROB reaches 0.0665.
 
-**(b) Which representation is primary.** The crop specification ends at
-"L2-normalise", so the as-exported unit-norm CLS embedding is the frozen
-representation and the verdict is computed on it. The decoder-layer decision used
-`whitened32` (PCA-32, per-axis standardised, renormalised). Both are reported on
-identical populations; the whitened row exists for apples-to-apples with the
-earlier audit. Declared now: **PASS/FAIL is decided on the as-exported
-representation.** If the two disagree, that disagreement is reported explicitly.
+**The correction.** The 0.15 threshold belongs to **open-pool kNN**, restoring the
+gate exactly as the decoder-layer rescue froze it. **NMI is retained as a
+descriptive secondary metric with no threshold**, and no NMI threshold is derived
+or tuned from the noise observation — the observation explains why NMI is not a
+gate, and that is all it is used for. The random noise floor continues to be
+measured and printed beside every metric, as calibration in the same spirit as the
+"chance kNN agreement = 0.0564" line the decoder-layer audit already prints.
 
-## 8. Frozen GO / NO-GO
+**Primary representation, also corrected.** The first version made the verdict on
+the as-exported `unit` representation. It is now **`whitened32`**, because the
+frozen thresholds were defined on `whitened32`/P2: deciding on `unit` would change
+the preprocessing *and* the backbone at once, and the thresholds would no longer be
+comparable to the baseline they were set against. The whitening reuses
+`tools.audit_decoder_layers.represent`, the decoder-layer audit's own
+implementation and fitting semantics — not a reimplementation. The as-exported
+`unit` representation remains a **reported secondary diagnostic**.
 
-**Primary decision population: P2.** Thresholds are frozen and must not change:
+## 8. Frozen GO / NO-GO — corrected, pre-result
+
+**Primary population: P2** (admissible + per-image NMS IoU 0.60).
+**Primary representation: `whitened32`.** Seeds 0, 1, 2.
+
+A semantic **PASS** requires all four, restoring the decoder-layer rescue's own
+decision logic:
 
 ```
-PASS requires   unknown-class kNN        >= 0.30
-          AND   open-pool semantic NMI   >= 0.15
+1  unknown-class kNN                >= 0.30
+2  open-pool unknown-class kNN      >= 0.15
+3  unknown-vs-background ROC AUC    >= 0.76
+4  unknown-class kNN - 0.1772       >= 0.05   for EVERY evaluated seed
 ```
 
-`unknown-vs-background ROC AUC` is reported as a **safeguard** and compared
-descriptively to PROB's P2 value (≈0.80). A representation that gains semantics by
-losing object/background discrimination is reported as such.
+Where the numbers come from, so none of them is new:
 
-No threshold is added after seeing the result. The CLI ends with exactly one of:
+* **1 and 2** are the decoder-layer protocol §4 thresholds verbatim.
+* **3** is that protocol's safeguard `AUC >= 0.95 x layer-5 AUC` instantiated at
+  the measured layer-5 value of 0.8000, i.e. 0.7600. A representation that gains
+  semantics by losing object/background discrimination does not pass.
+* **4** is that protocol's "substantial, not a rounding artefact" margin against
+  the measured PROB `whitened32`/P2 baseline of **0.1772**, required on **all**
+  seeds rather than on the mean. It is technically weaker than criterion 1 once
+  0.30 is reached; it is retained explicitly because it belonged to the frozen
+  decision logic and dropping it would be a silent change.
+
+**Reported, with no threshold:** open-pool NMI (descriptive only, for the reason
+in §7), the `unit` representation on all populations, known-class kNN,
+unknown-tail kNN, PC1 variance, dims for 90% variance, P0 and P1, the PROB `hs[5]`
+baseline recomputed in the same run, and the random noise floor.
+
+No threshold is added, moved, or derived after a DINOv2 result is seen. The CLI
+ends with exactly one of:
 
 ```
 METHOD_V2_REPRESENTATION_PASS
 METHOD_V2_REPRESENTATION_FAIL
 ```
 
-with the exact primary metrics printed immediately above it.
+with the four primary criteria printed immediately above it.
 
 ## 9. Out of scope at this stage
 
