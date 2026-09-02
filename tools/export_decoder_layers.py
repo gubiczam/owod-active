@@ -32,9 +32,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib
 import json
 import os
 import platform
+import re
 import sys
 import time
 from pathlib import Path
@@ -56,6 +58,102 @@ ARCHITECTURE_CANDIDATES = (
     {"with_box_refine": True, "two_stage": True},
     {"with_box_refine": False, "two_stage": True},
 )
+
+
+#: Top-level package names PROB owns that also exist on PyPI. ``datasets`` is the
+#: dangerous one: Hugging Face's ``datasets`` is commonly pre-installed in Colab,
+#: and if it is already in ``sys.modules`` then putting PROB first on ``sys.path``
+#: does nothing -- the cached module wins, and the failure is
+#: ``ModuleNotFoundError: No module named 'datasets.<x>'``, which looks exactly
+#: like a missing file in PROB rather than a shadowed package.
+PROB_TOP_LEVEL = ("datasets", "models", "util", "engine")
+
+
+def _under(path: str | None, root: Path) -> bool:
+    if not path:
+        return False
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def purge_shadowing_modules(prob_root: Path) -> list[str]:
+    """Evict cached top-level modules that would shadow PROB's own packages.
+
+    ``sys.path`` order is irrelevant once a name is in ``sys.modules``, so a
+    pre-imported Hugging Face ``datasets`` cannot be displaced by inserting
+    ``prob_root`` at the front. Anything under ``prob_root`` is left alone.
+    """
+
+    evicted = []
+    for name in sorted(sys.modules):
+        if name.split(".")[0] not in PROB_TOP_LEVEL:
+            continue
+        module = sys.modules.get(name)
+        if module is None:
+            continue
+        origin = getattr(module, "__file__", None)
+        search = list(getattr(module, "__path__", []) or [])
+        if _under(origin, prob_root) or any(_under(entry, prob_root) for entry in search):
+            continue
+        del sys.modules[name]
+        evicted.append(f"{name} (was {origin or search or 'namespace package'})")
+    return evicted
+
+
+def prob_import(prob_root: Path, dotted: str):
+    """Import ``dotted`` from the PROB checkout, or refuse.
+
+    Puts ``prob_root`` first on ``sys.path`` -- not merely present, first, since a
+    stale earlier entry would keep winning -- and then verifies that the module
+    which actually resolved lives inside ``prob_root``. Without that check an
+    installed package of the same name can satisfy the import silently, and every
+    number downstream would come from code nobody pinned.
+    """
+
+    root = str(Path(prob_root).resolve())
+    while root in sys.path:
+        sys.path.remove(root)
+    sys.path.insert(0, root)
+
+    module = importlib.import_module(dotted)
+    origin = getattr(module, "__file__", None)
+    if not _under(origin, prob_root):
+        raise dl.ExportError(
+            f"'{dotted}' resolved to {origin!r}, which is not under {prob_root}. "
+            "An installed package of the same name satisfied the import. Refusing "
+            "to run PROB code that is not the pinned checkout."
+        )
+    return module, origin
+
+
+def find_module_defining(prob_root: Path, symbol: str,
+                         packages: tuple[str, ...] = ("datasets", "models")) -> list[str]:
+    """Dotted paths of modules in the checkout that define ``symbol``.
+
+    The import path is read off the actual source tree rather than assumed. This
+    exists because ``datasets/open_world.py`` does not exist in this checkout --
+    ``make_coco_transforms`` is defined elsewhere -- and guessing produced a
+    ``ModuleNotFoundError`` indistinguishable from a shadowed package.
+    """
+
+    pattern = re.compile(rf"^def\s+{re.escape(symbol)}\s*\(", re.MULTILINE)
+    found = []
+    for package in packages:
+        directory = Path(prob_root) / package
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.rglob("*.py")):
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if pattern.search(text):
+                relative = path.relative_to(prob_root).with_suffix("")
+                found.append(".".join(relative.parts))
+    return found
 
 
 @contextlib.contextmanager
@@ -108,14 +206,39 @@ def preflight(prob_root: Path, checkpoint: Path, data_root: Path) -> None:
         raise dl.ExportError("preflight failed:\n  " + "\n  ".join(problems))
     print("[preflight] PROB checkout, backbone init, checkpoint and data root all present")
 
+    # Read the import path off the tree instead of assuming it. This checkout has
+    # no datasets/open_world.py -- make_coco_transforms lives elsewhere -- and the
+    # ModuleNotFoundError that produced was indistinguishable from a shadowed
+    # Hugging Face `datasets`.
+    where = find_module_defining(prob_root, "make_coco_transforms")
+    if not where:
+        raise dl.ExportError(
+            f"no module under {prob_root}/datasets or /models defines "
+            "make_coco_transforms(). The checkout layout is not the expected one."
+        )
+    print(f"[preflight] make_coco_transforms() defined in: {', '.join(where)}")
+
+    evicted = purge_shadowing_modules(prob_root)
+    if evicted:
+        print("[preflight] evicted shadowing modules so PROB's own are importable:")
+        for entry in evicted:
+            print(f"             {entry}")
+    else:
+        print("[preflight] no shadowing top-level modules were cached")
+
 
 def build_model(prob_root: Path, checkpoint: Path, device: str):
     """Build PROB and load the checkpoint strictly. Returns (model, chosen args)."""
 
-    sys.path.insert(0, str(prob_root))
     import torch
-    from main_open_world import get_args_parser
-    from models import build_model as prob_build_model
+
+    purge_shadowing_modules(prob_root)
+    parser_module, parser_origin = prob_import(prob_root, "main_open_world")
+    models_module, models_origin = prob_import(prob_root, "models")
+    print(f"[import] main_open_world      <- {parser_origin}")
+    print(f"[import] models               <- {models_origin}")
+    get_args_parser = parser_module.get_args_parser
+    prob_build_model = models_module.build_model
 
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     weights = state.get("model", state)
@@ -227,9 +350,30 @@ def main() -> None:
     store, handles = attach_hooks(model, dl.N_DECODER_LAYERS)
 
     # ---- PROB's own dataset, so preprocessing matches training --------------
-    sys.path.insert(0, str(Path(arguments.prob_root)))
-    from datasets.open_world import make_coco_transforms
-    from datasets.torchvision_datasets.open_world import OWDetection
+    #
+    # Module paths are resolved against the checkout and each resolved file is
+    # verified to live inside it. `datasets` is the name that matters: Hugging
+    # Face ships a package of that name, it is often already imported under
+    # Colab, and a cached one cannot be displaced by sys.path order alone.
+    prob_root = Path(arguments.prob_root)
+    dataset_module, dataset_origin = prob_import(
+        prob_root, "datasets.torchvision_datasets.open_world")
+    OWDetection = dataset_module.OWDetection
+    print(f"[import] OWDetection          <- {dataset_origin}")
+
+    make_coco_transforms = None
+    candidates = find_module_defining(prob_root, "make_coco_transforms")
+    for dotted in candidates:
+        module, origin = prob_import(prob_root, dotted)
+        function = getattr(module, "make_coco_transforms", None)
+        if function is not None:
+            make_coco_transforms = function
+            print(f"[import] make_coco_transforms <- {origin}")
+            break
+    if make_coco_transforms is None:
+        raise dl.ExportError(
+            f"none of {candidates} exposed make_coco_transforms after import"
+        )
 
     # The split *name* decides which annotation filters PROB runs, by substring.
     # owl.evaluation_subset.check_split_name refuses anything but a test-only
@@ -295,7 +439,9 @@ def main() -> None:
         )
 
     started = time.time()
-    from util.misc import nested_tensor_from_tensor_list
+    misc_module, misc_origin = prob_import(prob_root, "util.misc")
+    nested_tensor_from_tensor_list = misc_module.nested_tensor_from_tensor_list
+    print(f"[import] util.misc            <- {misc_origin}")
 
     def run_images(names: list[str], *, label: str) -> dict[str, np.ndarray]:
         """One forward pass per batch; returns {image_id: (layers, queries, dim)}."""

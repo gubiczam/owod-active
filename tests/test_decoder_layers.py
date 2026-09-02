@@ -217,8 +217,12 @@ def test_preflight_names_the_relative_path_initialisation(tmp_path):
 
     prob = tmp_path / "PROB"
     (prob / "models").mkdir(parents=True)
+    (prob / "datasets").mkdir(parents=True)
     (prob / "main_open_world.py").touch()
     (prob / "models" / "__init__.py").touch()
+    (prob / "datasets" / "coco.py").write_text(
+        "def make_coco_transforms(image_set):\n    return None\n"
+    )
     data = tmp_path / "data"
     (data / "JPEGImages").mkdir(parents=True)
     (data / "Annotations").mkdir(parents=True)
@@ -244,3 +248,120 @@ def test_preflight_reports_every_problem_at_once(tmp_path):
     assert "main_open_world.py" in message
     assert "checkpoint" in message
     assert "JPEGImages" in message
+
+
+# --------------------------------------- PROB import resolution and shadowing ---
+
+
+def _fake_prob(root, *, with_transforms_in="datasets/coco.py"):
+    """A minimal checkout: enough layout for the resolver, no torch involved."""
+
+    (root / "models").mkdir(parents=True)
+    (root / "datasets" / "torchvision_datasets").mkdir(parents=True)
+    (root / "main_open_world.py").write_text("def get_args_parser():\n    return None\n")
+    (root / "models" / "__init__.py").write_text("def build_model(a, mode=None):\n    return (None,)\n")
+    (root / "models" / "dino_resnet50_pretrain.pth").touch()
+    (root / "datasets" / "__init__.py").touch()
+    (root / "datasets" / "torchvision_datasets" / "__init__.py").touch()
+    (root / "datasets" / "torchvision_datasets" / "open_world.py").write_text(
+        "class OWDetection:\n    pass\n"
+    )
+    target = root / with_transforms_in
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("def make_coco_transforms(image_set):\n    return None\n")
+    return root
+
+
+def test_find_module_defining_reads_the_layout_instead_of_assuming_it(tmp_path):
+    """The bug this exists for: datasets/open_world.py does not exist in PROB."""
+
+    from tools.export_decoder_layers import find_module_defining
+
+    root = _fake_prob(tmp_path / "PROB")
+
+    found = find_module_defining(root, "make_coco_transforms")
+
+    assert found == ["datasets.coco"]
+    assert "datasets.open_world" not in found
+    assert find_module_defining(root, "no_such_symbol") == []
+
+
+def test_find_module_defining_follows_a_fork_that_moved_the_symbol(tmp_path):
+    """A fork may put it elsewhere; the resolver must not hard-code one path."""
+
+    from tools.export_decoder_layers import find_module_defining
+
+    root = _fake_prob(tmp_path / "PROB", with_transforms_in="datasets/open_world.py")
+
+    assert find_module_defining(root, "make_coco_transforms") == ["datasets.open_world"]
+
+
+def test_prob_import_refuses_a_module_resolved_outside_the_checkout(tmp_path, monkeypatch):
+    """An installed package of the same name must not silently satisfy the import.
+
+    This is the Hugging Face `datasets` case. Without the origin check the run
+    would proceed on code nobody pinned.
+    """
+
+    import sys
+
+    from owl.decoder_layers import ExportError
+    from tools.export_decoder_layers import prob_import
+
+    root = _fake_prob(tmp_path / "PROB")
+    intruder = tmp_path / "site-packages"
+    (intruder / "datasets").mkdir(parents=True)
+    (intruder / "datasets" / "__init__.py").write_text("VERSION = 'huggingface'\n")
+
+    monkeypatch.syspath_prepend(str(intruder))
+    for name in [n for n in sys.modules if n.split(".")[0] == "datasets"]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    # prob_import puts the checkout first, so PROB's own must win
+    _module, origin = prob_import(root, "datasets")
+    assert str(root) in origin
+
+    # and a module that genuinely lives outside is refused rather than used
+    for name in [n for n in sys.modules if n.split(".")[0] == "datasets"]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    with pytest.raises(ExportError, match="not under"):
+        prob_import(tmp_path / "empty", "datasets")
+
+
+def test_purge_evicts_a_cached_shadow_but_keeps_probs_own(tmp_path, monkeypatch):
+    """sys.path order is inert once a name is cached; eviction is what fixes it."""
+
+    import sys
+    import types
+
+    from tools.export_decoder_layers import purge_shadowing_modules
+
+    root = _fake_prob(tmp_path / "PROB")
+
+    foreign = types.ModuleType("datasets")
+    foreign.__file__ = str(tmp_path / "site-packages" / "datasets" / "__init__.py")
+    monkeypatch.setitem(sys.modules, "datasets", foreign)
+
+    native = types.ModuleType("models")
+    native.__file__ = str(root / "models" / "__init__.py")
+    monkeypatch.setitem(sys.modules, "models", native)
+
+    evicted = purge_shadowing_modules(root)
+
+    assert any(entry.startswith("datasets") for entry in evicted)
+    assert not any(entry.startswith("models") for entry in evicted)
+    assert "datasets" not in sys.modules
+    assert sys.modules["models"] is native
+
+
+def test_purge_leaves_unrelated_modules_alone(tmp_path, monkeypatch):
+    import sys
+
+    from tools.export_decoder_layers import purge_shadowing_modules
+
+    before = set(sys.modules)
+    purge_shadowing_modules(_fake_prob(tmp_path / "PROB"))
+    gone = before - set(sys.modules)
+
+    assert all(name.split(".")[0] in ("datasets", "models", "util", "engine")
+               for name in gone), gone
