@@ -27,8 +27,13 @@ NOTEBOOK = ROOT / "notebooks" / "method_v3_selection_transfer_overnight.ipynb"
 
 #: The cell that starts the twelve real trajectories. Everything that must
 #: happen first is expressed relative to this index.
-LAUNCHER_TAG = "[8/9]"
-TOTAL_CELLS = 9
+LAUNCHER_TAG = "[9/10]"
+TOTAL_CELLS = 10
+
+#: The cell that proves the pinned PROB source exists, before anything expensive.
+PROB_PREFLIGHT_TAG = "[4/10]"
+#: The cell that checks out PROB and builds its environment.
+PROB_SETUP_TAG = "[5/10]"
 
 
 @pytest.fixture(scope="module")
@@ -123,9 +128,9 @@ def test_no_shell_magic_can_swallow_a_failure(code_cells):
 
 def test_the_cells_are_numbered_in_order(code_cells):
     tags = [
-        re.search(r"\[(\d+)/(\d+)\]", source).groups()
+        re.search(r"\[(\d+)/(\d+)\]", source.splitlines()[0]).groups()
         for source in code_cells
-        if re.search(r"\[(\d+)/(\d+)\]", source)
+        if re.search(r"\[(\d+)/(\d+)\]", source.splitlines()[0])
     ]
     assert [int(n) for n, _ in tags] == list(range(1, TOTAL_CELLS + 1))
     assert {int(total) for _, total in tags} == {TOTAL_CELLS}
@@ -165,8 +170,50 @@ def test_the_repository_is_pinned_and_installed_before_owl_is_imported(code_cell
     assert imports and min(imports) == pin
 
 
+def test_the_prob_remote_is_verified_before_anything_expensive(code_cells):
+    """The regression: a bare `exit status 128` from a clone, mid-setup.
+
+    The pinned URL and SHA are checked against the server *before* pip, the CUDA
+    kernel build and the smoke test, and the check must live in the tested
+    module rather than in the notebook.
+    """
+
+    preflight = index_of(code_cells, PROB_PREFLIGHT_TAG)
+    prob = index_of(code_cells, PROB_SETUP_TAG)
+    assert preflight < prob, "the remote check must precede the checkout"
+    assert "ensure_pinned_checkout(_PROB_PATH" in code_cells[prob]
+
+    cell = code_cells[preflight]
+    assert "bridge.verify_remote_commit(PROB_REPOSITORY, PROB_COMMIT)" in cell
+    assert "PROB_REMOTE" in cell
+    # it must report both identifiers, since that is what the old failure hid
+    assert '"repository"' in cell and '"commit"' in cell
+    # and it must not carry its own network logic
+    assert "ls-remote" not in cell and "subprocess" not in cell
+
+
+def test_the_prob_checkout_reuses_an_exact_local_copy_and_retries(code_cells):
+    cell = code_cells[index_of(code_cells, PROB_SETUP_TAG)]
+    assert 'ensure_pinned_checkout(_PROB_PATH, PROB_REPOSITORY, PROB_COMMIT)' in cell
+    assert "bridge.local_checkout_matches(" in cell
+    assert "for _attempt in range(1, 4)" in cell
+    assert "shutil.rmtree" in cell, "a partial clone must not be reused"
+    assert "if _attempt == 3:" in cell and "raise" in cell
+
+
+def test_the_pinned_prob_url_is_the_projects_own_fork(code_cells):
+    """It is never changed to make a clone succeed."""
+
+    from owl import bridge
+
+    source = code_cells[0]
+    assert f'PROB_REPOSITORY = "{bridge.PROB_REPOSITORY}"' in source
+    assert bridge.PROB_REPOSITORY == "https://github.com/gubiczam/PROB.git"
+    assert bridge.PROB_BRANCH == "feat/daowod-bridge-v2"
+
+
 def test_prob_is_pinned_and_smoke_tested_before_the_launcher(code_cells):
-    prob = index_of(code_cells, "ensure_pinned_checkout(Path(\"/content/PROB\")")
+    prob = index_of(code_cells, PROB_SETUP_TAG)
     launcher = index_of(code_cells, LAUNCHER_TAG)
     assert prob < launcher
     assert "PROB CUDA model/loss/evaluator smoke" in code_cells[prob]

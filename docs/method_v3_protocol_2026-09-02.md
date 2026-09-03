@@ -439,7 +439,7 @@ The four arms and the criterion above are fixed as of this document.
 | | |
 |---|---|
 | OWL repository | `github.com/gubiczam/owod-active`, commit pinned in the notebook |
-| PROB repository | `github.com/gubiczam/PROB`, branch `feat/daowod-bridge-v2` |
+| PROB repository | `https://github.com/gubiczam/PROB.git`, branch `feat/daowod-bridge-v2` |
 | PROB commit | `4c66be1a52cad9360e09c729e9134aba8fe0b531` |
 | detector checkpoint | `MyDrive/OWL/checkpoints/SOWODB/t1.pth`, SHA-256 recorded in the run manifest |
 | frozen base features | `dinov2_vitb14_method_v2_v1.npz` |
@@ -448,6 +448,41 @@ The four arms and the criterion above are fixed as of this document.
 
 `ref_t1_dinov2_vitb14_cap1000_v1.npz` is a Stage-2 artefact and is **not** read
 by Method V3: `C` needs the base export and the two views, not the reference.
+
+### 13.1 The detector source, verified
+
+`https://github.com/gubiczam/PROB.git` is the **only** PROB URL this project has
+ever used — twelve occurrences across the full git history of this repository,
+and never any other. It is a fork, and the pinned commit is **fork-only**: it
+carries `daowod_prob_bridge.py`, the 1,057-line CLI this project drives PROB
+through, which exists on no upstream branch. Verified on 2026-09-03 with
+`git ls-remote`:
+
+```
+$ git ls-remote --heads https://github.com/gubiczam/PROB.git
+874c0553...  refs/heads/feat/daowod-bridge
+4c66be1a52cad9360e09c729e9134aba8fe0b531  refs/heads/feat/daowod-bridge-v2
+cbd5bfd3...  refs/heads/main
+
+$ git ls-remote https://github.com/orrzohar/PROB.git | grep 4c66be1a
+(nothing — the pinned commit is not in upstream history)
+```
+
+The commit resolves to *Make --replay-ids do something, or refuse the run*,
+2026-08-24. **There is therefore nothing to substitute**, and §13's URL and SHA
+may not be changed to make a clone succeed.
+
+A Method V3 attempt on 2026-09-03 died in the PROB setup cell on
+`git clone ... exit status 128`. The URL was reachable and the pin present both
+before and after, so the failure was transient — the class of failure an
+anonymous clone from a shared Colab egress address produces. `exit status 128`
+does not distinguish that from a deleted repository, which is why
+`owl.bridge.verify_remote_commit` now proves the URL and the SHA **before** pip,
+the CUDA kernel build and the smoke test, retries the read-only probe, honours a
+pin that has become an interior commit, and refuses to name an alternative
+repository in its error. `owl.bridge.local_checkout_matches` accepts an existing
+checkout whose origin and `HEAD` are exactly the pinned ones — byte-identical to
+a fresh clone, and the recovery if the host is ever truly unavailable.
 
 All of these, plus the population fingerprint and the checkpoint hash, are
 written into the machine-readable run manifest

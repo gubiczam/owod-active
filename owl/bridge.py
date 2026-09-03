@@ -326,6 +326,211 @@ class Bridge:
         return report
 
 
+# ------------------------------------------------- verifying the remote pin ---
+#
+# Why this exists. A Method V3 run died in the PROB setup cell on
+#
+#     git clone --filter=blob:none --no-checkout https://github.com/gubiczam/PROB.git
+#     exit status 128
+#
+# and a bare 128 says nothing about whether the URL is wrong, the network
+# hiccupped, GitHub rate-limited a shared Colab egress IP, or the pinned commit
+# is gone. Guessing at that question is how a frozen detector gets quietly
+# swapped for a convenient one. So the question is answered before the expensive
+# setup runs, out loud, naming the URL and the SHA.
+
+
+def normalise_repository(value: str) -> str:
+    """``git@github.com:o/r.git`` and ``https://github.com/o/r/`` compare equal."""
+
+    value = str(value).strip().removesuffix(".git").rstrip("/")
+    if value.startswith("git@github.com:"):
+        value = "https://github.com/" + value.split(":", 1)[1]
+    return value
+
+
+def _ls_remote(repository: str, timeout: float) -> tuple[int, str, str]:
+    import os
+
+    environment = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    try:
+        probe = subprocess.run(
+            ["git", "ls-remote", repository],
+            capture_output=True, text=True, check=False,
+            timeout=timeout, env=environment,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", f"git ls-remote timed out after {timeout:.0f}s"
+    return probe.returncode, probe.stdout, probe.stderr
+
+
+def _fetchable(repository: str, commit: str, timeout: float) -> tuple[bool, str]:
+    """Can the server hand us this exact commit even if no ref points at it?
+
+    A pin that was a branch tip becomes an *interior* commit as soon as anything
+    is pushed on top of it, and ``ls-remote`` cannot see interior commits. GitHub
+    allows fetching one by SHA, so this is what keeps a legitimately advanced
+    branch from being reported as a missing pin.
+    """
+
+    import os
+    import tempfile
+
+    environment = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    with tempfile.TemporaryDirectory() as directory:
+        for command in (
+            ["git", "init", "--quiet", directory],
+            ["git", "-C", directory, "fetch", "--quiet", "--depth", "1",
+             "--filter=blob:none", repository, commit],
+        ):
+            try:
+                probe = subprocess.run(
+                    command, capture_output=True, text=True, check=False,
+                    timeout=timeout, env=environment,
+                )
+            except subprocess.TimeoutExpired:
+                return False, f"timed out after {timeout:.0f}s"
+            if probe.returncode != 0:
+                return False, (probe.stderr or probe.stdout).strip()
+    return True, ""
+
+
+def verify_remote_commit(
+    repository: str = PROB_REPOSITORY,
+    commit: str = "",
+    *,
+    branch: str | None = PROB_BRANCH,
+    attempts: int = 3,
+    delay: float = 5.0,
+    timeout: float = 60.0,
+    ls_remote=_ls_remote,
+    fetchable=_fetchable,
+) -> dict:
+    """Prove the URL is reachable and ``commit`` is really on that server.
+
+    Retries, because the failure class actually observed is transient: an
+    anonymous clone from a shared Colab egress address can be rate-limited or
+    dropped, and the same URL then works a minute later. Retrying a read-only
+    probe costs seconds; a wrong diagnosis costs a night.
+
+    Fails closed with :class:`BridgeError`, and the message names the URL, the
+    SHA and — when the server answered — the refs it actually saw. It never
+    proposes another repository: the pinned commit carries this project's own
+    bridge and exists in no other history, so there is nothing to fall back to
+    and a substitution would silently change the detector.
+
+    Returns a record fit for a run manifest: whether the pin is a ref tip, and
+    whether ``branch`` still points at it.
+    """
+
+    if not commit or len(commit) != 40 or not all(
+        character in "0123456789abcdef" for character in commit.lower()
+    ):
+        raise BridgeError(
+            f"{commit!r} is not a full 40-character commit SHA; an abbreviated or "
+            "symbolic pin is not a pin."
+        )
+    commit = commit.lower()
+
+    failures: list[str] = []
+    for attempt in range(1, max(attempts, 1) + 1):
+        code, out, err = ls_remote(repository, timeout)
+        if code == 0:
+            break
+        failures.append(f"attempt {attempt}: exit {code}: {(err or out).strip()}")
+        if attempt < max(attempts, 1):
+            time.sleep(delay)
+    else:
+        detail = "\n    ".join(failures)
+        raise BridgeError(
+            f"cannot reach the pinned PROB repository.\n"
+            f"    URL    {repository}\n"
+            f"    SHA    {commit}\n"
+            f"    branch {branch}\n"
+            f"    {detail}\n"
+            "The URL and the SHA above are part of the frozen experiment and must "
+            "not be changed to make a clone succeed: this commit carries this "
+            "project's own PROB bridge and exists in no other repository's "
+            "history. If the host is simply down or rate-limiting, wait and run "
+            "again. If the repository has been made private or renamed, restore "
+            "its visibility or place a checkout of that exact SHA at the target "
+            "path — the notebook uses an existing checkout as-is once it verifies "
+            "the SHA."
+        )
+
+    refs: dict[str, str] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            refs[parts[1]] = parts[0].lower()
+
+    at_commit = sorted(name for name, value in refs.items() if value == commit)
+    branch_ref = f"refs/heads/{branch}" if branch else None
+    branch_head = refs.get(branch_ref) if branch_ref else None
+
+    present, note = (True, "ref tip") if at_commit else fetchable(
+        repository, commit, timeout)
+    if not present:
+        visible = "\n    ".join(
+            f"{name} -> {value}" for name, value in sorted(refs.items())
+        ) or "(the server listed no refs)"
+        raise BridgeError(
+            f"the pinned PROB commit is not on that server.\n"
+            f"    URL {repository}\n"
+            f"    SHA {commit}\n"
+            f"    {note}\n"
+            f"    refs the server did offer:\n    {visible}\n"
+            "The pin is not moved to whatever the branch points at now — that "
+            "would change the detector implementation the completed experiments "
+            "used. Recover the commit, or stop."
+        )
+
+    return {
+        "repository": repository,
+        "normalised": normalise_repository(repository),
+        "commit": commit,
+        "branch": branch,
+        "branch_head": branch_head,
+        "branch_points_at_commit": branch_head == commit,
+        "refs_at_commit": at_commit,
+        "pin_is_ref_tip": bool(at_commit),
+        "refs_seen": len(refs),
+        "attempts_used": len(failures) + 1,
+    }
+
+
+def local_checkout_matches(
+    path: Path, repository: str, commit: str, *, runner=None
+) -> bool:
+    """Is ``path`` already a clean checkout of ``repository`` at exactly ``commit``?
+
+    The offline escape hatch, and it is safe precisely because it is exact: the
+    origin must be the pinned repository and ``HEAD`` must be the pinned SHA, so
+    an accepted checkout is byte-identical to what a successful clone would have
+    produced. Used so that a mirrored checkout — copied in from Drive when the
+    host is unreachable — is scientifically the same run, and so that a second
+    attempt in the same session does not re-fetch.
+    """
+
+    def git(*arguments: str) -> tuple[int, str]:
+        if runner is not None:
+            return runner(path, arguments)
+        probe = subprocess.run(
+            ["git", "-C", str(path), *arguments],
+            capture_output=True, text=True, check=False,
+        )
+        return probe.returncode, probe.stdout.strip()
+
+    path = Path(path)
+    if not (path / ".git").is_dir():
+        return False
+    code, origin = git("remote", "get-url", "origin")
+    if code != 0 or normalise_repository(origin) != normalise_repository(repository):
+        return False
+    code, head = git("rev-parse", "HEAD")
+    return code == 0 and head.lower() == str(commit).lower()
+
+
 def ensure_checkout(root: Path, *, repository: str = PROB_REPOSITORY, branch: str = PROB_BRANCH) -> Path:
     """Clone or update PROB. Colab-only; a no-op if the checkout is already there."""
 
