@@ -325,3 +325,179 @@ def test_coverage_refuses_mismatched_inputs():
             np.zeros((3, 2), dtype=np.float32), np.asarray(["a"]),
             cost_of=lambda _: 1, budget=1,
         )
+
+# ----------------------------------- the failure mode Method V3 walked into ---
+
+
+def test_the_gated_arm_only_ever_picks_inside_the_gate(built):
+    """A-gating is applied *before* semantic selection, not after it."""
+
+    index = np.flatnonzero(built.gate)
+    picked = arms.select(
+        "proposed", built, cost_of=lambda _: 4, answer_budget=400, seed=0,
+        semantic=built.candidates.embeddings[index],
+    )
+    assert picked.anchors, "nothing was selected"
+    inside = set(index.tolist())
+    assert all(anchor in inside for anchor in picked.anchors), (
+        "a pick landed outside the admissible subset; the gate is not being "
+        "applied before the traversal"
+    )
+    # and the images it opened are the images of those gated candidates
+    opened = set(picked.images)
+    assert opened == {
+        str(built.candidates.image_ids[a]) for a in picked.anchors
+    }
+
+
+def test_coverage_does_not_reduce_to_the_admissibility_ranking(built):
+    """The whole point, and the exact way Method V3 failed to test it.
+
+    There, ``A`` and ``A*C`` reported four identical aggregate statistics and
+    nobody checked whether the *proposals* differed — the audit later found the
+    ranking was dense to 3 parts in 100,000, so the aggregates were blind. Here
+    the check is on the selection itself: a coverage traversal that had collapsed
+    into "take the top of the tie-break" would open exactly the images the
+    admissibility arm opens, in the same order.
+    """
+
+    index = np.flatnonzero(built.gate)
+    cost_of = lambda _: 4
+    coverage_arm = arms.select(
+        "proposed", built, cost_of=cost_of, answer_budget=400, seed=0,
+        semantic=built.candidates.embeddings[index],
+    )
+    ranking_arm = arms.select(
+        "admissibility", built, cost_of=cost_of, answer_budget=400, seed=0
+    )
+    assert coverage_arm.images != ranking_arm.images
+    shared = set(coverage_arm.images) & set(ranking_arm.images)
+    assert len(shared) < 0.9 * len(coverage_arm.images), (
+        f"{len(shared)} of {len(coverage_arm.images)} opened images are the "
+        "admissibility arm's; the traversal is behaving like a static ranking"
+    )
+
+
+def test_the_traversal_reorders_its_own_tie_break(built):
+    """Picks must not come out in descending admissibility order."""
+
+    index = np.flatnonzero(built.gate)
+    picked = arms.select(
+        "proposed", built, cost_of=lambda _: 4, answer_budget=200, seed=0,
+        semantic=built.candidates.embeddings[index],
+    )
+    order = built.admissibility[list(picked.anchors)]
+    assert not np.all(np.diff(order) <= 0), (
+        "every pick was less admissible than the one before it, which is what a "
+        "pure A ranking looks like"
+    )
+
+
+def test_acquisition_changes_what_the_traversal_wants_next(built):
+    """Coverage is updated by acquisition; it is not a fixed score.
+
+    Two traversals over the same pool, one starting from an empty reference and
+    one from a reference that already covers part of the space, must not agree —
+    otherwise ``R`` is decorative.
+    """
+
+    index = np.flatnonzero(built.gate)
+    features = built.candidates.embeddings[index]
+    cost_of = lambda _: 4
+    fresh = coverage.kcenter_greedy(
+        features, built.candidates.image_ids[index], cost_of=cost_of, budget=200,
+        tie_break=built.admissibility[index],
+    )
+    seeded = coverage.kcenter_greedy(
+        features, built.candidates.image_ids[index], cost_of=cost_of, budget=200,
+        reference=features[: len(features) // 2],
+        tie_break=built.admissibility[index],
+    )
+    assert fresh.images != seeded.images
+    assert seeded.reference_size > 0 and fresh.reference_size == 0
+
+
+def test_every_pick_is_at_least_as_far_as_the_next_one_would_have_been(built):
+    """Farthest-first: the distances it accepts are non-increasing.
+
+    Opening an image can only shrink the remaining minimum distances, so the
+    sequence of accepted distances cannot rise. A rise would mean the traversal
+    is not taking the argmax.
+    """
+
+    index = np.flatnonzero(built.gate)
+    result = coverage.kcenter_greedy(
+        built.candidates.embeddings[index], built.candidates.image_ids[index],
+        cost_of=lambda _: 4, budget=200,
+        reference=built.candidates.embeddings[index][:50],
+        tie_break=built.admissibility[index],
+    )
+    taken = np.asarray(result.distances)
+    assert taken.size > 5
+    assert np.all(np.diff(taken) <= 1e-6), taken[:10]
+
+# ------------------------------------------- no oracle reaches the ranking ---
+
+
+def test_no_selection_module_can_reach_an_answer():
+    """Static: the acquisition path never calls ``Candidates.oracle()``.
+
+    ``tests/test_owl.py::test_scoring_never_reads_an_answer`` makes the same
+    guarantee for the additive score. This is its counterpart for the modules
+    Benchmark V1 added, and it is a source check rather than a behavioural one
+    because a call added on a rarely-taken branch would pass the behavioural
+    test for months.
+    """
+
+    import inspect
+
+    from owl.active_selection import population as population_module
+
+    for module in (arms, coverage, population_module, budget):
+        source = inspect.getsource(module)
+        assert ".oracle()" not in source, module.__name__
+        assert "oracle_kind" not in source, module.__name__
+        assert "class_name" not in source or module is budget, module.__name__
+
+
+def test_the_cost_function_reads_counts_and_never_a_class():
+    """The one thing the selector *is* handed that touches the annotation.
+
+    It answers "how many objects are on this image", which is the price of a
+    question. It cannot answer "which classes", and a selector that wanted to
+    could not get there through this interface.
+    """
+
+    import inspect
+
+    source = inspect.getsource(budget.cost_function)
+    assert "sum(" in inspect.getsource(budget.image_cost)
+    # the closure returns an int, so there is nothing else to read off it
+    cost = budget.cost_function({"i1": {"person": 2, "bear": 1}})
+    assert cost("i1") == 3
+    assert isinstance(cost("i1"), int)
+    assert "class" not in source
+
+
+def test_the_future_label_helpers_are_not_imported_by_the_selectors():
+    """``acquisition`` reads future classes; it must run only after the budget.
+
+    It lives in :mod:`owl.active_selection.budget` beside the cost function, so
+    the separation cannot be by module. It is enforced by the call site instead:
+    :func:`owl.runner.run_chain` calls it *after* the selector has returned and
+    the images have been committed, and the arm registry never mentions it.
+    """
+
+    import inspect
+
+    assert "acquisition" not in inspect.getsource(arms)
+    assert "acquisition" not in inspect.getsource(coverage)
+    runner_source = inspect.getsource(
+        __import__("owl.runner", fromlist=["runner"])
+    )
+    selector_call = runner_source.index("bought = selector(")
+    acquisition_call = runner_source.index("annotation_budget.acquisition(")
+    assert selector_call < acquisition_call, (
+        "the future-label table is computed before the selector has spent the "
+        "budget"
+    )

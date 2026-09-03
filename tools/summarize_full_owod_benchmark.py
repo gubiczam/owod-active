@@ -47,6 +47,9 @@ COST_COLUMNS = (
     "images_trainable", "images_barren", "images_from_earlier_tasks",
     "boxes_labelled", "boxes_supervised", "boxes_banked", "supervised_share",
     "boxes_supervised_head", "boxes_supervised_medium", "boxes_supervised_tail",
+    # what PROB was actually handed, which is not what the task bought
+    "boxes_trained_on", "boxes_trained_on_head", "boxes_trained_on_medium",
+    "boxes_trained_on_tail",
     "training_images", "training_iterations",
 )
 ACQUISITION_COLUMNS = (
@@ -201,6 +204,12 @@ def main() -> None:
         print(f"  boxes_labelled across all arms and tasks: {min(spread):.0f} – "
               f"{max(spread):.0f} (ratio {max(spread) / max(min(spread), 1):.2f}x). "
               "Method V3's region budget gave 2.09x.")
+    trained = [r["boxes_trained_on"] for r in cost
+               if isinstance(r.get("boxes_trained_on"), float)]
+    if trained:
+        print(f"  boxes_trained_on (what PROB was handed, banked labels "
+              f"included): {min(trained):.0f} – {max(trained):.0f} "
+              f"(ratio {max(trained) / max(min(trained), 1):.2f}x)")
     supervised = [r["boxes_supervised"] for r in cost
                   if isinstance(r.get("boxes_supervised"), float)]
     if supervised:

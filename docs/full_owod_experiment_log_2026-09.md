@@ -206,6 +206,34 @@ assume them.
 
 ---
 
+## 2026-09-03 — the resume path is made fail-closed on lineage
+
+**Decision.** A task refuses to train unless the checkpoint it is about to
+fine-tune is the one the previous task wrote.
+
+**Reason.** Working through the pre-flight checklist for the seed-0 session
+surfaced a silent failure in the resume path that no test covered: restoring a
+finished task keeps the previous value of `checkpoint` when the file it wants
+has been pruned, so a chain could have continued *from the anchor* and reported
+`t1 -> t2 -> t3 -> t4` while having actually run `t1 -> t4`. Nothing in the
+output would have said so — the same class of invisible defect as Method V3's
+unrecorded supervision.
+
+**Evidence at the time.** None was needed; it is a control-flow reading of
+`owl/runner.py` plus the observation that `keep_checkpoints=2` prunes. Two new
+tests exercise both branches, and a third asserts the guard does not fire on a
+fresh chain.
+
+**Also recorded, same pass.** `prob_seed`, `replay_arm` and `replay_objects` are
+written into every trajectory's manifest entry, and the dry run's audit asserts
+them. The semantic dry-run stub now writes and reads through the real cache, so
+the row fingerprint that ties a feature matrix to its own population is
+exercised end to end rather than being the one thing the dry run skips.
+
+**Endpoints inspected?** None.
+
+---
+
 ## Entries to add before the supervisor meeting
 
 * the outcome of the seed-0 session, and whether any stopping rule fired;

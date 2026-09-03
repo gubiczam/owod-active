@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import shutil
 from dataclasses import fields
 from pathlib import Path
 
@@ -374,6 +375,50 @@ def test_the_row_prices_what_the_detector_received(tmp_path, small_index, small_
         assert row["training_iterations"] > 0
         assert row["images_opened"] >= row["images_trainable"] - row[
             "images_from_earlier_tasks"]
+        # what was bought and what PROB was handed are separate quantities
+        assert row["boxes_trained_on"] > 0
+        assert row["boxes_trained_on"] == (
+            row["boxes_trained_on_head"] + row["boxes_trained_on_medium"]
+            + row["boxes_trained_on_tail"]
+        )
+
+
+def test_what_prob_was_handed_matches_what_prob_would_keep(
+    tmp_path, small_index, small_config
+):
+    """The accounting is checked against PROB's own filter, not against itself.
+
+    ``remove_unknown_instances`` keeps ``category_id in range(0, prev + current)``
+    on a fine-tuning split. ``boxes_trained_on`` claims to be exactly that count
+    over the images handed to ``train``, so it is recomputed here from the
+    annotations on disk, the way the loader would.
+    """
+
+    from xml.etree import ElementTree
+
+    from owl.evaluation_subset import canonical_class_name
+    from tests.test_run_chain import prob_data_root
+
+    data_root = prob_data_root(tmp_path / "x", small_index)
+    results, bridge, _ = _run(tmp_path / "x", small_index, small_config, "random")
+    trains = [c for c in bridge.calls if c["verb"] == "train"]
+    chain = benchmark.chain()
+    for result, call, task in zip(results, trains, chain[1:], strict=True):
+        declared = set(protocol.CLASS_ORDER[: task.n_prev + task.n_new])
+        counted = 0
+        for image_id in call["images"]:
+            root = ElementTree.parse(
+                data_root / "Annotations" / f"{image_id}.xml"
+            ).getroot()
+            counted += sum(
+                1 for element in root.findall("object")
+                if canonical_class_name(element.findtext("name", "")) in declared
+            )
+        assert result.selection_row["boxes_trained_on"] == counted, (
+            f"{task.name}: the row says "
+            f"{result.selection_row['boxes_trained_on']} supervised boxes and "
+            f"PROB would keep {counted}"
+        )
 
 
 def test_an_object_bought_early_is_credited_to_the_task_that_can_learn_it(
@@ -472,3 +517,102 @@ def test_the_ledger_is_not_reachable_from_a_selector():
     cost = annotation_budget.cost_function({"i1": {"person": 3}})
     assert cost("i1") == 3
     assert cost("absent") == annotation_budget.ANSWER_FLOOR
+
+# -------------------------------------------- lineage across a broken session ---
+
+
+def test_a_session_that_died_mid_chain_resumes_onto_its_own_checkpoint(
+    tmp_path, small_index, small_config
+):
+    """The lineage check that only a *partial* resume can make.
+
+    A completed chain resumes by restoring every task and training nothing, so
+    it proves nothing about lineage. The dangerous case is a session that
+    finished t2 and died: t3 must fine-tune the t2 checkpoint that is on disk,
+    not restart from the anchor.
+    """
+
+    workspace = tmp_path / "broken"
+    first, _, _ = _run(tmp_path / "a", small_index, small_config, "random",
+                       workspace=workspace)
+    assert [r.task for r in first] == ["t2", "t3", "t4"]
+
+    # Drop t4 as though the session had died in it. t3's checkpoint is on disk —
+    # `keep_checkpoints` never prunes the newest, which is the invariant the
+    # resume depends on and the next test is about.
+    shutil.rmtree(workspace / "t4_random")
+    t3_checkpoint = workspace / "t3_random" / "checkpoint.pth"
+    assert t3_checkpoint.is_file()
+
+    again, bridge, _ = _run(tmp_path / "a", small_index, small_config, "random",
+                            workspace=workspace)
+    trains = [c for c in bridge.calls if c["verb"] == "train"]
+    assert len(trains) == 1, "only t4 should have retrained"
+    assert Path(trains[0]["previous"]) == t3_checkpoint, (
+        f"t4 resumed from {trains[0]['previous']} instead of t3's own checkpoint"
+    )
+    assert [r.task for r in again] == ["t2", "t3", "t4"]
+    # and the restored rows are identical to the ones originally written
+    assert [r.flat() for r in again[:2]] == [r.flat() for r in first[:2]]
+
+
+def test_a_lost_previous_checkpoint_stops_the_chain_instead_of_restarting_it(
+    tmp_path, small_index, small_config
+):
+    """A silent restart from the anchor would report a chain that never ran."""
+
+    workspace = tmp_path / "pruned"
+    _run(tmp_path / "a", small_index, small_config, "random", workspace=workspace)
+    shutil.rmtree(workspace / "t4_random")
+    (workspace / "t3_random" / "checkpoint.pth").unlink()
+
+    with pytest.raises(RuntimeError, match="break the checkpoint lineage"):
+        _run(tmp_path / "a", small_index, small_config, "random", workspace=workspace)
+
+
+def test_the_first_task_is_allowed_to_start_from_the_anchor(
+    tmp_path, small_index, small_config
+):
+    """The guard must not fire on a fresh chain."""
+
+    results, bridge, _ = _run(tmp_path / "fresh", small_index, small_config, "random")
+    trains = [c for c in bridge.calls if c["verb"] == "train"]
+    assert Path(trains[0]["previous"]).name == "t1.pth"
+    assert len(results) == 3
+
+
+# ---------------------------------------- isolation from the earlier methods ---
+
+
+def test_the_results_directory_is_not_any_earlier_experiments(tmp_path):
+    """Method V1, V2 and V3 results must be unreachable from this launcher."""
+
+    source = (Path(__file__).resolve().parent.parent / "tools"
+              / "run_full_owod_benchmark.py").read_text(encoding="utf-8")
+    for earlier in ("method_v3_selection_transfer", "method_v2", "replay_v3",
+                    "dinov2_vitb14_method_v2_v1", "dinov2_vitb14_stage2_views_v1"):
+        assert earlier not in source, earlier
+    notebook = (Path(__file__).resolve().parent.parent / "notebooks"
+                / "full_owod_active_benchmark_v1.ipynb").read_text(encoding="utf-8")
+    assert "results/full_owod_active_benchmark_v1" in notebook
+    for earlier in ("results/method_v3_selection_transfer", "results/method_v2"):
+        assert earlier not in notebook, earlier
+
+
+def test_the_only_frozen_artefact_reused_is_the_labelled_reference():
+    """Nothing recomputes a Method V2 export, and nothing overwrites one."""
+
+    notebook = (Path(__file__).resolve().parent.parent / "notebooks"
+                / "full_owod_active_benchmark_v1.ipynb").read_text(encoding="utf-8")
+    assert "ref_t1_dinov2_vitb14_cap1000_v1.npz" in notebook
+    # the two Stage-2 exports belong to Method V3 and are not touched here
+    assert "dinov2_vitb14_stage2_views_v1" not in notebook
+
+
+def test_the_manifest_records_the_seed_and_the_replay_policy(tmp_path):
+    source = (Path(__file__).resolve().parent.parent / "tools"
+              / "run_full_owod_benchmark.py").read_text(encoding="utf-8")
+    for field in ('"prob_seed": seed', '"replay_arm": bm.REPLAY_ARM',
+                  '"replay_objects": bm.REPLAY_OBJECTS',
+                  '"checkpoint_lineage"'):
+        assert field in source, field

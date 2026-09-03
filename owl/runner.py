@@ -407,6 +407,13 @@ def run_chain(
     #: further behind, and a discarded exemplar cannot be resurrected.
     previous_task_images: tuple[str, ...] = ()
     checkpoint = Path(start_checkpoint)
+    #: The checkpoint the next task to *run* must be fine-tuned from. It equals
+    #: the anchor before anything has run and the last completed task's own
+    #: output afterwards. It exists because the restore above falls back to
+    #: whatever ``checkpoint`` already held when a pruned file is missing, and a
+    #: chain that silently restarted a task from the anchor would report a
+    #: sequential result it never produced. See the guard below.
+    expected_start = Path(start_checkpoint)
     results: list[TaskResult] = []
     written: list[Path] = []
     previous_baseline: float | None = None
@@ -470,6 +477,9 @@ def run_chain(
             restored = Path(saved["checkpoint"])
             if restored.exists():
                 checkpoint = restored
+            # What the *next* task must start from, whether or not the file is
+            # still on disk. Checked below, once, at the point it matters.
+            expected_start = restored
             results.append(TaskResult(
                 task=task.name, new_class=task.new_class,
                 selection_row=saved["selection_row"],
@@ -479,6 +489,25 @@ def run_chain(
             ))
             print(f"  [{task.name}] already done; restored from {state_path.name}")
             continue
+
+        # ---- 0b. the lineage this task is about to extend -----------------
+        #
+        # ``t3`` must fine-tune ``t2``'s own checkpoint, and a resumed session is
+        # where that silently stops being true: the restore above keeps the
+        # previous value of ``checkpoint`` when the file it wants has been pruned,
+        # so the chain would quietly continue from the anchor and every later
+        # number would describe a shorter chain than the table claims. There is
+        # no honest way to recover here — the weights are gone — so it stops.
+        if checkpoint != expected_start:
+            raise RuntimeError(
+                f"{task.name} would train from {checkpoint}, but the task before "
+                f"it produced {expected_start}, which is no longer on disk. "
+                "Resuming would break the checkpoint lineage and report a "
+                "sequential chain that was never run. Either restore that file, "
+                f"or delete {task_dir.parent} and run the trajectory again.\n"
+                "If this happened with keep_checkpoints > 0, that is a bug: the "
+                "newest checkpoint is never supposed to be pruned."
+            )
 
         if time_budget_minutes is not None and elapsed >= time_budget_minutes:
             remaining = [t.name for t in chain[chain.index(task):]]
@@ -782,6 +811,8 @@ def run_chain(
             batch_size=config.batch_size,
         )
 
+        expected_start = Path(checkpoint)
+
         # ---- 7. score it ---------------------------------------------------
         metrics_path = bridge.evaluate(
             checkpoint=checkpoint, test_set=test_set,
@@ -839,6 +870,18 @@ def run_chain(
             candidate_index, opened, chain=chain,
             task_index=list(chain).index(task), groups=groups,
         )
+        # `boxes_supervised` prices what this task *bought*: declared boxes on
+        # the images it opened. What PROB is actually handed is a different set —
+        # the barren ones are dropped and images banked at earlier tasks rejoin —
+        # so the two are recorded separately rather than one standing in for the
+        # other. This is the number an AP difference has to be read against.
+        trained = annotation_budget.supervision(
+            candidate_index, trainable, declared=task.known_classes, groups=groups,
+        )
+        ledger_row["boxes_trained_on"] = trained["boxes_supervised"]
+        ledger_row["boxes_trained_on_head"] = trained["boxes_supervised_head"]
+        ledger_row["boxes_trained_on_medium"] = trained["boxes_supervised_medium"]
+        ledger_row["boxes_trained_on_tail"] = trained["boxes_supervised_tail"]
         result = TaskResult(
                 task=task.name, new_class=task.new_class,
                 selection_row={

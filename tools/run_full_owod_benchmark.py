@@ -55,9 +55,16 @@ def git_sha(path: Path) -> str:
 def synthetic_features(path, image_ids, boxes, jpeg_dir, **_):
     """Deterministic stand-in for the DINOv2 pass. ``--dry-run`` only.
 
-    Unit-norm, seeded on the rows it describes, so the traversal is exercised
+    Unit-norm and seeded on the rows it describes, so the traversal is exercised
     end to end and is reproducible — but it is noise, and a dry-run manifest
     says ``dry_run: true`` so its selections can never be read as results.
+
+    It goes through the real cache — :func:`owl.active_selection.semantic.write`
+    and ``read`` — rather than returning an array directly, so the dry run
+    exercises the fingerprint that ties a feature matrix to the exact population
+    it describes. That check is what stops one task's or one arm's geometry
+    deciding another's selection, and it should not be the one thing a dry run
+    skips.
     """
 
     import numpy as np
@@ -65,11 +72,13 @@ def synthetic_features(path, image_ids, boxes, jpeg_dir, **_):
     from owl.active_selection import semantic
 
     fingerprint = semantic.row_fingerprint(image_ids, boxes)
+    if Path(path).exists():
+        return semantic.read(path, fingerprint=fingerprint)
     generator = np.random.default_rng(int(fingerprint[:8], 16))
     features = generator.normal(size=(len(image_ids), 32)).astype(np.float32)
-    return features / np.maximum(
-        np.linalg.norm(features, axis=1, keepdims=True), 1e-9
-    )
+    features /= np.maximum(np.linalg.norm(features, axis=1, keepdims=True), 1e-9)
+    semantic.write(path, features, fingerprint, {"dry_run": True})
+    return semantic.read(path, fingerprint=fingerprint)
 
 
 def empty_reference(_path):
@@ -285,10 +294,20 @@ def main() -> None:
             complete = len(rows) == len(chain) - 1
             trajectories.append({
                 "trajectory": name, "arm": arm, "seed": seed,
+                # Recorded, not inferred. Method V3's audit had to read the
+                # launcher's source to discover that PROB's --seed had been left
+                # at 0 for all twelve of its trajectories; this row says what it
+                # was, for every trajectory, in the manifest itself.
+                "prob_seed": seed,
+                "replay_arm": bm.REPLAY_ARM,
+                "replay_objects": bm.REPLAY_OBJECTS,
                 "status": "COMPLETE" if complete else "INCOMPLETE",
                 "tasks": [row["task"] for row in rows],
                 "dry_run": bool(arguments.dry_run),
                 "known_mAP50_final": rows[-1].get("known_mAP50") if rows else None,
+                "checkpoint_lineage": [
+                    str(Path(row["task"]) / "checkpoint.pth") for row in rows
+                ],
             })
             print(f"[{name}] {'complete' if complete else 'INCOMPLETE'}: "
                   f"{len(rows)} of {len(chain) - 1} tasks, "

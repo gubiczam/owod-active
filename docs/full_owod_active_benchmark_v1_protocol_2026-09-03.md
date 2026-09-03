@@ -200,7 +200,17 @@ Recorded per arm, per task, always:
 `boxes_labelled`, `boxes_supervised`, `boxes_banked`, `supervised_share`,
 `images_barren`, `boxes_supervised_head/medium/tail`, `per_class_supervised`,
 `images_trainable`, `images_from_earlier_tasks`, `training_images`,
-`training_iterations`.
+`training_iterations`, `boxes_trained_on` and its head/medium/tail split.
+
+`boxes_supervised` and `boxes_trained_on` are **not** the same number and
+neither stands in for the other. The first prices what the task *bought*:
+declared boxes on the images it opened. The second is what PROB was actually
+handed — the barren images are dropped and images banked at earlier tasks
+rejoin at no cost — and it is the number an AP difference has to be read
+against. It is checked against PROB's own filter rather than against itself:
+`tests/test_full_benchmark_chain.py::test_what_prob_was_handed_matches_what_prob_would_keep`
+recomputes it from the annotations on disk the way `remove_unknown_instances`
+would.
 
 An image whose objects are all future-task classes yields no supervision now.
 It is **banked**, not lost: `reuse_deferred_labels` returns it at the task where
@@ -374,6 +384,21 @@ One workspace per `(arm, seed)`; checkpoints pruned to two per arm. Semantic
 features cached per task and keyed on a fingerprint of the exact rows they
 describe, so a different population cannot reuse another's geometry. Atomic
 JSON writes. A Colab disconnect costs the task in flight, not the session.
+
+**The lineage is fail-closed, not best-effort.** Restoring a finished task reads
+the checkpoint it produced; if that file is gone, the old code kept whatever
+`checkpoint` already held and the chain would have continued *from the anchor* —
+reporting a sequential result it never produced, with nothing in the output
+saying so. A task now refuses to train unless the checkpoint it is about to
+extend is the one the task before it wrote.
+`tests/test_full_benchmark_chain.py` covers both branches: a session dropped
+mid-chain resumes onto its own previous checkpoint, and a session whose previous
+checkpoint has been destroyed stops.
+
+**PROB's seed is recorded, not inferred.** Every trajectory's manifest entry
+carries `prob_seed`, `replay_arm` and `replay_objects`. Method V3's audit had to
+read the launcher's source to discover its `--seed` had been left at 0 for all
+twelve trajectories; that question is answerable from the manifest here.
 
 ## 12. Phase 2, priced but not run
 

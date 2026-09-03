@@ -156,14 +156,52 @@ def audit(results: Path) -> None:
             f"{task}: {len(entries)} trajectories produced {len(paths)} distinct "
             "checkpoints. Two arms shared one.")
 
+    # Every trajectory says which seed PROB was given, in the manifest itself.
+    # Method V3's audit had to read the launcher's source to find that out.
+    for entry in entries:
+        assert "prob_seed" in entry, entry["trajectory"]
+        assert entry["prob_seed"] == entry["seed"]
+        assert entry["replay_arm"] == "uniform"
+        assert entry["replay_objects"] == 400
+
+    # A coverage arm must carry its labelled reference forward, or it is a static
+    # ranking wearing a traversal's name.
+    import csv
+
+    for entry in entries:
+        directory = results / entry["trajectory"]
+        blocks = sorted(directory.glob("t*/coverage_reference.npz"))
+        with (directory / "results.csv").open(encoding="utf-8") as handle:
+            points = [
+                float(row["reference_points"])
+                for row in csv.DictReader(handle)
+                if row.get("reference_points") not in (None, "")
+            ]
+        if not points:
+            assert not blocks, (
+                f"{entry['trajectory']} stored semantic blocks but reports no "
+                "reference size")
+            continue
+        assert len(blocks) == len(TASKS), (entry["trajectory"], len(blocks))
+        assert points[0] == 0.0 and points[1] > 0 and points[2] > points[1], (
+            f"{entry['trajectory']} reference sizes {points} do not grow; the "
+            "traversal is not being told what it already bought")
+
     spread = max(answers) / max(min(answers), 1.0)
     assert spread < 1.05, (
         f"oracle answers differ by {spread:.3f}x across arms and tasks; the "
         "budget is supposed to be matched to within one image's cost.")
 
+    coverage_arms = [
+        e["arm"] for e in entries
+        if (results / e["trajectory"] / f"t2_{e['arm']}"
+            / "coverage_reference.npz").exists()
+    ]
     print(f"[audit] {len(entries)} trajectories x {len(TASKS)} tasks; lineage "
           f"sequential and per-arm; {len(checkpoints[TASKS[0]])} distinct "
-          f"checkpoints per task; answers matched to {spread:.4f}x")
+          f"checkpoints per task; answers matched to {spread:.4f}x; "
+          f"seed recorded per trajectory; coverage reference grows for "
+          f"{coverage_arms or 'no arm in this session'}")
 
 
 def main() -> None:
