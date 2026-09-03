@@ -31,6 +31,7 @@ import numpy as np
 
 from owl import clustering, labelling, metrics, proposals, protocol, replay, selection
 from owl import exemplars as exemplar_memory
+from owl.active_selection import budget as annotation_budget
 from owl.bridge import Bridge
 
 
@@ -46,6 +47,20 @@ class CycleConfig:
     proposals_per_image: int = 50        # PROB offers 100; the top 50 by its own
                                         # objectness order is what the frozen pool
                                         # keeps, and it halves the export's size
+
+    #: What one unit of ``budget_per_task`` is.
+    #:
+    #: ``regions``
+    #:     the historical unit. The selector's top ``budget_per_task`` proposals
+    #:     are bought, and whatever images they happen to sit on are opened.
+    #:     Every committed result before 2026-09-03 used it.
+    #: ``answers``
+    #:     one oracle answer, under full-image labelling:
+    #:     ``cost(image) = max(1, annotated objects on it)``. Benchmark V1's
+    #:     unit, because the region unit was measured to hand one arm 2.09x the
+    #:     supervision of another at identical nominal cost. Requires
+    #:     ``selector``; the additive score has no notion of what an image costs.
+    budget_unit: str = "regions"
 
     # --- the four experimental variables ----------------------------------
     arm: str = "prior_consult_batch"    # owl.selection.ARMS
@@ -113,8 +128,22 @@ class CycleConfig:
         "epochs", "learning_rate", "batch_size", "n_clusters", "seed",
     )
 
+    #: Result-affecting fields added *after* results were already committed. A
+    #: workspace stamped before a field existed cannot carry it, and
+    #: :func:`run_chain` counts an absent field as differing — correctly, since
+    #: absent means "written by code that meant something else". Refusing every
+    #: older workspace on that basis would strand the completed Replay-V3 chains
+    #: for no scientific gain, so a field listed here joins the fingerprint only
+    #: when it is set to something other than the value the older code implied.
+    LATER_ADDITIONS: tuple[tuple[str, object], ...] = (("budget_unit", "regions"),)
+
     def fingerprint(self) -> dict[str, object]:
-        return {name: getattr(self, name) for name in self.RESULT_AFFECTING}
+        row = {name: getattr(self, name) for name in self.RESULT_AFFECTING}
+        for name, legacy in self.LATER_ADDITIONS:
+            value = getattr(self, name)
+            if value != legacy:
+                row[name] = value
+        return row
 
 
 @dataclass
@@ -233,6 +262,7 @@ def run_chain(
     prepare_images: Callable[[Sequence[str]], Sequence[str]] | None = None,
     replay_index: Mapping[str, Mapping[str, int]] | None = None,
     replay_root: Path | None = None,
+    selector: Callable[..., object] | None = None,
 ) -> list[TaskResult]:
     """Run the task chain on the GPU, one checkpoint per task, resumable.
 
@@ -249,6 +279,16 @@ def run_chain(
     Every artefact is keyed by ``workspace / task / arm``, and the bridge skips
     any call whose output already exists — so a Colab session that is cut off
     resumes at the task it died on rather than at the beginning.
+
+    ``selector`` replaces the additive score with an arbitrary acquisition
+    function — Benchmark V1's five arms, which spend a budget counted in oracle
+    answers rather than in regions and therefore have to decide *which images to
+    open*, not which top-k proposals to take. It is called once per task with
+    the task's own fresh proposals and returns an object carrying ``images`` (the
+    ids it opened, in the order it opened them) and ``row`` (whatever it wants
+    recorded). When it is given, no k-means partition is fitted: none of those
+    arms consults one, and fitting 1,600 clusters over 50,000 proposals costs
+    minutes per task for a term weighted at zero.
 
     ``time_budget_minutes`` stops the chain cleanly before the runtime is lost
     and prints which tasks were not run. Nothing is silently truncated.
@@ -272,6 +312,22 @@ def run_chain(
     groups = protocol.load_groups()
     workspace = Path(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
+    if config.budget_unit not in ("regions", "answers"):
+        raise ValueError(
+            f"budget_unit={config.budget_unit!r}; expected 'regions' or 'answers'."
+        )
+    if config.budget_unit == "answers" and selector is None:
+        raise ValueError(
+            "budget_unit='answers' prices an *image*, and the additive score "
+            "ranks proposals with no notion of what opening one costs. Pass the "
+            "benchmark's `selector`, or use budget_unit='regions'."
+        )
+    if config.budget_unit == "regions" and selector is not None:
+        raise ValueError(
+            "A selector decides how much of the budget each image consumes, so "
+            "it cannot be run under budget_unit='regions', where the budget is "
+            "spent before any image is priced."
+        )
 
     # Resuming is keyed on files existing, which is fast and which silently makes
     # two different experiments into one. A smoke run and a real run share this
@@ -307,7 +363,10 @@ def run_chain(
             )
     stamp.write_text(json.dumps(config.fingerprint(), indent=2), encoding="utf-8")
 
-    arm = selection.ARMS[config.arm]
+    # Only the additive path resolves a registered ScoreConfig. A benchmark arm
+    # names a selector, not a config, and looking it up here would fail on the
+    # name before the chain started.
+    arm = selection.ARMS[config.arm] if selector is None else None
     replay_spec = dict(replay.ARMS[config.replay_arm])
     replay_spec.pop("selector", None)
     replay_budget = int(replay_spec["total"])
@@ -470,22 +529,37 @@ def run_chain(
         candidates = proposals.from_predict(export)
 
         # ---- 3. spend the budget ----------------------------------------
-        # Cluster once per task, not once per round. The partition depends only on
-        # the pool's geometry, which does not move while the budget is spent, and
-        # a k-means over 200,000 proposals costs minutes — at six rounds that is
-        # the difference between one evening and three.
-        task_partition = clustering.fit(
-            candidates.embeddings, method=arm.cluster_method,
-            n_clusters=config.n_clusters, seed=config.seed,
-        )
-        picked = selection.select(
-            candidates, arm,
-            budget=config.budget_per_task,
-            rounds=config.rounds_per_task,
-            n_known=task.n_prev,
-            partition=task_partition,
-        )
-        opened = [str(v) for v in picked.images(candidates)]
+        if selector is None:
+            # Cluster once per task, not once per round. The partition depends only
+            # on the pool's geometry, which does not move while the budget is spent,
+            # and a k-means over 200,000 proposals costs minutes — at six rounds
+            # that is the difference between one evening and three.
+            task_partition = clustering.fit(
+                candidates.embeddings, method=arm.cluster_method,
+                n_clusters=config.n_clusters, seed=config.seed,
+            )
+            picked = selection.select(
+                candidates, arm,
+                budget=config.budget_per_task,
+                rounds=config.rounds_per_task,
+                n_known=task.n_prev,
+                partition=task_partition,
+            )
+            opened = [str(v) for v in picked.images(candidates)]
+            acquired = {"asked": len(picked)}
+        else:
+            bought = selector(
+                candidates,
+                task=task,
+                task_dir=task_dir,
+                used_images=frozenset(used_images),
+                budget=config.budget_per_task,
+                seed=config.seed,
+            )
+            # Order matters: the arm opened them in this order and the ledger's
+            # cost is per image, so de-duplicating with a set would lose both.
+            opened = list(dict.fromkeys(str(v) for v in bought.images))
+            acquired = dict(bought.row)
         used_images.update(opened)
 
         # ---- 4. what the oracle's answers are worth ----------------------
@@ -752,16 +826,36 @@ def run_chain(
         # that bound is what makes the memory fixed-size.
         previous_task_images = tuple(trainable)
 
+        # What the oracle produced on the images this task opened, and what
+        # PROB will keep of it. Method V3 recorded neither and its two strongest
+        # arms turned out to have been trained on 972 and 2,027 supervised boxes
+        # for the same nominal budget — a 2.09x difference that no row in that
+        # experiment's output could have revealed. These are derived from the
+        # benchmark's own per-image counts *after* the budget was committed, so
+        # they cost nothing and no selector can see them.
+        ledger_row = annotation_budget.supervision(
+            candidate_index, opened, declared=task.known_classes, groups=groups,
+        ) | annotation_budget.acquisition(
+            candidate_index, opened, chain=chain,
+            task_index=list(chain).index(task), groups=groups,
+        )
         result = TaskResult(
                 task=task.name, new_class=task.new_class,
                 selection_row={
-                    "asked": len(picked),
+                    **acquired,
                     "images_opened": len(opened),
                     "images_trainable": len(trainable),
                     "images_no_supervision": barren,
                     "images_from_earlier_tasks": len(deferred),
                     "target_objects_in_images": found,
                     "images_with_target": with_target,
+                    # PROB drops the last partial batch, so this is what the
+                    # optimiser actually took. Equal supervision does not imply
+                    # equal steps and the difference has to be visible.
+                    "training_images": len(trainable) + len(replay_aliases),
+                    "training_iterations": ((len(trainable) + len(replay_aliases))
+                                            // max(config.batch_size, 1)) * config.epochs,
+                    **{k: v for k, v in ledger_row.items() if k not in acquired},
                 },
                 annotation_row={"policy": config.labelling_policy,
                                 "supervision": supervision},
