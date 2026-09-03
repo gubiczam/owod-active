@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -327,13 +328,110 @@ class Criterion:
             f"  (2) at least {self.minimum_improving_seeds} of {len(SEEDS)} paired "
             f"seed differences {self.treatment} - {self.control} are > 0\n"
             f"  (3) mean {self.guard_metric}({self.treatment}) >= "
-            f"mean {self.guard_metric}({self.control}) - {self.guard_tolerance:g}\n"
+            f"mean {self.guard_metric}({self.control}) - {self.guard_tolerance}\n"
             f"otherwise C_DOWNSTREAM_NOT_SUPPORTED"
         )
 
 
 #: The one criterion. Instantiated at import so it cannot be parameterised later.
 CRITERION = Criterion()
+
+#: Where the criterion is written down for a human. §11.0 of that document holds
+#: a machine-readable copy, and :func:`check_protocol_criterion` compares it.
+PROTOCOL_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "docs" / "method_v3_protocol_2026-09-02.md"
+)
+
+#: The fence the structured copy lives behind. A tagged fence rather than a bare
+#: ``json`` one so an unrelated JSON example in the document can never be picked
+#: up as the criterion.
+CRITERION_BLOCK = re.compile(r"^```json criterion\n(.*?)^```", re.DOTALL | re.MULTILINE)
+
+
+def parse_criterion_block(text: str) -> dict:
+    """The criterion as the protocol document declares it, as values.
+
+    Exactly one tagged block must be present. Returning parsed JSON rather than a
+    matched phrase is the whole point: the first version of this check searched
+    the document for ``f"{guard_tolerance:g} AP50 point"``, which renders ``1.0``
+    as ``1`` while the document says ``1.0`` — a correct, frozen criterion
+    reported as a mismatch, and an overnight run stopped before it trained
+    anything. Numbers are compared as numbers here, so a difference in rendering
+    cannot fail and a difference in value cannot pass.
+    """
+
+    found = CRITERION_BLOCK.findall(text)
+    if len(found) != 1:
+        raise MethodV3Error(
+            f"the protocol holds {len(found)} ```json criterion``` blocks, "
+            "expected exactly 1. The criterion must have one machine-readable "
+            "declaration, not zero and not two."
+        )
+    try:
+        payload = json.loads(found[0])
+    except json.JSONDecodeError as error:
+        raise MethodV3Error(
+            f"the protocol's criterion block is not valid JSON: {error}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise MethodV3Error(
+            f"the protocol's criterion block is a {type(payload).__name__}, "
+            "expected an object"
+        )
+    return payload
+
+
+def check_protocol_criterion(path: str | Path | None = None) -> dict:
+    """Fail closed unless the document and :data:`CRITERION` agree, value by value.
+
+    Compares the field *set* and each field's *value*. ``1`` and ``1.0`` are the
+    same number and are accepted as such; ``1.0`` and ``2.0`` are not, and neither
+    is a missing or an extra field. Wording, emphasis and number formatting in the
+    document's prose are deliberately not examined — they are for the reader.
+    """
+
+    path = PROTOCOL_PATH if path is None else Path(path)
+    if not Path(path).is_file():
+        raise MethodV3Error(f"the protocol document is missing: {path}")
+    text = Path(path).read_text(encoding="utf-8")
+
+    declared = parse_criterion_block(text)
+    frozen = asdict(CRITERION)
+
+    missing = sorted(set(frozen) - set(declared))
+    extra = sorted(set(declared) - set(frozen))
+    differing = {
+        name: (declared[name], frozen[name])
+        for name in sorted(set(frozen) & set(declared))
+        if declared[name] != frozen[name]
+    }
+    if missing or extra or differing:
+        lines = []
+        if missing:
+            lines.append(f"    not declared in the protocol: {missing}")
+        if extra:
+            lines.append(f"    declared but not a criterion field: {extra}")
+        for name, (there, here) in differing.items():
+            lines.append(f"    {name}: protocol {there!r}, owl.method_v3 {here!r}")
+        raise MethodV3Error(
+            f"{path} and owl.method_v3.CRITERION declare different criteria:\n"
+            + "\n".join(lines)
+            + "\n"
+            "This is a real disagreement about what counts as a success, not a "
+            "formatting difference — the two are compared as values. Decide which "
+            "is right and change both deliberately."
+        )
+
+    # The two verdict labels are format-free strings, so checking that the
+    # document names both of them costs nothing and catches a document that
+    # describes some other decision procedure entirely.
+    for label in ("C_DOWNSTREAM_POSITIVE", "C_DOWNSTREAM_NOT_SUPPORTED"):
+        if label not in text:
+            raise MethodV3Error(f"{path} never names the verdict {label!r}")
+
+    return {"protocol": str(path), "criterion": frozen,
+            "statement": CRITERION.statement()}
 
 
 @dataclass(frozen=True)

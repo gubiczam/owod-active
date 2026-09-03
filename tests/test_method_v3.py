@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -299,15 +300,160 @@ def test_criterion_matches_the_frozen_statement():
     assert criterion.guard_tolerance == 1.0
 
 
-def test_criterion_is_written_in_the_protocol_document():
-    text = (ROOT / "docs" / "method_v3_protocol_2026-09-02.md").read_text(
+def test_the_protocol_declares_the_criterion_as_the_same_values():
+    """Structured equality, which is the whole point of the block.
+
+    The previous version of this check searched the document for the rendered
+    phrase ``f"{guard_tolerance:g} AP50 point"``. That renders ``1.0`` as ``1``
+    while the document says ``1.0``, so a correct and frozen criterion was
+    reported as a documentation mismatch and stopped an overnight run before it
+    trained anything. Values, not wording.
+    """
+
+    report = method_v3.check_protocol_criterion()
+    assert report["criterion"] == asdict(method_v3.CRITERION)
+    assert Path(report["protocol"]) == method_v3.PROTOCOL_PATH
+
+
+def test_the_protocol_block_holds_exactly_the_frozen_numbers():
+    declared = method_v3.parse_criterion_block(
+        method_v3.PROTOCOL_PATH.read_text(encoding="utf-8"))
+    assert declared == {
+        "primary_metric": "mAP50_medium_tail",
+        "guard_metric": "known_mAP50",
+        "treatment": "A*C",
+        "control": "A",
+        "budget": 600,
+        "minimum_improving_seeds": 2,
+        "guard_tolerance": 1.0,
+    }
+
+
+def test_a_difference_in_number_formatting_does_not_fail_the_check(tmp_path):
+    """``1`` and ``1.0`` are the same number and must both be accepted."""
+
+    text = method_v3.PROTOCOL_PATH.read_text(encoding="utf-8")
+    rewritten = text.replace('"guard_tolerance": 1.0', '"guard_tolerance": 1')
+    assert rewritten != text
+    target = tmp_path / "protocol.md"
+    target.write_text(rewritten, encoding="utf-8")
+    report = method_v3.check_protocol_criterion(target)
+    assert report["criterion"]["guard_tolerance"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ('"guard_tolerance": 1.0', '"guard_tolerance": 2.0'),
+        ('"minimum_improving_seeds": 2', '"minimum_improving_seeds": 1'),
+        ('"budget": 600', '"budget": 300'),
+        ('"primary_metric": "mAP50_medium_tail"', '"primary_metric": "known_mAP50"'),
+        ('"treatment": "A*C"', '"treatment": "U"'),
+        ('"control": "A"', '"control": "random"'),
+        ('"guard_metric": "known_mAP50"', '"guard_metric": "mAP50_head"'),
+    ],
+)
+def test_a_difference_in_value_does_fail_the_check(tmp_path, before, after):
+    text = method_v3.PROTOCOL_PATH.read_text(encoding="utf-8")
+    assert text.count(before) >= 1
+    target = tmp_path / "protocol.md"
+    target.write_text(text.replace(before, after), encoding="utf-8")
+    with pytest.raises(method_v3.MethodV3Error, match="different criteria"):
+        method_v3.check_protocol_criterion(target)
+
+
+def test_a_dropped_or_added_criterion_field_fails_the_check(tmp_path):
+    text = method_v3.PROTOCOL_PATH.read_text(encoding="utf-8")
+    # A field with a trailing comma, so what is left is still valid JSON and the
+    # missing-field branch is what gets exercised rather than the parser.
+    dropped = tmp_path / "dropped.md"
+    dropped.write_text(
+        text.replace('  "minimum_improving_seeds": 2,\n', ""), encoding="utf-8")
+    with pytest.raises(method_v3.MethodV3Error, match="not declared in the protocol"):
+        method_v3.check_protocol_criterion(dropped)
+
+    added = tmp_path / "added.md"
+    added.write_text(
+        text.replace('"guard_tolerance": 1.0',
+                     '"guard_tolerance": 1.0,\n  "p_value": 0.05'),
         encoding="utf-8")
-    assert "C_DOWNSTREAM_POSITIVE" in text
-    assert "C_DOWNSTREAM_NOT_SUPPORTED" in text
-    assert method_v3.CRITERION.primary_metric in text
-    assert method_v3.CRITERION.guard_metric in text
-    assert "1.0 AP50 point" in text
-    assert "2 of the 3" in text
+    with pytest.raises(method_v3.MethodV3Error,
+                       match="declared but not a criterion field"):
+        method_v3.check_protocol_criterion(added)
+
+
+def test_the_known_retention_clause_cannot_be_dropped_from_the_protocol(tmp_path):
+    """Removing the guard is a change of criterion, not a wording change."""
+
+    text = method_v3.PROTOCOL_PATH.read_text(encoding="utf-8")
+    target = tmp_path / "protocol.md"
+    target.write_text(
+        text.replace('  "guard_metric": "known_mAP50",\n', ""), encoding="utf-8")
+    with pytest.raises(method_v3.MethodV3Error, match="guard_metric"):
+        method_v3.check_protocol_criterion(target)
+
+
+def test_a_missing_or_duplicated_block_fails_closed(tmp_path):
+    text = method_v3.PROTOCOL_PATH.read_text(encoding="utf-8")
+    block = method_v3.CRITERION_BLOCK.search(text)
+    assert block
+
+    absent = tmp_path / "absent.md"
+    absent.write_text(text.replace(block.group(0), ""), encoding="utf-8")
+    with pytest.raises(method_v3.MethodV3Error, match="holds 0"):
+        method_v3.check_protocol_criterion(absent)
+
+    twice = tmp_path / "twice.md"
+    twice.write_text(text + "\n" + block.group(0) + "\n", encoding="utf-8")
+    with pytest.raises(method_v3.MethodV3Error, match="holds 2"):
+        method_v3.check_protocol_criterion(twice)
+
+
+def test_a_malformed_block_fails_closed(tmp_path):
+    text = method_v3.PROTOCOL_PATH.read_text(encoding="utf-8")
+    target = tmp_path / "broken.md"
+    target.write_text(
+        text.replace('"guard_tolerance": 1.0', '"guard_tolerance": '),
+        encoding="utf-8")
+    with pytest.raises(method_v3.MethodV3Error, match="not valid JSON"):
+        method_v3.check_protocol_criterion(target)
+
+
+def test_a_missing_protocol_document_fails_closed(tmp_path):
+    with pytest.raises(method_v3.MethodV3Error, match="protocol document is missing"):
+        method_v3.check_protocol_criterion(tmp_path / "nope.md")
+
+
+def test_the_protocol_names_both_verdict_labels(tmp_path):
+    text = method_v3.PROTOCOL_PATH.read_text(encoding="utf-8")
+    target = tmp_path / "protocol.md"
+    target.write_text(
+        text.replace("C_DOWNSTREAM_NOT_SUPPORTED", "SOMETHING_ELSE"),
+        encoding="utf-8")
+    with pytest.raises(method_v3.MethodV3Error, match="never names the verdict"):
+        method_v3.check_protocol_criterion(target)
+
+
+def test_the_protocol_prose_does_not_contradict_the_block():
+    """The block is authoritative, but the reader must not be told otherwise.
+
+    Checked tolerantly on purpose: a value may appear as ``1`` or ``1.0`` or
+    ``1.00`` and all of those are the same number. What is rejected is prose that
+    states a *different* number from the block.
+    """
+
+    text = method_v3.PROTOCOL_PATH.read_text(encoding="utf-8")
+    section = text[text.index("## 11."):text.index("## 12.")]
+    declared = method_v3.parse_criterion_block(text)
+
+    for field in ("guard_tolerance", "minimum_improving_seeds", "budget"):
+        value = declared[field]
+        renderings = {f"{value:g}", str(value), f"{float(value):.1f}",
+                      str(int(value)) if float(value).is_integer() else str(value)}
+        assert any(rendering in section for rendering in renderings), (
+            field, value, sorted(renderings))
+    for field in ("primary_metric", "guard_metric", "treatment", "control"):
+        assert declared[field] in section, field
 
 
 def test_all_three_clauses_pass_gives_positive():

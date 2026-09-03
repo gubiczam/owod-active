@@ -275,7 +275,7 @@ def main() -> None:
           f"± {detail['primary_sd_treatment']:.3f}")
     print(f"  guard {method_v3.CRITERION.guard_metric} delta "
           f"{detail['guard_delta']:+.3f} "
-          f"(tolerance {method_v3.CRITERION.guard_tolerance:g})")
+          f"(tolerance {method_v3.CRITERION.guard_tolerance})")
     print()
     print("=" * 78)
     print(verdict.label)

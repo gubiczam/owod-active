@@ -377,6 +377,41 @@ inherited convention.
 Which clause failed is printed with the verdict. A failure of (3) alone still
 yields `C_DOWNSTREAM_NOT_SUPPORTED`; it is not reinterpreted.
 
+**Numbers appear twice in §11 — in the prose above and in the block of §11.0 —
+and the two are kept in step by a test**, which reads every value out of the
+block and requires the prose to state the same number in some standard rendering.
+The block is authoritative; the prose may not disagree with it.
+
+### 11.0 The criterion, machine-readable
+
+This block is the document's copy of the criterion, and it is the **only** part
+of §11 that is checked against the code. `owl.method_v3.check_protocol_criterion`
+parses it and compares it **field by field, as values** against
+`owl.method_v3.CRITERION`; the notebook calls that function before the training
+launcher and refuses to run if the two disagree.
+
+It is here because the first attempt validated the criterion by searching this
+document for a rendered phrase, and `f"{1.0:g}"` renders `1.0` as `1` — so a
+correct, frozen criterion was reported as a documentation mismatch and the
+overnight run stopped before training. A number compared as a number cannot fail
+that way. The prose of §11 is for the reader; this block is for the machine.
+
+<!-- METHOD-V3-CRITERION: parsed by owl.method_v3.parse_criterion_block. Keep the
+     fence tag `json criterion` exactly; edit only with a deliberate, documented
+     change to owl.method_v3.CRITERION. -->
+
+```json criterion
+{
+  "primary_metric": "mAP50_medium_tail",
+  "guard_metric": "known_mAP50",
+  "treatment": "A*C",
+  "control": "A",
+  "budget": 600,
+  "minimum_improving_seeds": 2,
+  "guard_tolerance": 1.0
+}
+```
+
 **With three seeds this is a descriptive criterion, not a significance test.**
 Individual seed values, the mean, the standard deviation and the three paired
 differences are all printed. No p-value is claimed. A bootstrap interval, if

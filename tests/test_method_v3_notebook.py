@@ -52,6 +52,24 @@ def markdown(notebook):
     )
 
 
+def executable_source(cell: str) -> str:
+    """The cell with its comments removed, for bans that are about code.
+
+    A ban on ``:g}`` has to be a ban on *formatting a value*, not on a comment
+    explaining why that formatting was a bug — otherwise the note that documents
+    the fix trips the test that enforces it.
+    """
+
+    import io
+    import tokenize
+
+    kept = []
+    for token in tokenize.generate_tokens(io.StringIO(cell).readline):
+        if token.type != tokenize.COMMENT:
+            kept.append(token.string)
+    return "\n".join(kept)
+
+
 def quotes(text: str) -> str:
     """Compare source text without caring which quote character was used.
 
@@ -179,8 +197,49 @@ def test_the_criterion_is_printed_before_the_training_launcher(code_cells):
     cell = code_cells[criterion]
     assert "method_v3.CRITERION.statement()" in cell
     assert "FROZEN CRITERION" in cell
-    assert "method_v3_protocol_2026-09-02.md" in cell
-    assert "assert _needle in _protocol_text" in cell
+
+
+def test_the_protocol_is_checked_structurally_not_by_prose_matching(code_cells):
+    """The regression that stopped an overnight run before it trained anything.
+
+    The notebook used to search the protocol document for
+    ``f"{guard_tolerance:g} AP50 point"``. ``f"{1.0:g}"`` is ``"1"`` and the
+    document says ``"1.0"``, so a correct, frozen criterion failed a
+    documentation check. The notebook must delegate to
+    ``owl.method_v3.check_protocol_criterion``, which compares values.
+    """
+
+    cell = code_cells[index_of(code_cells, "CRITERION_STATEMENT")]
+    assert "method_v3.check_protocol_criterion()" in cell
+    assert "_protocol_text" not in cell
+    assert "read_text" not in cell
+
+
+def test_no_cell_searches_a_document_for_a_formatted_criterion_value(code_cells):
+    """Bans the whole class, not just the one phrase that failed.
+
+    Two things are forbidden anywhere in the notebook: formatting a criterion
+    field into a string with a format spec (``:g`` silently drops ``.0``), and
+    substring-searching a document for a value that came out of the module.
+    """
+
+    joined = "\n".join(executable_source(source) for source in code_cells)
+    for banned in (":g}", ":.1f}", ":.2f}",
+                   "AP50 point", "of the 3", "of the 2"):
+        assert banned not in joined, banned
+    for field in method_v3.CRITERION.__dataclass_fields__:
+        assert f"CRITERION.{field}:" not in joined, field
+    assert "_protocol_text" not in joined
+    assert "_needle" not in joined
+
+
+def test_the_notebook_never_hardcodes_the_criterion_values(code_cells):
+    """No criterion field name or number may be typed into the notebook at all."""
+
+    joined = "\n".join(executable_source(source) for source in code_cells)
+    for value in ("mAP50_medium_tail", "known_mAP50 tolerance",
+                  "guard_tolerance", "minimum_improving_seeds"):
+        assert value not in joined, value
 
 
 def test_the_summariser_runs_after_the_launcher_and_exactly_once(code_cells):
