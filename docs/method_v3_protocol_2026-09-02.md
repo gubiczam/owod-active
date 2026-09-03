@@ -89,8 +89,13 @@ draws without replacement, which gives nested prefixes as well.
 
 **Consequence, stated in advance (2) — what the three seeds vary.** For the same
 reason, `A`, `U` and `A*C` select the **identical 600 regions at every seed**.
-The seed still changes two things: the exemplar draw inside the fixed `uniform`
-allocation, and PROB's own `--seed`. So for those arms the three paired
+The seed still changes the exemplar draw inside the fixed `uniform` allocation.
+(It does **not** change PROB's own `--seed`: `owl.bridge.Bridge.seed` defaults to
+0 and the launcher never overrides it, so PROB was seeded 0 in all twelve
+trajectories. Measured in
+[`docs/method_v3_posthoc_audit_2026-09-03.md`](method_v3_posthoc_audit_2026-09-03.md)
+§2.1, after the run; this sentence originally claimed both.) So for those arms
+the three paired
 differences measure **training and replay-draw noise on two fixed selections**,
 not selection variance. This is stated here, printed by the summariser, and it is
 not a flaw — a paired design that holds the selection fixed is the cleaner way to
