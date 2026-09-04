@@ -234,6 +234,135 @@ exercised end to end rather than being the one thing the dry run skips.
 
 ---
 
+## 2026-09-04 — seed-0, four arms, the real chain. Proposed-v1 fails downstream
+
+**Result, as reported.** Development seed only; no statistical claim is made
+from it.
+
+| | random | admissibility | proposed-v1 | entropy |
+|---|---:|---:|---:|---:|
+| final `known_mAP50` | **50.13** | 48.34 | 44.89 | 48.03 |
+| final `mAP50_tail` | 36.83 | **48.53** | 37.20 | 47.11 |
+| mean `new_class_AP50` | 2.40 | 7.12 | **0.00** | **7.31** |
+| mean `U_Recall` | 15.34 | 15.47 | **18.05** | 16.98 |
+
+Primary contrast, proposed-v1 vs admissibility at t4: `known_mAP50` **-3.46**,
+`mAP50_tail` **-11.33**, mean `new_class_AP50` **-7.12**, mean `U_Recall`
+**+2.58**.
+
+**Reading, and what is *not* independent evidence.** `bear` receives no new
+boxes for any arm, so the tail band's movement at t4 is entirely `fire hydrant`
+and `stop sign` — the t3 and t4 new classes. `mAP50_tail` and
+`new_class_AP50` are therefore the *same fact* reported twice, and their
+ordering is identical across all four arms. The long-tail endpoint behaved
+exactly as section 1 of the protocol predicted it would; proposed-v1 fails it.
+
+**Mechanism, stated as a hypothesis with its evidence.** `new_class_AP50` is
+**0.00**, not small — an acquisition failure, not an optimisation one. At the
+same time proposed-v1 has the *best* `U_Recall` of any arm. It bought breadth
+and no depth, which is what farthest-first is for: once a semantic region is
+covered the traversal moves away from it, so **per-class multiplicity is capped
+by construction**. Learning one class needs tens of instances of that one
+class. The objective is misaligned with the endpoint, and no value of any
+parameter fixes that, because there is no parameter.
+
+A second, sharper form of the same hypothesis: the reference contains REF-T1,
+which is 19 head classes of street and animal content. `traffic light`,
+`fire hydrant` and `stop sign` occur *only* in street scenes, i.e. exactly the
+images that most resemble the labelled reference — so coverage-against-labelled
+-data systematically avoids the images holding the class we are trying to learn.
+This is consistent with proposed-v1's `known_mAP50` also being the lowest of the
+four: it spent its annotation where PROB had least to gain.
+
+**Endpoints inspected?** Yes. Everything below this line is
+development-seed-informed and must be labelled as such.
+
+---
+
+## 2026-09-04 — candidate-side measurements taken before designing v2
+
+CPU, on the committed frozen pool, no detector, no endpoint:
+
+| candidate set | rows | background | distinct declared-class objects |
+|---|---:|---:|---:|
+| `P_nms` (all arms) | 63 997 | 0.879 | 55 |
+| `G` = top 30% by `A` | 19 199 | 0.799 | 28 |
+| `G` then top 30% by `U` | 5 760 | **0.602** | 18 |
+| top-k by `U` with **no** gate | 5 760 | 0.714 | **6** |
+
+Two things follow, both needed before choosing a v2:
+
+1. **The `A` gate is not the fault.** Dropping it and selecting by uncertainty
+   alone reaches 6 distinct declared-class objects against 18 for gate-then-`U`.
+   Gate-off is *worse* at reaching the class we must learn.
+2. **`A` then `U` enriches what v1 starved.** Background falls 0.799 -> 0.602,
+   declared-class objects per candidate rise **2.1x** and distinct unknown
+   objects per candidate **1.6x**, at 30% of the rows.
+
+**Endpoints inspected?** No detector endpoint. These are oracle counts over an
+already-committed pool, computed after the seed-0 result was known and used to
+choose between candidate designs — which is development, and is why the entry
+exists.
+
+---
+
+## 2026-09-04 — the coreset ablation's reading is fixed before it runs
+
+`coreset` is the pre-declared ungated k-center control. Its result decides which
+of three explanations of proposed-v1's failure is right, and the mapping is
+written down **now** so it cannot be chosen afterwards:
+
+* **(B) the coverage objective** — `new_class_AP50` <= 1, `U_Recall` >= ~18,
+  `known_mAP50` <= 44.89, `mAP50_tail` ~ 37. Coverage caps multiplicity with or
+  without the gate.
+* **(A) the `A` gate** — `new_class_AP50` >= 3.5 and `mAP50_tail` >= 45. Removing
+  the gate recovers new-class learning.
+* **(C) their interaction** — `new_class_AP50` strictly between 1 and 3.5.
+
+Predicted before running: **(B)**, on the candidate-side measurement above and
+on the structural argument. If (A) instead, the v2 below is wrong and the gate
+share is what to revisit.
+
+---
+
+## 2026-09-04 — Proposed-v2, designed after seeing seed-0 v1. NOT pre-registered
+
+**Awaiting approval; not run.** Recorded here before any GPU time so that the
+order of events is on the record: the seed-0 v1 endpoints *were* inspected
+before this design existed, and it must be reported as `Proposed-v2
+(development-seed-informed)`, never as pre-registered.
+
+**One idea: demote DINOv2 from novelty objective to redundancy remover.**
+
+1. population `P_nms` — unchanged;
+2. admissibility gate, top **0.30** by `A` — unchanged;
+3. **new:** informativeness filter, top **0.30** by normalised Shannon entropy
+   `U` *within* the gate. The share reuses the already-frozen
+   `ADMISSIBLE_SHARE`; no new constant is introduced;
+4. **changed:** farthest-first traversal inside that subset, with the reference
+   holding **only what this trajectory has itself bought** — empty at t2,
+   growing with every opened image and carrying across tasks. REF-T1 is
+   dropped;
+5. everything else identical: cost rule, 3 000 answers, `uniform` M=400,
+   5 epochs, shared split, chain, seeds.
+
+**New hyperparameters: zero.**
+
+**Why each part, against frozen evidence.** `D_NO_GO` already established that
+DINOv2 distance to REF-T1 is not a usable novelty signal, so v2 stops using it
+as one; `U` takes over the "not explained by a known class" role, from the
+detector rather than from the backbone. `A` stays because the measurement above
+shows removing it is worse. Coverage stays, in the role it is measured to be
+good at — telling near-duplicates apart among real object-like candidates —
+rather than as the thing being maximised.
+
+**Kill rule, fixed now.** If v2's seed-0 mean `new_class_AP50` < 3.56 (half of
+admissibility's 7.12) **or** its final `known_mAP50` < 44.89 (v1's), v2 is a
+negative result: seeds 1 and 2 are **not** spent on it, the result is preserved,
+and the supervisor material is built on the strongest baseline.
+
+---
+
 ## Entries to add before the supervisor meeting
 
 * the outcome of the seed-0 session, and whether any stopping rule fired;

@@ -616,3 +616,87 @@ def test_the_manifest_records_the_seed_and_the_replay_policy(tmp_path):
                   '"replay_objects": bm.REPLAY_OBJECTS',
                   '"checkpoint_lineage"'):
         assert field in source, field
+
+
+# ------------------------------------------- recovering a column after the fact ---
+
+
+def _fake_results(root: Path, arm: str, index: dict) -> Path:
+    """A results tree shaped like a completed trajectory, ids files included."""
+
+    trajectory = f"{arm}__seed0"
+    images = sorted(index)
+    for offset, task in enumerate(benchmark.chain()[1:]):
+        train = root / trajectory / f"{task.name}_{arm}" / "train"
+        train.mkdir(parents=True, exist_ok=True)
+        handed = images[offset : offset + 2]
+        (train / "labelled_ids.txt").write_text("\n".join(handed) + "\n", encoding="utf-8")
+        (train / "replay_ids.txt").write_text("alias-1\nalias-2\n", encoding="utf-8")
+    benchmark.write_json(root / "manifest.json", {
+        "trajectories": [
+            {"trajectory": trajectory, "arm": arm, "seed": 0, "status": "COMPLETE"}
+        ],
+    })
+    return root
+
+
+def test_boxes_trained_on_is_recoverable_from_the_id_files(tmp_path, monkeypatch):
+    """Session 1 ran before the column existed; the number is not lost."""
+
+    from tools import backfill_boxes_trained_on as backfill
+
+    index = {
+        "000000000001": {"person": 3, "traffic light": 2, "banana": 4},
+        "000000000002": {"car": 1, "fire hydrant": 2},
+        "000000000003": {"bear": 1, "stop sign": 5},
+        "000000000004": {"banana": 7},
+    }
+    results = _fake_results(tmp_path / "results", "random", index)
+    monkeypatch.setattr(backfill, "CANDIDATE_INDEX", tmp_path / "index.json")
+    (tmp_path / "index.json").write_text(json.dumps(index), encoding="utf-8")
+
+    manifest = json.loads((results / "manifest.json").read_text(encoding="utf-8"))
+    rows = backfill.rows_for(
+        results, manifest["trajectories"][0], index, protocol.load_groups()
+    )
+    assert [r["task"] for r in rows] == ["t2", "t3", "t4"]
+
+    # t2 is handed images 1 and 2; `traffic light` is declared, `fire hydrant`
+    # is not yet, and `banana` never is in this chain.
+    t2 = rows[0]
+    assert t2["boxes_trained_on"] == 3 + 2 + 1        # person, traffic light, car
+    assert t2["boxes_dropped_as_undeclared"] == 4 + 2  # banana, fire hydrant
+    assert t2["boxes_on_those_images_total"] == 12
+    assert t2["replay_alias_images"] == 2
+    assert t2["images_handed_to_prob"] == 2
+
+    # t3 is handed images 2 and 3. `fire hydrant` is declared now and counts;
+    # `stop sign` is not declared until t4, so its five boxes are dropped here
+    # and appear only in t4's count. That the same image yields a different
+    # supervised total at two tasks is the whole point of the column.
+    t3, t4 = rows[1], rows[2]
+    assert t3["boxes_trained_on"] == 1 + 2 + 1          # car, hydrant, bear
+    assert t3["boxes_dropped_as_undeclared"] == 5       # the stop signs
+    assert t3["boxes_trained_on_tail"] == 1 + 2         # bear, fire hydrant
+
+    # t4 is handed images 3 and 4; now the stop signs count.
+    assert t4["boxes_trained_on"] == 1 + 5              # bear, stop sign
+    assert t4["boxes_dropped_as_undeclared"] == 7       # the bananas
+    assert t4["boxes_trained_on_tail"] == 1 + 5
+
+
+def test_the_backfill_refuses_to_write_into_the_results_it_reads(tmp_path):
+    """A tool that recomputes a measurement must not be able to overwrite it."""
+
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable,
+         str(Path(__file__).resolve().parent.parent / "tools"
+             / "backfill_boxes_trained_on.py"),
+         "--results", str(tmp_path), "--out", str(tmp_path)],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0
+    assert "must not be the results directory" in result.stdout + result.stderr

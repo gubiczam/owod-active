@@ -157,6 +157,15 @@ class FakeBridge:
         output_checkpoint = Path(output_checkpoint)
         output_checkpoint.parent.mkdir(parents=True, exist_ok=True)
         Path(output_dir).mkdir(parents=True, exist_ok=True)
+        # The real bridge writes the id files it passes to PROB, and they are
+        # the record every later audit reads — what was actually handed to the
+        # detector, as opposed to what a row says was bought. A stub that skips
+        # them makes the dry run unable to prove that record exists.
+        (Path(output_dir) / "labelled_ids.txt").write_text(
+            "\n".join(str(value) for value in labelled_ids) + "\n", encoding="utf-8")
+        if len(replay_ids):
+            (Path(output_dir) / "replay_ids.txt").write_text(
+                "\n".join(str(value) for value in replay_ids) + "\n", encoding="utf-8")
         output_checkpoint.write_bytes(b"fake checkpoint")
         output_checkpoint.with_suffix(".train.json").write_text(json.dumps({
             "previous_checkpoint": str(previous_checkpoint),
