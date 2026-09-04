@@ -18,6 +18,7 @@ identity of the rows it describes, so a resumed session does not pay again and a
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 from collections.abc import Sequence
@@ -50,6 +51,45 @@ def row_fingerprint(image_ids: np.ndarray, boxes: np.ndarray) -> str:
     digest.update(image_ids.tobytes())
     digest.update(boxes.tobytes())
     return digest.hexdigest()
+
+
+def release(*, device: str = "cuda") -> dict[str, object]:
+    """Give the GPU back before PROB asks for it.
+
+    The ungated ``coreset`` attempt died of CUDA OOM. Two allocators want the
+    same card in the same process: DINOv2 embeds a task's crops, then PROB
+    fine-tunes a Deformable-DETR on it. Dropping the Python reference to the
+    backbone is not enough — PyTorch's caching allocator keeps the blocks
+    reserved, so the next allocation sees a card that is already full.
+
+    So the cache is returned explicitly, between the two, every task. This is
+    **memory management only**: no tensor that any result depends on exists at
+    this point, and nothing here can change a selection, a box or a metric.
+
+    Safe to call with no torch installed and with no CUDA device, which is what
+    the laptop tests and the dry run do.
+    """
+
+    report: dict[str, object] = {"gc_collected": gc.collect()}
+    try:
+        import torch
+    except ImportError:
+        return report | {"torch": False}
+    report["torch"] = True
+    if not torch.cuda.is_available():
+        return report | {"cuda": False}
+    reserved_before = int(torch.cuda.memory_reserved())
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    # Releases blocks shared with other processes; a no-op when there are none.
+    torch.cuda.ipc_collect()
+    return report | {
+        "cuda": True,
+        "device": device,
+        "reserved_before_bytes": reserved_before,
+        "reserved_after_bytes": int(torch.cuda.memory_reserved()),
+        "freed_bytes": reserved_before - int(torch.cuda.memory_reserved()),
+    }
 
 
 def load_backbone(device: str = "cuda"):
@@ -203,10 +243,20 @@ def cached(
     if path.exists():
         return read(path, fingerprint=fingerprint)
     model = model_factory(device)
-    features = embed(
-        image_ids, boxes, jpeg_dir,
-        model=model, device=device, batch_size=batch_size, label=label,
-    )
+    try:
+        features = embed(
+            image_ids, boxes, jpeg_dir,
+            model=model, device=device, batch_size=batch_size, label=label,
+        )
+    finally:
+        # Before PROB, not after the trajectory: the backbone and the allocator's
+        # cache are handed back here, in a `finally` so a failed pass does not
+        # leave a full card behind either. See `release`.
+        model = None
+        freed = release(device=device)
+        if freed.get("cuda"):
+            print(f"  [{label}] released the backbone; "
+                  f"{freed['freed_bytes'] / 1e9:.2f} GB of CUDA cache returned")
     write(path, features, fingerprint, {
         "rows": int(features.shape[0]),
         "images": len(set(np.asarray(image_ids, dtype=str).tolist())),

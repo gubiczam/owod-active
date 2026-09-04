@@ -71,7 +71,11 @@ Five, in the pre-declared execution order
    unknown objects against admissibility's 150) and kept anyway.
 5. **`coreset`** — the same traversal as `proposed` with the gate **off**, over
    the whole deduplicated pool. The recognisable core-set baseline and the
-   one-variable ablation of the gate.
+   one-variable ablation of the gate. **Attempted at seed 0 and incomplete:
+   CUDA OOM, no detector endpoint reported.** The gate is therefore **not**
+   causally ruled out as a cause of Proposed-v1's failure.
+6. **`proposed_v2`** — appended 2026-09-04, **development-seed-informed and not
+   pre-registered**. Section 3.1.
 
 **Raw objectness does not get a trajectory, and here is the measurement.** On
 the committed pool, raw `objectness` and `A` have Spearman rank correlation
@@ -332,7 +336,8 @@ the numbers arrive:
 * **long-tail**: `mAP50_tail` at every task, with the band's membership named;
 * **acquisition** (detector-free, so available even if a trajectory fails):
   `acquired_classes`;
-* **gate ablation**: `proposed` vs `coreset`;
+* **gate ablation**: `proposed` vs `coreset` — **not available**; the coreset
+  seed-0 run terminated with CUDA OOM and reported no endpoint;
 * **reference**: `random`.
 
 ## 9. Stopping rules, fixed in advance
@@ -443,7 +448,14 @@ contract.
   "seeds": [0, 1, 2],
   "nms_iou": 0.6,
   "admissible_share": 0.3,
-  "arms": ["random", "admissibility", "proposed", "entropy", "coreset"],
+  "arms": ["random", "admissibility", "proposed", "entropy", "coreset", "proposed_v2"],
+  "development_seed_informed": ["proposed_v2"],
+  "kill_rule": {
+    "arm": "proposed_v2",
+    "seed": 0,
+    "minimum_mean_new_class_ap50": 3.56,
+    "minimum_final_known_map50": 44.89
+  },
   "endpoints": {
     "primary_contrast": ["proposed", "admissibility"],
     "primary_task": "t4",

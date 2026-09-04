@@ -44,19 +44,34 @@ class Coverage:
 
     images: tuple[str, ...]
     anchors: tuple[int, ...]          # the candidate position that opened each image
-    distances: tuple[float, ...]      # its min-distance to the reference when taken
+    #: Its min-distance to the reference when taken, or ``None`` when there was
+    #: no reference yet to measure against. ``None``, not infinity: an empty
+    #: reference means the quantity is undefined, and ``inf`` is not
+    #: representable in strict JSON — it would reach the manifest and the CSV as
+    #: a value some readers reject and every mean silently absorbs. Only the
+    #: first pick of a trajectory-scoped arm can be ``None``, and only at t2.
+    distances: tuple[float | None, ...]
     ledger: Ledger
     reference_size: int
     covered: np.ndarray               # (n,) bool, candidates on opened images
     diagnostics: dict
 
     def summary(self) -> dict[str, object]:
-        taken = np.asarray(self.distances, dtype=np.float64)
+        def show(value: float | None) -> float | None:
+            return None if value is None else round(float(value), 4)
+
+        measured = [value for value in self.distances if value is not None]
         return self.ledger.summary() | {
             "reference_points": self.reference_size,
-            "coverage_first_pick_distance": round(float(taken[0]), 4) if taken.size else None,
-            "coverage_last_pick_distance": round(float(taken[-1]), 4) if taken.size else None,
-            "coverage_mean_pick_distance": round(float(taken.mean()), 4) if taken.size else None,
+            "coverage_first_pick_distance": (
+                show(self.distances[0]) if self.distances else None),
+            "coverage_last_pick_distance": (
+                show(self.distances[-1]) if self.distances else None),
+            "coverage_mean_pick_distance": (
+                round(float(np.mean(measured)), 4) if measured else None),
+            #: Picks taken with nothing to measure against. Non-zero only for a
+            #: trajectory-scoped arm at its first task, where it is exactly 1.
+            "coverage_picks_without_reference": len(self.distances) - len(measured),
             "candidates_covered": int(self.covered.sum()),
         }
 
@@ -96,10 +111,16 @@ def kcenter_greedy(
     is still credited for every candidate on an opened image, gated or not,
     because the annotator labelled them.
 
-    ``tie_break`` decides between equally distant candidates; higher wins. It
-    matters at the very first pick, where an empty reference makes every
-    distance infinite. Passing admissibility makes that first pick the most
-    object-like region rather than row zero.
+    ``tie_break`` decides between equally distant candidates; higher wins.
+
+    **The first-point rule, stated rather than inherited.** With an empty
+    reference every distance is ``+inf``, so the lexicographic order falls
+    through to ``tie_break`` descending and then to the lowest stable position.
+    Passing admissibility therefore makes the first pick **the most object-like
+    candidate in the subset, ties broken by lowest index** — deterministic, and
+    not an accident of how ``lexsort`` happens to treat equal keys. Proposed-v2
+    is the first arm to exercise it, because it is the first whose reference is
+    empty at t2; ``proposed`` and ``coreset`` start from REF-T1 and never do.
     """
 
     features = np.asarray(features, dtype=np.float32)
@@ -139,7 +160,7 @@ def kcenter_greedy(
     covered = np.zeros(n, dtype=bool)
     images: list[str] = []
     anchors: list[int] = []
-    taken: list[float] = []
+    taken: list[float | None] = []
     stopped = "pool exhausted"
 
     while True:
@@ -156,7 +177,11 @@ def kcenter_greedy(
         ledger.charge(image, cost)
         images.append(image)
         anchors.append(best)
-        taken.append(float(distance[best]))
+        # An empty reference makes every distance infinite, so the quantity is
+        # undefined rather than large. Recorded as None; see `distances`.
+        taken.append(
+            float(distance[best]) if np.isfinite(distance[best]) else None
+        )
 
         group = members[image]
         covered[group] = True

@@ -337,6 +337,27 @@ def main() -> None:
     print(runner.table(efficiency, digits=arguments.digits))
     write_csv(out / "annotation_efficiency.csv", efficiency)
 
+    # ---- the frozen kill rule, applied mechanically ----------------------
+    kill: dict[str, object] | None = None
+    rule = manifest.get("kill_rule") or bm.KILL_RULE.as_dict()
+    for entry in order:
+        if entry["arm"] != rule["arm"] or entry["seed"] != rule["seed"]:
+            continue
+        rows = loaded[entry["trajectory"]]
+        kill = bm.KILL_RULE.decide(
+            mean([r.get("new_class_AP50") for r in rows]),
+            rows[-1].get("known_mAP50") if rows else None,
+        )
+        print(f"\n[kill rule] {manifest.get('kill_rule_statement') or bm.KILL_RULE.statement()}")
+        print(f"  {entry['trajectory']}: {kill['verdict']} — "
+              + "; ".join(kill["reasons"]))
+        if kill["verdict"] == "STOP":
+            print("  Preserve it as a negative development result. Do not tune "
+                  "it. Do not run its replication seeds.")
+
+    for line in manifest.get("provenance", []):
+        print(f"\n[provenance] {line}")
+
     bm.write_json(out / "summary.json", {
         "experiment": manifest["experiment"],
         "dry_run": bool(manifest.get("dry_run")),
@@ -348,6 +369,9 @@ def main() -> None:
         ],
         "chain_summary": chain_rows,
         "contrasts": contrasts,
+        "kill_rule": rule,
+        "kill_rule_outcome": kill,
+        "provenance": manifest.get("provenance", []),
         "reporting_rules": manifest["reporting_rules"],
     })
 

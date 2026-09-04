@@ -180,6 +180,96 @@ class Endpoints:
 
 ENDPOINTS = Endpoints()
 
+
+@dataclass(frozen=True)
+class KillRule:
+    """When a development-seed-informed arm does **not** get replication seeds.
+
+    Frozen before Proposed-v2's first trajectory. Both thresholds are values
+    already on the record from the seed-0 baseline run, not numbers chosen to
+    be reachable:
+
+    * ``3.56`` is half of the admissibility arm's seed-0 mean
+      ``new_class_AP50`` of 7.12 — clear less than half the bar and the method
+      has not addressed the failure it was designed for;
+    * ``44.89`` is Proposed-v1's own seed-0 final ``known_mAP50`` — fall below
+      it and v2 has not even improved on the version it replaces.
+
+    Failing either preserves v2 as a negative development result. It is not
+    tuned afterwards and it does not get seeds 1 and 2.
+    """
+
+    arm: str = "proposed_v2"
+    seed: int = DEVELOPMENT_SEED
+    minimum_mean_new_class_ap50: float = 3.56
+    minimum_final_known_map50: float = 44.89
+
+    def statement(self) -> str:
+        return (
+            f"{self.arm} proceeds to seeds {[s for s in SEEDS if s != self.seed]} "
+            f"only if its seed-{self.seed} run gives mean new_class_AP50 >= "
+            f"{self.minimum_mean_new_class_ap50} AND final known_mAP50 >= "
+            f"{self.minimum_final_known_map50}. Failing either, it is preserved "
+            "as a negative development result, not tuned."
+        )
+
+    def decide(
+        self, mean_new_class_ap50: float | None, final_known_map50: float | None
+    ) -> dict[str, object]:
+        """Mechanical. No judgement is applied at reporting time."""
+
+        if mean_new_class_ap50 is None or final_known_map50 is None:
+            return {"verdict": "INCOMPLETE", "reasons": ["a required endpoint is absent"]}
+        reasons = []
+        if mean_new_class_ap50 < self.minimum_mean_new_class_ap50:
+            reasons.append(
+                f"mean new_class_AP50 {mean_new_class_ap50:.2f} < "
+                f"{self.minimum_mean_new_class_ap50}")
+        if final_known_map50 < self.minimum_final_known_map50:
+            reasons.append(
+                f"final known_mAP50 {final_known_map50:.2f} < "
+                f"{self.minimum_final_known_map50}")
+        return {
+            "verdict": "STOP" if reasons else "PROCEED",
+            "reasons": reasons or ["both thresholds met"],
+            "mean_new_class_AP50": mean_new_class_ap50,
+            "final_known_mAP50": final_known_map50,
+        }
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "arm": self.arm, "seed": self.seed,
+            "minimum_mean_new_class_ap50": self.minimum_mean_new_class_ap50,
+            "minimum_final_known_map50": self.minimum_final_known_map50,
+        }
+
+
+KILL_RULE = KillRule()
+
+#: Arms whose design followed inspection of a detector endpoint. Reported as
+#: such, always. Everything else in :data:`owl.active_selection.arms.ORDER` was
+#: fixed before the first trajectory ran.
+DEVELOPMENT_SEED_INFORMED: tuple[str, ...] = ("proposed_v2",)
+
+PROVENANCE: tuple[str, ...] = (
+    (
+        "Proposed-v2 was designed after inspection of Proposed-v1 "
+        "development-seed (seed 0) results and is therefore "
+        "development-seed-informed, not pre-registered."
+    ),
+    (
+        "The coreset gate ablation is unavailable: its seed-0 detector run "
+        "terminated with CUDA OOM and reported no endpoint. The A gate has "
+        "therefore NOT been causally ruled out as a cause of Proposed-v1's "
+        "failure."
+    ),
+    (
+        "The CPU candidate-side diagnostics that informed Proposed-v2 are "
+        "supporting development evidence only. They are oracle counts over an "
+        "already-committed pool, not a detector result."
+    ),
+)
+
 #: What a single-seed result may and may not be reported as. Printed by the
 #: summariser next to every table, so the caveat travels with the numbers.
 REPORTING: tuple[str, ...] = (
@@ -314,7 +404,8 @@ def make_selector(
     spec = arm_registry.ARMS[arm]
     cost_of = annotation_budget.cost_function(candidate_index)
     jpeg_dir = Path(jpeg_dir)
-    if spec.needs_semantic and ref_t1 is None:
+    wants_ref_t1 = spec.needs_semantic and spec.reference_scope == "labelled"
+    if wants_ref_t1 and ref_t1 is None:
         raise BenchmarkError(
             f"Arm {arm!r} covers semantic space relative to what is already "
             "labelled, and the balanced task-1 reference was not given. Pass "
@@ -332,11 +423,13 @@ def make_selector(
         features = None
         reference = None
         if spec.needs_semantic:
-            # Only the rows this arm ranks are embedded: G for a gated arm, the
-            # whole deduplicated pool for the ungated control. The cache is keyed
-            # on a fingerprint of exactly those rows, so the two arms cannot
-            # reuse each other's file.
-            ranked = np.flatnonzero(pool.gate) if spec.gated else np.arange(len(pool))
+            # Only the rows this arm ranks are embedded, and *the same function*
+            # decides that here and inside the traversal — computing the subset
+            # twice is how a feature matrix comes to describe a different
+            # population from the one being selected over. The cache is keyed on
+            # a fingerprint of exactly these rows, so no two arms can reuse each
+            # other's file.
+            ranked = arm_registry.ranked_positions(arm, pool)
             features = features_for(
                 task_dir / "dinov2_pool.npz",
                 pool.candidates.image_ids[ranked],
@@ -347,8 +440,17 @@ def make_selector(
                 label=f"{task.name}/{arm} dinov2",
                 provenance={"task": task.name, "arm": arm, "seed": seed},
             )
+            # `labelled` measures distance to the balanced task-1 reference plus
+            # this trajectory's purchases — what `proposed` and `coreset` were
+            # measured with. `trajectory` measures distance to the purchases
+            # alone: Proposed-v2 stops using DINOv2 as a distance-to-REF-T1
+            # novelty score, which Method V2 already froze as D_NO_GO, and uses
+            # it only to tell near-duplicates apart. At t2 that reference is
+            # empty, and `coverage.kcenter_greedy` documents what the first pick
+            # then is.
+            anchor_reference = [reference_for(ref_t1)] if wants_ref_t1 else []
             reference = semantic.stack_reference([
-                reference_for(ref_t1),
+                *anchor_reference,
                 *reference_blocks(task_dir, task_index=task.index),
             ])
 
@@ -380,6 +482,8 @@ def make_selector(
             "population_proposals": pool.diagnostics["proposals_after_nms"],
             "population_images": pool.diagnostics["images"],
             "population_admissible": pool.diagnostics["admissible"],
+            "population_ranked": int(arm_registry.ranked_positions(arm, pool).size),
+            "reference_scope": spec.reference_scope,
         }
         return arm_registry.ArmSelection(
             arm=picked.arm, images=picked.images, anchors=picked.anchors,
@@ -421,6 +525,8 @@ def frozen_values() -> dict[str, object]:
         "admissible_share": ADMISSIBLE_SHARE,
         "arms": list(arm_registry.ORDER),
         "endpoints": ENDPOINTS.as_dict(),
+        "development_seed_informed": list(DEVELOPMENT_SEED_INFORMED),
+        "kill_rule": KILL_RULE.as_dict(),
     }
 
 
@@ -520,6 +626,10 @@ def manifest(
         "endpoints": ENDPOINTS.as_dict(),
         "endpoint_statement": ENDPOINTS.statement(),
         "reporting_rules": list(REPORTING),
+        "provenance": list(PROVENANCE),
+        "development_seed_informed": list(DEVELOPMENT_SEED_INFORMED),
+        "kill_rule": KILL_RULE.as_dict(),
+        "kill_rule_statement": KILL_RULE.statement(),
         "chain": [
             {"task": task.name, "new_class": task.new_class,
              "known_after": task.n_current, "tail_band": list(tail_band(task))}

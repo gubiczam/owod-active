@@ -290,7 +290,8 @@ def test_the_selector_is_handed_a_pool_with_no_answers(tmp_path, small_index, sm
 def test_every_arm_reaches_t4_from_its_own_previous_checkpoint(
     tmp_path, small_index, small_config
 ):
-    for arm in ("random", "admissibility", "entropy", "proposed", "coreset"):
+    for arm in ("random", "admissibility", "entropy", "proposed", "coreset",
+                "proposed_v2"):
         results, bridge, _ = _run(tmp_path / arm, small_index, small_config, arm)
         assert [r.task for r in results] == ["t2", "t3", "t4"], arm
         trains = [c for c in bridge.calls if c["verb"] == "train"]
@@ -700,3 +701,142 @@ def test_the_backfill_refuses_to_write_into_the_results_it_reads(tmp_path):
     )
     assert result.returncode != 0
     assert "must not be the results directory" in result.stdout + result.stderr
+
+
+# ----------------------------------------------------------- Proposed-v2 ---
+
+
+def test_v2_never_consults_the_task_one_reference(tmp_path, small_index, small_config):
+    """REF-T1 is removed from v2's objective, so it must not even be read."""
+
+    def forbidden(_path):
+        raise AssertionError("v2 read REF-T1; its reference is trajectory-only")
+
+    from tests.test_run_chain import prob_data_root
+
+    data_root = prob_data_root(tmp_path, small_index)
+    (tmp_path / "t1.pth").write_bytes(b"anchor")
+
+    def features(path, image_ids, boxes, jpeg_dir, **kwargs):
+        block = np.random.default_rng(len(image_ids)).normal(
+            size=(len(image_ids), 8)).astype(np.float32)
+        return block / np.maximum(np.linalg.norm(block, axis=1, keepdims=True), 1e-9)
+
+    selector = benchmark.make_selector(
+        "proposed_v2", candidate_index=small_index,
+        jpeg_dir=data_root / "JPEGImages", ref_t1=None,
+        features_for=features, reference_for=forbidden,
+    )
+    from dataclasses import replace
+
+    results = runner.run_chain(
+        _lineage_bridge(), replace(small_config, arm="proposed_v2"),
+        workspace=tmp_path / "v2", candidate_index=small_index,
+        start_checkpoint=tmp_path / "t1.pth", test_set="owl_shared_test",
+        chain=benchmark.chain(), selector=selector,
+    )
+    assert [r.task for r in results] == ["t2", "t3", "t4"]
+
+
+def test_v2_needs_no_ref_t1_but_v1_still_does(tmp_path):
+    assert callable(benchmark.make_selector(
+        "proposed_v2", candidate_index={}, jpeg_dir=tmp_path, ref_t1=None))
+    with pytest.raises(benchmark.BenchmarkError, match="task-1 reference"):
+        benchmark.make_selector(
+            "proposed", candidate_index={}, jpeg_dir=tmp_path, ref_t1=None)
+
+
+def test_v2_starts_with_an_empty_reference_and_grows_it(
+    tmp_path, small_index, small_config
+):
+    results, _, seen = _run(tmp_path / "v2", small_index, small_config, "proposed_v2")
+    points = [r.selection_row["reference_points"] for r in results]
+    assert points[0] == 0, "t2 must start from nothing bought"
+    assert points[1] > 0 and points[2] > points[1], points
+    # and the first pick of t2 had nothing to measure against
+    assert results[0].selection_row["coverage_picks_without_reference"] == 1
+    assert results[0].selection_row["coverage_first_pick_distance"] is None
+    assert results[1].selection_row["coverage_picks_without_reference"] == 0
+    assert len(seen) == 3, "one semantic pass per task"
+
+
+def test_v2_embeds_fewer_rows_than_v1(tmp_path, small_index, small_config):
+    _, _, v1 = _run(tmp_path / "a", small_index, small_config, "proposed")
+    _, _, v2 = _run(tmp_path / "b", small_index, small_config, "proposed_v2")
+    assert v2[0]["rows"] < v1[0]["rows"]
+
+
+def test_v2_records_its_own_reference_scope(tmp_path, small_index, small_config):
+    results, _, _ = _run(tmp_path / "v2", small_index, small_config, "proposed_v2")
+    for row in (r.selection_row for r in results):
+        assert row["reference_scope"] == "trajectory"
+        assert row["population_ranked"] < row["population_admissible"]
+
+
+def test_adding_v2_does_not_move_an_existing_arms_fingerprint():
+    """The four measured seed-0 trajectories must stay resumable."""
+
+    for arm in ("random", "admissibility", "proposed", "entropy"):
+        fingerprint = benchmark.cycle_config(arm, 0).fingerprint()
+        assert fingerprint["arm"] == arm
+        assert fingerprint["budget_per_task"] == benchmark.ANSWER_BUDGET_PER_TASK
+        assert fingerprint["epochs"] == benchmark.EPOCHS
+        assert fingerprint["replay_arm"] == benchmark.REPLAY_ARM
+        assert fingerprint["budget_unit"] == "answers"
+        assert "informative" not in fingerprint
+        assert set(fingerprint) == set(
+            runner.CycleConfig.RESULT_AFFECTING) | {"budget_unit"}
+
+
+def test_v2_gets_its_own_workspace_and_does_not_touch_proposed():
+    assert benchmark.trajectory_name("proposed_v2", 0) == "proposed_v2__seed0"
+    assert benchmark.trajectory_name("proposed", 0) == "proposed__seed0"
+    assert benchmark.cycle_config("proposed_v2", 0).arm == "proposed_v2"
+
+
+# ------------------------------------------------------------- kill rule ---
+
+
+def test_the_kill_rule_thresholds_are_the_observed_ones():
+    assert benchmark.KILL_RULE.arm == "proposed_v2"
+    assert benchmark.KILL_RULE.seed == benchmark.DEVELOPMENT_SEED
+    assert benchmark.KILL_RULE.minimum_mean_new_class_ap50 == 3.56
+    assert benchmark.KILL_RULE.minimum_final_known_map50 == 44.89
+
+
+def test_the_kill_rule_needs_both_conditions():
+    rule = benchmark.KILL_RULE
+    assert rule.decide(4.0, 46.0)["verdict"] == "PROCEED"
+    assert rule.decide(3.55, 46.0)["verdict"] == "STOP"
+    assert rule.decide(4.0, 44.88)["verdict"] == "STOP"
+    assert rule.decide(3.56, 44.89)["verdict"] == "PROCEED"   # boundary is inclusive
+    assert rule.decide(None, 46.0)["verdict"] == "INCOMPLETE"
+
+
+def test_the_kill_rule_reaches_the_manifest():
+    payload = benchmark.manifest(
+        trajectories=[], owl_commit="a" * 40, prob_commit="b" * 40,
+        prob_repository="x", checkpoint="c", checkpoint_sha256=None,
+        test_set="owl_shared_test", test_images=837,
+    )
+    assert payload["kill_rule"] == benchmark.KILL_RULE.as_dict()
+    assert payload["development_seed_informed"] == ["proposed_v2"]
+    assert any("not\npre-registered" in line or "not pre-registered" in line
+               for line in payload["provenance"])
+    assert any("CUDA OOM" in line for line in payload["provenance"])
+
+
+def test_the_provenance_says_the_gate_is_not_ruled_out():
+    joined = " ".join(benchmark.PROVENANCE)
+    assert "NOT been causally ruled out" in joined
+    assert "development-seed-informed" in joined
+    assert "supporting development evidence only" in joined
+
+
+def test_the_allocator_config_is_set_before_torch_can_load():
+    from tools import run_full_owod_benchmark as launcher
+
+    assert launcher.ALLOCATOR_CONFIG == "expandable_segments:True"
+    source = Path(launcher.__file__).read_text(encoding="utf-8")
+    assert source.index("def configure_allocator") < source.index("def main()")
+    assert "configure_allocator()" in source.split("def main() -> None:")[1][:200]

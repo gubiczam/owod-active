@@ -28,8 +28,6 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from owl import evaluation_subset, proposals, protocol, runner
@@ -107,8 +105,9 @@ def simulate_arms(
         spec = arm_registry.ARMS[name]
         semantic = None
         if spec.needs_semantic:
-            ranked = np.flatnonzero(pool.gate) if spec.gated else np.arange(len(pool))
-            semantic = pool.candidates.embeddings[ranked]
+            semantic = pool.candidates.embeddings[
+                arm_registry.ranked_positions(name, pool)
+            ]
         picked = arm_registry.select(
             name, pool, cost_of=cost_of, answer_budget=answer_budget,
             seed=seed, semantic=semantic,
@@ -138,6 +137,7 @@ def simulate_arms(
             "new_class_objects": acquired["acquired_new_class"],
             "known_at_t3": acquired.get("acquired_becomes_known_t3", 0),
             "known_at_t4": acquired.get("acquired_becomes_known_t4", 0),
+            "ranked_rows": int(arm_registry.ranked_positions(name, pool).size),
             "classes": acquired["acquired_classes"],
             "tail_objects": acquired["acquired_tail_objects"],
         })
@@ -213,15 +213,15 @@ def main() -> None:
             # 0.80 is the measured NMS survival on the committed pool; a gated
             # arm then embeds only the admissible share of that, which is why
             # `proposed` is roughly three times cheaper than `coreset`.
-            deduplicated = candidate_images * bm.PROPOSALS_PER_IMAGE * 0.80
+            deduplicated = candidate_images * bm.PROPOSALS_PER_IMAGE * 0.80  # measured NMS survival
             per_task = {}
             for name in arm_registry.ORDER:
                 spec = arm_registry.ARMS[name]
                 crops = 0
                 if spec.needs_semantic:
-                    crops = int(deduplicated * (
-                        population_module.ADMISSIBLE_SHARE if spec.gated else 1.0
-                    ))
+                    # The arm's own definition of what it ranks, so a new arm
+                    # cannot be priced against a share it does not use.
+                    crops = int(deduplicated * arm_registry.ranked_share(name))
                 per_task[name] = minutes(
                     basis,
                     candidate_images=candidate_images,

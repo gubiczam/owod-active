@@ -94,7 +94,23 @@ def empty_reference(_path):
     return np.zeros((0, 32), dtype=np.float32)
 
 
+#: Set before anything imports torch, so the CUDA allocator picks it up.
+#: Expandable segments let a freed block be reused at a different size instead
+#: of fragmenting the reserve — which is what turns "enough free memory in
+#: total" into an OOM. The ungated coreset attempt died that way. Memory
+#: management only; it cannot change a number.
+ALLOCATOR_CONFIG = "expandable_segments:True"
+
+
+def configure_allocator() -> str:
+    import os
+
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", ALLOCATOR_CONFIG)
+    return os.environ["PYTORCH_CUDA_ALLOC_CONF"]
+
+
 def main() -> None:
+    configured = configure_allocator()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prob-root", required=True)
     parser.add_argument("--data-root", required=True)
@@ -128,6 +144,11 @@ def main() -> None:
     report = bm.check_protocol()
     print(f"[protocol] {report['fields']} frozen fields agree with "
           f"{Path(report['path']).name}")
+    print(f"[cuda] PYTORCH_CUDA_ALLOC_CONF={configured}")
+    for line in bm.PROVENANCE:
+        print(f"  * {line}")
+    if any(a in bm.DEVELOPMENT_SEED_INFORMED for a in arguments.arms):
+        print(f"[kill rule] {bm.KILL_RULE.statement()}")
     print(f"[endpoints] {bm.ENDPOINTS.statement()}")
     for line in bm.REPORTING:
         print(f"  ! {line}")

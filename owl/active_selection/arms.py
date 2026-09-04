@@ -63,6 +63,7 @@ import numpy as np
 from owl import scoring
 from owl.active_selection import budget as ledger_module
 from owl.active_selection import coverage as coverage_module
+from owl.active_selection import population as population_module
 from owl.active_selection.population import Population
 
 
@@ -76,6 +77,22 @@ class Arm:
     gated: bool               # restricted to the admissible subset G
     reference_aware: bool     # consults what has already been labelled
     description: str
+
+    #: Restrict further to the candidates whose normalised entropy is at or
+    #: above the **median of the gated population**. An explicit new design
+    #: choice, introduced by Proposed-v2; every earlier arm leaves it off and is
+    #: therefore bit-identical to what it was measured as.
+    informative: bool = False
+
+    #: What "already labelled" means for a coverage arm.
+    #:
+    #: ``labelled``    the balanced task-1 reference plus everything this
+    #:                 trajectory has bought. What ``proposed`` and ``coreset``
+    #:                 were measured with.
+    #: ``trajectory``  **only** what this trajectory has bought. Proposed-v2,
+    #:                 which stops using DINOv2 as a distance-to-REF-T1 novelty
+    #:                 score at all.
+    reference_scope: str = "labelled"
 
     @property
     def slug(self) -> str:
@@ -108,6 +125,25 @@ ARMS: dict[str, Arm] = {
         reference_aware=True,
         description="A-gated k-center greedy in frozen DINOv2 space",
     ),
+    # ------------------------------------------------------------ v2, 2026-09-04
+    # Designed AFTER inspecting Proposed-v1's seed-0 endpoints. It is
+    # development-seed-informed and is NOT pre-registered; the protocol and the
+    # research log say so, and so must any table that reports it.
+    #
+    # Informativeness first, diversity second. v1 maximised semantic coverage
+    # and, on seed 0, produced mean new_class_AP50 = 0.00 with the best
+    # U_Recall of any arm: it bought breadth and no depth, because
+    # farthest-first leaves a region once that region is covered and so caps
+    # per-class multiplicity by construction. v2 keeps the traversal but
+    # demotes it to redundancy removal inside an informative subset, and stops
+    # measuring distance to REF-T1 — a signal Method V2 already froze as
+    # ``D_NO_GO``.
+    "proposed_v2": Arm(
+        name="proposed_v2", kind="coverage", needs_semantic=True, gated=True,
+        reference_aware=True, informative=True, reference_scope="trajectory",
+        description="A-gated, above-median-U, DINOv2 farthest-first for "
+                    "redundancy removal only",
+    ),
 }
 
 #: Execution priority, fixed before the first trajectory ran. A session that
@@ -116,7 +152,12 @@ ARMS: dict[str, Arm] = {
 #: the bar it must clear, and the reference. It is **not** a licence to drop an
 #: arm because of what its numbers turned out to be; see the protocol's
 #: "stopping rules" section for the only reasons an arm may be abandoned.
-ORDER: tuple[str, ...] = ("random", "admissibility", "proposed", "entropy", "coreset")
+#: ``proposed_v2`` is **appended**, not inserted. It was designed after seeing
+#: seed-0 results, so it may not displace a baseline in the execution order; a
+#: short session completes the pre-registered prefix first and reaches v2 last.
+ORDER: tuple[str, ...] = (
+    "random", "admissibility", "proposed", "entropy", "coreset", "proposed_v2",
+)
 
 
 class ArmError(ValueError):
@@ -164,6 +205,52 @@ def ranking(
     else:
         raise ArmError(f"{arm!r} is not a ranking arm; kinds are {sorted(ARMS)}.")
     return np.argsort(-score, kind="mergesort").astype(np.int64)
+
+
+def ranked_positions(arm: str, pool: Population) -> np.ndarray:
+    """The pool positions ``arm`` may choose from, in ascending order.
+
+    **One definition, two callers**, and that is the point:
+    :func:`owl.active_selection.benchmark.make_selector` uses it to decide which
+    crops to embed and :func:`select` uses it to decide what the traversal may
+    take. Computing the subset twice is how a feature matrix comes to describe a
+    different population from the one being selected over — the failure the
+    export fingerprint exists to catch, and which is better not created.
+
+    Two restrictions, applied in this order:
+
+    1. the **admissibility gate** — the top
+       :data:`owl.active_selection.population.ADMISSIBLE_SHARE` by ``A``;
+    2. for an ``informative`` arm, ``U >= median(U)`` **within what step 1
+       kept**. The median is taken over the gated population, not over the
+       whole pool: taking it over the pool would keep whatever share of the gate
+       happened to sit above the pool's middle, which is not a fixed quantity
+       and not the stated rule.
+    """
+
+    spec = ARMS[arm]
+    keep = (
+        np.asarray(pool.gate, dtype=bool).copy()
+        if spec.gated
+        else np.ones(len(pool), dtype=bool)
+    )
+    if spec.informative:
+        entropy = scoring.uncertainty(pool.candidates, "entropy")
+        threshold = float(np.median(entropy[keep]))
+        keep &= entropy >= threshold
+    return np.flatnonzero(keep)
+
+
+def ranked_share(arm: str) -> float:
+    """The fraction of ``P_nms`` an arm ranks, for cost estimates only.
+
+    Exact for the gate (a rank fraction) and nominal for the median filter,
+    which keeps half of the gate up to ties at the median.
+    """
+
+    spec = ARMS[arm]
+    share = population_module.ADMISSIBLE_SHARE if spec.gated else 1.0
+    return share * (0.5 if spec.informative else 1.0)
 
 
 def select(
@@ -217,16 +304,17 @@ def select(
 
     features = np.asarray(semantic, dtype=np.float32)
     # A gated arm never selects outside G and never covers outside it either, so
-    # it is handed features for G alone. That is not only cheaper — 24,000 crops
-    # per task instead of 80,000 — it is what the method means: cover the
-    # semantic space of the *object-like* candidates. An ungated arm gets the
-    # whole deduplicated pool, which is the point of the control.
-    index = np.flatnonzero(pool.gate) if spec.gated else np.arange(len(pool))
+    # it is handed features for G alone — cheaper, and it is what the method
+    # means: cover the semantic space of the *object-like* candidates. An
+    # informative arm narrows that again to the upper half by entropy. An ungated
+    # arm gets the whole deduplicated pool, which is the point of the control.
+    index = ranked_positions(arm, pool)
     if features.shape[0] != index.size:
         raise ArmError(
             f"semantic has {features.shape[0]} rows and arm {arm!r} selects over "
             f"{index.size} candidates ("
             + ("the admissible subset G" if spec.gated else "the deduplicated pool")
+            + (", narrowed to U >= median(U) within it" if spec.informative else "")
             + "); the export does not describe what this arm ranks."
         )
     result = coverage_module.kcenter_greedy(

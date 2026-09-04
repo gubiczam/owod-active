@@ -102,8 +102,9 @@ def test_no_arm_reads_an_answer(built):
     for name, spec in arms.ARMS.items():
         features = None
         if spec.needs_semantic:
-            index = np.flatnonzero(bare.gate) if spec.gated else np.arange(len(bare))
-            features = bare.candidates.embeddings[index]
+            # through the arm's own definition, so a new arm cannot quietly be
+            # handed the wrong subset here and pass anyway
+            features = bare.candidates.embeddings[arms.ranked_positions(name, bare)]
         picked = arms.select(
             name, bare, cost_of=cost_of, answer_budget=100, seed=0,
             semantic=features,
@@ -501,3 +502,205 @@ def test_the_future_label_helpers_are_not_imported_by_the_selectors():
         "the future-label table is computed before the selector has spent the "
         "budget"
     )
+
+
+# ---------------------------------------------------------- Proposed-v2 ---
+#
+# Development-seed-informed, appended 2026-09-04, NOT pre-registered. These
+# tests pin what it is; `tests/test_full_benchmark_chain.py` pins that it runs
+# the chain and that it leaves the earlier arms alone.
+
+
+def test_v2_ranks_the_gated_above_median_uncertainty_subset(built):
+    from owl import scoring as scoring_module
+
+    index = arms.ranked_positions("proposed_v2", built)
+    gate = np.flatnonzero(built.gate)
+    entropy = scoring_module.uncertainty(built.candidates, "entropy")
+
+    assert set(index.tolist()) <= set(gate.tolist()), "v2 left the gate"
+    threshold = float(np.median(entropy[built.gate]))
+    assert entropy[index].min() >= threshold
+    # `>=` keeps half the gate, plus any ties sitting exactly at the median
+    assert gate.size // 2 <= index.size <= gate.size // 2 + 1 + gate.size // 100
+
+
+def test_the_v2_median_is_taken_inside_the_gate_not_over_the_pool(built):
+    """The trap: a pool-wide median keeps an unfixed share of the gate."""
+
+    from owl import scoring as scoring_module
+
+    entropy = scoring_module.uncertainty(built.candidates, "entropy")
+    inside = float(np.median(entropy[built.gate]))
+    whole = float(np.median(entropy))
+    assert inside != whole, "the fixture cannot distinguish the two medians"
+
+    index = arms.ranked_positions("proposed_v2", built)
+    pool_wide = np.flatnonzero(built.gate & (entropy >= whole))
+    assert index.size != pool_wide.size
+    assert entropy[index].min() >= inside
+
+
+def test_v2_ranks_about_half_of_what_v1_ranks(built):
+    v1 = arms.ranked_positions("proposed", built).size
+    v2 = arms.ranked_positions("proposed_v2", built).size
+    assert 0.45 * v1 <= v2 <= 0.55 * v1
+    assert arms.ranked_share("proposed_v2") == pytest.approx(
+        arms.ranked_share("proposed") * 0.5
+    )
+
+
+def test_v2_does_not_change_what_the_earlier_arms_rank(built):
+    """Adding an arm must not move a measured one."""
+
+    assert np.array_equal(
+        arms.ranked_positions("proposed", built), np.flatnonzero(built.gate)
+    )
+    for name in ("random", "admissibility", "entropy", "coreset"):
+        assert np.array_equal(
+            arms.ranked_positions(name, built), np.arange(len(built))
+        )
+
+
+def test_the_earlier_arms_keep_their_defaults():
+    for name in ("random", "admissibility", "entropy", "proposed", "coreset"):
+        spec = arms.ARMS[name]
+        assert spec.informative is False, name
+        assert spec.reference_scope == "labelled", name
+    v2 = arms.ARMS["proposed_v2"]
+    assert v2.informative is True
+    assert v2.reference_scope == "trajectory"
+    assert v2.gated is True and v2.needs_semantic is True
+
+
+def test_v2_is_last_in_the_declared_order():
+    """It was designed after seeing results, so it may not displace a baseline."""
+
+    assert arms.ORDER[-1] == "proposed_v2"
+    assert arms.ORDER[:5] == (
+        "random", "admissibility", "proposed", "entropy", "coreset"
+    )
+    assert set(arms.ORDER) == set(arms.ARMS)
+
+
+def test_v2_refuses_features_for_the_wrong_subset(built):
+    with pytest.raises(arms.ArmError, match="U >= median"):
+        arms.select(
+            "proposed_v2", built, cost_of=lambda _: 1, answer_budget=10, seed=0,
+            semantic=built.candidates.embeddings[np.flatnonzero(built.gate)],
+        )
+
+
+def test_v2_only_ever_picks_inside_its_own_subset(built):
+    index = arms.ranked_positions("proposed_v2", built)
+    picked = arms.select(
+        "proposed_v2", built, cost_of=lambda _: 4, answer_budget=400, seed=0,
+        semantic=built.candidates.embeddings[index],
+    )
+    assert picked.anchors
+    assert set(picked.anchors) <= set(index.tolist())
+
+
+# ------------------------------------------- the empty-reference first pick ---
+
+
+def test_an_empty_reference_takes_the_most_admissible_candidate_first():
+    """v2's t2 starts with nothing bought. The rule is stated, not inherited."""
+
+    features = np.eye(4, dtype=np.float32)
+    result = coverage.kcenter_greedy(
+        features, np.asarray(["a", "b", "c", "d"]),
+        cost_of=lambda _: 1, budget=1,
+        tie_break=np.asarray([0.1, 0.9, 0.5, 0.4]),
+    )
+    assert result.images == ("b",)
+
+
+def test_a_tie_at_the_maximum_breaks_to_the_lowest_index():
+    features = np.eye(4, dtype=np.float32)
+    result = coverage.kcenter_greedy(
+        features, np.asarray(["a", "b", "c", "d"]),
+        cost_of=lambda _: 1, budget=1,
+        tie_break=np.asarray([0.1, 0.9, 0.5, 0.9]),
+    )
+    assert result.images == ("b",), "the later equal candidate won"
+
+
+def test_an_undefined_first_distance_is_none_and_never_infinity():
+    """`inf` would reach the manifest as a value strict JSON rejects."""
+
+    import json
+    import math
+
+    features = np.eye(3, dtype=np.float32)
+    result = coverage.kcenter_greedy(
+        features, np.asarray(["a", "b", "c"]), cost_of=lambda _: 1, budget=3,
+        tie_break=np.asarray([0.9, 0.5, 0.1]),
+    )
+    assert result.distances[0] is None
+    assert all(d is not None and math.isfinite(d) for d in result.distances[1:])
+    summary = result.summary()
+    assert summary["coverage_first_pick_distance"] is None
+    assert summary["coverage_picks_without_reference"] == 1
+    assert summary["coverage_mean_pick_distance"] is not None
+    json.dumps(summary, allow_nan=False)          # raises on inf/nan
+
+
+def test_a_non_empty_reference_leaves_no_undefined_distance():
+    features = np.eye(3, dtype=np.float32)
+    result = coverage.kcenter_greedy(
+        features, np.asarray(["a", "b", "c"]), cost_of=lambda _: 1, budget=2,
+        reference=features[:1], tie_break=np.asarray([0.9, 0.5, 0.1]),
+    )
+    assert all(d is not None for d in result.distances)
+    assert result.summary()["coverage_picks_without_reference"] == 0
+
+
+# ------------------------------------------------------------ CUDA memory ---
+
+
+def test_releasing_the_backbone_is_safe_without_torch():
+    from owl.active_selection import semantic
+
+    report = semantic.release(device="cpu")
+    assert report["gc_collected"] >= 0
+    assert report["torch"] in (True, False)
+
+
+def test_the_semantic_pass_releases_the_backbone_even_when_it_fails(tmp_path, monkeypatch):
+    """In a `finally`: a failed pass must not leave a full card behind."""
+
+    from owl.active_selection import semantic
+
+    released: list[dict] = []
+    monkeypatch.setattr(semantic, "release", lambda **kw: released.append(kw) or {})
+
+    class Backbone:
+        pass
+
+    def exploding(*_args, **_kwargs):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(semantic, "embed", exploding)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        semantic.cached(
+            tmp_path / "f.npz", np.asarray(["1"]), np.zeros((1, 4)), tmp_path,
+            model_factory=lambda _d: Backbone(), device="cuda",
+        )
+    assert released == [{"device": "cuda"}], "the backbone was not released"
+
+
+def test_the_semantic_pass_releases_the_backbone_on_success(tmp_path, monkeypatch):
+    from owl.active_selection import semantic
+
+    released: list[dict] = []
+    monkeypatch.setattr(semantic, "release", lambda **kw: released.append(kw) or {})
+    monkeypatch.setattr(
+        semantic, "embed",
+        lambda *a, **k: np.eye(1, semantic.sf.FEATURE_DIM, dtype=np.float32),
+    )
+    semantic.cached(
+        tmp_path / "f.npz", np.asarray(["1"]), np.zeros((1, 4)), tmp_path,
+        model_factory=lambda _d: object(), device="cuda",
+    )
+    assert released == [{"device": "cuda"}]

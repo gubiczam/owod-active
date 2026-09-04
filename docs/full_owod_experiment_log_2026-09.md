@@ -325,28 +325,78 @@ share is what to revisit.
 
 ---
 
-## 2026-09-04 — Proposed-v2, designed after seeing seed-0 v1. NOT pre-registered
+## 2026-09-04 — coreset seed 0: attempted, incomplete
 
-**Awaiting approval; not run.** Recorded here before any GPU time so that the
-order of events is on the record: the seed-0 v1 endpoints *were* inspected
-before this design existed, and it must be reported as `Proposed-v2
+**Recorded as:** *coreset seed-0 attempted but incomplete due CUDA OOM; no
+detector endpoint reported.*
+
+Not rerun, not repaired. **Consequence for every claim downstream:** the
+pre-declared (A)/(B)/(C) reading of the gate ablation, fixed in the entry above,
+**cannot be applied**. The A gate has **not** been causally ruled out as a cause
+of Proposed-v1's failure, and nothing in this project may say otherwise. The
+candidate-side CPU diagnostics remain supporting development evidence only.
+
+The failure itself is a two-allocators-one-card problem, not a scientific one:
+DINOv2 embeds a task's crops and PROB then fine-tunes a Deformable-DETR in the
+same process, and the ungated arm embeds 80 000 crops — 3.3x the gated arm.
+Addressed for every coverage arm in the entry below, as memory management only.
+
+---
+
+## 2026-09-04 — Proposed-v2 FROZEN and implemented. NOT pre-registered
+
+Supersedes the sketch above; that sketch's `0.30` share was **rejected** on the
+measurement in the previous entry. What is implemented is below, and it is what
+`owl.active_selection.arms.ARMS['proposed_v2']` does.
+
+**Implemented; not yet run.** Recorded before any GPU time so the order of
+events is on the record: the seed-0 v1 endpoints *were* inspected before this
+design existed, and it must be reported as `Proposed-v2
 (development-seed-informed)`, never as pre-registered.
 
 **One idea: demote DINOv2 from novelty objective to redundancy remover.**
 
 1. population `P_nms` — unchanged;
 2. admissibility gate, top **0.30** by `A` — unchanged;
-3. **new:** informativeness filter, top **0.30** by normalised Shannon entropy
-   `U` *within* the gate. The share reuses the already-frozen
-   `ADMISSIBLE_SHARE`; no new constant is introduced;
+3. **new:** informativeness filter — `U >= median(U within the gated
+   population)`. The median is taken over the **gate**, not over `P_nms`: over
+   the pool it would keep whatever share of the gate happened to lie above the
+   pool's middle, which is not a fixed quantity and not this rule;
 4. **changed:** farthest-first traversal inside that subset, with the reference
    holding **only what this trajectory has itself bought** — empty at t2,
    growing with every opened image and carrying across tasks. REF-T1 is
-   dropped;
-5. everything else identical: cost rule, 3 000 answers, `uniform` M=400,
-   5 epochs, shared split, chain, seeds.
+   dropped. *Consequence, from step 4 and not an extra choice:* the carried
+   reference holds the ranked-subset embeddings of bought images, because
+   nothing outside the subset is embedded;
+5. **empty reference at t2:** first pick = maximum `A`, ties broken by lowest
+   stable pool index; distance recorded as **null, not infinity** — `inf` is
+   not representable in strict JSON and would reach the manifest and the CSV as
+   a value some readers reject and every mean silently absorbs. This was a live
+   defect, found by asking the question, and is now regression-tested;
+6. everything else identical: cost rule, 3 000 answers, `uniform` M=400,
+   5 epochs, learning rate, batch size, PROB model, `freeze_prob_model`,
+   checkpoint lineage, shared split, metrics, chain, seeds. `proposed_v2` is a
+   **new arm**; `proposed` is untouched.
 
-**New hyperparameters: zero.**
+**Hyperparameters: one new explicit design choice — the median filter.** The
+earlier claim of "zero new hyperparameters" was wrong and is withdrawn:
+borrowing a numeral from elsewhere does not make a second filtering decision
+free. It is fixed as a parameter-free central quantile and is never swept.
+
+**Why the median and not 0.30.** Measured, before the run: `U >= median` keeps
+23 of the gate's 28 distinct declared-class objects (82%) against 18 (64%) for
+the top 30%, and keeps 94.8% of images reachable against 77.7%. It discards
+less of exactly the raw material v1 starved, at the cost of slightly less
+background purity (0.660 against 0.602). The 3 000-answer budget opens ~520
+images against ~1 895 reachable — about 3.6x headroom, so the budget fills
+without the traversal being cornered.
+
+**CUDA memory.** The backbone and the allocator's cache are released between
+the semantic pass and PROB's training, every task, in a `finally` —
+`gc.collect()`, `empty_cache()`, `ipc_collect()` — with
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` set before torch is
+imported. No tensor any result depends on exists at that point, so nothing here
+can change a selection, a box or a metric.
 
 **Why each part, against frozen evidence.** `D_NO_GO` already established that
 DINOv2 distance to REF-T1 is not a usable novelty signal, so v2 stops using it
@@ -356,10 +406,15 @@ shows removing it is worse. Coverage stays, in the role it is measured to be
 good at — telling near-duplicates apart among real object-like candidates —
 rather than as the thing being maximised.
 
-**Kill rule, fixed now.** If v2's seed-0 mean `new_class_AP50` < 3.56 (half of
-admissibility's 7.12) **or** its final `known_mAP50` < 44.89 (v1's), v2 is a
-negative result: seeds 1 and 2 are **not** spent on it, the result is preserved,
-and the supervisor material is built on the strongest baseline.
+**Kill rule, frozen in code before the run.**
+`owl.active_selection.benchmark.KILL_RULE`: v2 proceeds to seeds 1 and 2 only if
+its seed-0 run gives mean `new_class_AP50` **>= 3.56** *and* final
+`known_mAP50` **>= 44.89** — half of admissibility's observed 7.12, and v1's own
+observed final known mAP. Failing either: preserve as a negative development
+result, do **not** tune it, do **not** run its replication seeds; the supervisor
+material is built on the strongest baseline. Applied mechanically by
+`KILL_RULE.decide` and printed by the summariser, so no judgement is applied at
+reporting time.
 
 ---
 
