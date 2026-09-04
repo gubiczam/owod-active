@@ -437,14 +437,16 @@ is material.
 
 **Measured on the candidate index:**
 
-| class | objects | on images that also hold a t1 class |
-|---|---:|---:|
-| `traffic light` | 6 703 | 5 951 (**88.8 %**) |
-| `fire hydrant` | 997 | 674 (**67.6 %**) |
-| `stop sign` | 1 021 | 672 (**65.8 %**) |
+| class | declared | exposed? | P(lost \| bought before declaration) |
+|---|---|---|---:|
+| `traffic light` | t2 | **no** — t2 is the first purchase task | **0** |
+| `fire hydrant` | t3 | yes (t2) | **0.687** |
+| `stop sign` | t4 | yes (t2, t3) | **0.681** |
 
-So a new-class object bought *before* its declaring task is lost about two times
-in three.
+**Correction:** an earlier form of this entry put `traffic light` at 88.8 %
+alongside the other two. That figure described *mixedness*, not loss;
+`traffic light` cannot be bought before it is declared and loses nothing. See
+`docs/banking_defect_forensics_2026-09-04.md` section 2.
 
 **Consequences, stated rather than corrected.**
 
@@ -466,6 +468,14 @@ stated limitation (section 14) and in the supervisor note (section 7.5).
 
 **Endpoints inspected?** No detector endpoint. Counts over the committed
 candidate index.
+
+**Resolved 2026-09-04, same day:** forensics, a protocol-v2 banking design, and
+the decision to **keep V1** — with the falsifier that would reverse it — are in
+`docs/banking_defect_forensics_2026-09-04.md`. The short version: fixing
+banking would raise tail-class supply reaching training from ~3 to ~10 objects
+per arm per task, and the Method V3 audit measured ~0 AP from 23–101, so the
+fix would move t3 and t4 from hopeless to still hopeless while invalidating four
+completed trajectories. The binding constraint is supply, not banking.
 
 ---
 

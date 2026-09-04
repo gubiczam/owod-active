@@ -493,10 +493,19 @@ trainable — at no further annotation cost.
 > is never re-offered — so its not-yet-declared boxes are **never learned
 > from**, even though the oracle was paid for them.
 >
-> Measured on the candidate index: **85.7 %** of `traffic light` objects,
-> **67.6 %** of `fire hydrant` objects and **65.8 %** of `stop sign` objects sit
-> on images that also hold a task-1 class. So a new-class object bought *before*
-> its declaring task is, about two times in three, lost.
+> **Which classes are exposed.** `traffic light` is declared at t2 and t2 is the
+> first task at which anything is bought, so it can never be purchased before
+> its own declaration and its loss is **zero**. Only `fire hydrant` (buyable at
+> t2) and `stop sign` (buyable at t2 and t3) are exposed.
+>
+> Measured over the candidate index, an object bought before its declaring task
+> is lost with probability **0.687** for `fire hydrant` and **0.681** for
+> `stop sign`. For one arm opening ~300 of 2 000 images that is about 7 objects
+> lost against 3 recovered, per class, per pre-declaration task — roughly 40 %
+> of the total supply reaching training for those two classes.
+>
+> Full analysis, the protocol-v2 design that would fix it, and the reasoning for
+> keeping V1 anyway: `docs/banking_defect_forensics_2026-09-04.md`.
 >
 > This lowers the new-class ceiling for **every arm**, in the same way though
 > not by the same amount, and it is a confound of unknown sign for comparisons

@@ -267,12 +267,16 @@ attached.
    causally localised.
 4. `boxes_trained_on` is not matched across arms; `training_iterations` differ.
 5. **Banking recovers only wholly-barren images.** An acquired image that also
-   held an already-known class is trained on immediately and never re-offered,
-   so its not-yet-declared boxes are never learned from. Measured on the
-   candidate index: **67.6 %** of `fire hydrant` objects and **65.8 %** of
-   `stop sign` objects sit on such mixed images. This lowers the new-class
-   ceiling for **every** arm and is a property of the protocol, not of any
-   method. See `docs/full_owod_experiment_log_2026-09.md`.
+   held an already-declared class is trained on immediately and never
+   re-offered, so its not-yet-declared boxes are never learned from. An object
+   bought before its declaring task is lost with probability **0.687**
+   (`fire hydrant`) and **0.681** (`stop sign`) — about 40 % of the supply those
+   two classes would otherwise contribute. `traffic light` is **not** exposed:
+   it is declared at t2, the first purchase task. This lowers the new-class
+   ceiling at t3 and t4 for **every** arm and is a property of the protocol, not
+   of any method; it cannot explain `proposed-v1`'s 0.00, whose t2 term is
+   immune. Analysis and the decision to keep the protocol as frozen:
+   `docs/banking_defect_forensics_2026-09-04.md`.
 6. Genuine iterative acquisition (detector rescoring between annotation rounds)
    is not tested; selection is one pass per task.
 7. `freeze_prob_model=True` — PROB's own fine-tuning procedure — keeps the
