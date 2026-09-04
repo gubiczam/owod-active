@@ -418,6 +418,74 @@ reporting time.
 
 ---
 
+## 2026-09-04 — DEFECT FOUND: banking recovers only wholly-barren images
+
+**Not patched. Reported.** Found while freezing the banking semantics for the
+supervisor note, by reading the implementation rather than the docstring.
+
+**What the code does.** `reuse_deferred_labels` re-offers
+`ledger − trained_on − opened`. An acquired image that held **any** already-
+declared class was trained on at the task it was bought, entered `trained_on`,
+and is therefore **never re-offered**. Its not-yet-declared boxes are never
+learned from, although the oracle was paid for them. Only images that were
+*wholly* barren at purchase are recovered.
+
+**The docstring in `owl/runner.py` says** the label "joins the training set at
+the task where its class becomes declarable", which reads as though any banked
+label is recovered. That is true only for the barren subset, and the difference
+is material.
+
+**Measured on the candidate index:**
+
+| class | objects | on images that also hold a t1 class |
+|---|---:|---:|
+| `traffic light` | 6 703 | 5 951 (**88.8 %**) |
+| `fire hydrant` | 997 | 674 (**67.6 %**) |
+| `stop sign` | 1 021 | 672 (**65.8 %**) |
+
+So a new-class object bought *before* its declaring task is lost about two times
+in three.
+
+**Consequences, stated rather than corrected.**
+
+* It lowers the new-class ceiling for **every** arm. It is not an explanation of
+  why `proposed-v1` scored 0.00 while `admissibility` scored 7.12, because it
+  applies to both.
+* It is a confound of unknown sign between arms that differ in how many barren
+  images they open — and they differ a lot; the frozen-pool simulation put
+  `admissibility` at 70 % barren against `entropy`'s 34 %.
+* It affects only purchases made *earlier* than the declaring task. Objects
+  bought at the declaring task itself are supervised normally.
+
+**Why it is not patched now.** Re-offering already-trained images would change
+the supervision handed to the four already-measured seed-0 trajectories, so
+their numbers would no longer describe the protocol they were run under. Any
+repair is a **new protocol version** with its own run, and it should be weighed
+against simply reporting the ceiling honestly. Recorded in the protocol as a
+stated limitation (section 14) and in the supervisor note (section 7.5).
+
+**Endpoints inspected?** No detector endpoint. Counts over the committed
+candidate index.
+
+---
+
+## 2026-09-04 — correction: tail mAP and new-class AP are not the same ordering
+
+An earlier entry and an earlier report of mine said the orderings of
+`mAP50_tail` and mean `new_class_AP50` were "identical across all four arms".
+**That was wrong.** Rank correlation is **0.6**: `admissibility` leads on tail
+while `entropy` leads on mean new-class AP, and `proposed-v1` edges `random` on
+tail while trailing it on new-class AP.
+
+The two measure at different points — `new_class_AP50` scores each class **at
+its own task**, `mAP50_tail` scores `fire hydrant` **at t4**, one task of
+forgetting later. The corrected claim, which the ~11-point separation does
+support: the gap between {`admissibility`, `entropy`} and {`random`,
+`proposed-v1`} is explained by new-class learning and is not a second
+independent finding. Decomposing it needs `per_class_ap.csv`.
+
+---
+
 ## Entries to add before the supervisor meeting
 
 * the outcome of the seed-0 session, and whether any stopping rule fired;

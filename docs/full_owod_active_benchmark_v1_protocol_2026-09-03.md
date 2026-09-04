@@ -468,7 +468,109 @@ contract.
 }
 ```
 
-## 14. Pins
+## 14. Deferred-label banking — frozen semantics
+
+Read off the implementation on 2026-09-04, not from intent. Three image sets are
+carried through a trajectory: `ledger` (every image the oracle has ever answered
+for), `trained_on` (every image PROB has ever been handed), and `used_images`
+(every image opened, which is excluded from later candidate samples).
+
+**A future class annotated before it is declared.** The annotator labels every
+object on an opened image, including objects of classes not yet declared. PROB's
+fine-tuning split then keeps only `category_id in range(0, prev + current)`, so
+those boxes are dropped from *this* task's supervision. They are counted, in
+`boxes_banked` and in `acquired_becomes_known_t3/t4`.
+
+**When it becomes trainable.** An opened image is trainable at a task iff it
+holds at least one class declared by then. `reuse_deferred_labels=True` re-offers
+`ledger − trained_on − opened` — previously opened, never trained, now
+trainable — at no further annotation cost.
+
+> **Stated limitation, quantified, and it is a property of the protocol rather
+> than of any method.** Because the re-offer excludes `trained_on`, banking
+> recovers **only wholly-barren images**. An acquired image that also held an
+> already-declared class was trained on immediately, entered `trained_on`, and
+> is never re-offered — so its not-yet-declared boxes are **never learned
+> from**, even though the oracle was paid for them.
+>
+> Measured on the candidate index: **85.7 %** of `traffic light` objects,
+> **67.6 %** of `fire hydrant` objects and **65.8 %** of `stop sign` objects sit
+> on images that also hold a task-1 class. So a new-class object bought *before*
+> its declaring task is, about two times in three, lost.
+>
+> This lowers the new-class ceiling for **every arm**, in the same way though
+> not by the same amount, and it is a confound of unknown sign for comparisons
+> between arms that differ in how many barren images they open. It is **not**
+> patched: doing so would change the supervision of the four already-measured
+> seed-0 trajectories. Any repair is a new protocol version.
+
+**Whether it influences selection before declaration.** No label reaches a
+selector. Arms are handed a `Candidates` built by `from_predict`, which carries
+no oracle at all, and `tests/test_active_selection.py` asserts every arm runs on
+such a pool. One idealisation is stated rather than hidden: the **cost function
+reads the number of annotated objects on an image**, which is oracle-derived and
+known before purchase, where a real annotator's effort would not be. It cannot
+reorder anything — `cost_of` is consulted only *after* the next candidate has
+been chosen, to decide whether it fits the remaining budget — so it gates and
+never ranks. A previously opened image is removed from the candidate sample
+entirely, so a banked image is never re-scored and never bought twice.
+
+**Whether it enters replay.** No. The exemplar pool is filtered to
+`task.previous_classes` — the classes known *before* the current task — so a
+future class cannot be an exemplar, and neither can the class being declared
+now. Measured windows: `traffic light` becomes rehearsable at t3, `fire hydrant`
+at t4, and `stop sign` never inside this chain. The pool is further restricted to
+`E_(k−1) ∪ L_(k−1)` where `L` is the previous task's *trainable* images, and
+excludes what the current task just bought — so a barren, banked image is not
+rehearsable until it becomes trainable.
+
+**Whether any oracle future label leaks into ranking.** No. Future labels are
+read in exactly one place, `owl.active_selection.budget.acquisition`, which
+`owl.runner.run_chain` calls **after** the selector has returned and the images
+have been committed; a test asserts that call order in the source, and asserts
+that neither the arm registry nor the traversal so much as mentions it.
+
+## 15. Seed semantics — frozen
+
+| what | keyed on | consequence |
+|---|---|---|
+| candidate image sample | `(seed, task.index)` | 2 000 images drawn per task from what this trajectory has not already bought |
+| `random` arm's permutation | `seed` **only** | see the note below |
+| replay exemplar preference order | `(seed, crc32(class_name))` | deliberately **arm-independent** given the same pool, so changing the allocation changes how many exemplars a class contributes and never which ones are preferred |
+| PROB's `--seed` | `seed`, passed explicitly | recorded per trajectory in the manifest as `prob_seed` |
+
+**The `random` arm's draw is not task-keyed.** It is
+`default_rng(seed).choice(n, size=n, replace=False)` over the task's pool, so it
+is a function of `(seed, n)` and of the pool's row order. Different tasks give
+different `n` and different pool contents, so the selected proposals differ; the
+*positions* would coincide if two tasks happened to give the same `n`, which
+maps to a different image subset regardless. Not a correctness defect, and
+**deliberately not changed** — it would alter the already-measured seed-0
+`random` trajectory. Keying it on `(seed, task)` belongs to a future protocol
+version.
+
+**Common random numbers across arms — what is and is not shared.**
+
+*Shared:* the anchor checkpoint; the frozen 837-image evaluation split; PROB's
+`--seed` value; and **the candidate image sample at t2**, because
+`used_images` is empty for every arm at the first incremental task.
+
+*Not shared, by construction:* the candidate sample from **t3 onwards**, since
+each arm removes its own purchases from the pool; and the replay exemplars,
+since the eligible pool excludes what the arm just bought — an earlier audit
+measured that one differing acquired image moves 20 of 400 exemplars. **A paired
+comparison between arms therefore cannot assume common randomness, and no claim
+in this project may.**
+
+**Residual nondeterminism.** PROB never calls
+`torch.use_deterministic_algorithms`, and MSDeformAttn accumulates with atomics,
+so two runs of an identical configuration on identical data can differ. The size
+of that difference is **unmeasured**: this benchmark provides no repeat of one
+configuration. Measuring it — one acquisition trained three or four times — is
+the outstanding recommendation from the earlier post-hoc audit and is not part
+of Benchmark V1.
+
+## 16. Pins
 
 * `owod-active` commit: recorded in `manifest.json` per session.
 * PROB: `https://github.com/gubiczam/PROB.git` @
