@@ -316,3 +316,113 @@ def test_the_launcher_flags_the_notebook_uses_all_exist(code_cells):
     ).stdout
     for flag in re.findall(r'"(--[a-z-]+)"', launcher):
         assert flag in help_text, flag
+
+
+# ------------------------------------- the committed notebook is launch-ready ---
+#
+# These pin the operational contract of the file as committed, because the
+# failure they guard against is not a wrong number in a table — it is a Colab
+# session that dies in cell [1/10] or, worse, runs the wrong arms for seven
+# hours.
+
+
+def test_the_owl_pin_is_a_full_forty_character_sha(code_cells):
+    """Cell [1/10] asserts len == 40; a short SHA fails the run immediately."""
+
+    source = code_cells[index_of(code_cells, PARAMETERS_TAG)]
+    match = re.search(r'OWL_COMMIT = "([0-9a-f]*)"', source)
+    assert match, "OWL_COMMIT is absent or not a plain hex literal"
+    assert len(match.group(1)) == 40, (
+        f"OWL_COMMIT is {len(match.group(1))} characters, not 40. The notebook's "
+        "own assertion refuses a short SHA, so this would fail in [1/10]."
+    )
+    assert 'assert len(PROB_COMMIT) == 40 and len(OWL_COMMIT) == 40' in source, (
+        "the 40-character assertion must stay; it is what catches a short pin"
+    )
+
+
+def test_the_pinned_revision_carries_the_code_the_run_imports(code_cells):
+    """The pin may lag HEAD, but only by commits that do not touch ``owl/``.
+
+    This is the reproducibility claim in one assertion: whatever the notebook
+    pins must give a byte-identical ``owl/`` to the working tree, so the run
+    executes the code this repository currently tests.
+    """
+
+    source = code_cells[index_of(code_cells, PARAMETERS_TAG)]
+    commit = re.search(r'OWL_COMMIT = "([0-9a-f]{40})"', source).group(1)
+    assert subprocess.run(
+        ["git", "-C", str(ROOT), "cat-file", "-e", f"{commit}^{{commit}}"],
+        capture_output=True, check=False,
+    ).returncode == 0, f"{commit} is not a commit in this repository"
+
+    drift = subprocess.run(
+        ["git", "-C", str(ROOT), "diff", "--name-only", commit, "HEAD", "--", "owl/"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert not drift, (
+        f"owl/ differs between the pinned {commit[:12]} and HEAD:\n{drift}\n"
+        "Re-pin the notebook, or the session runs code this tree no longer has."
+    )
+
+
+def test_the_session_is_the_seed_one_replication(code_cells):
+    source = code_cells[index_of(code_cells, PARAMETERS_TAG)]
+    named = re.findall(
+        r'"([a-z_]+)"',
+        re.search(r"SESSION_ARMS = \(([^)]*)\)", source, re.DOTALL).group(1),
+    )
+    assert named == ["random", "admissibility", "entropy"], named
+    seeds = re.search(r"SEEDS = \(([^)]*)\)", source).group(1)
+    assert seeds.strip().rstrip(",") == "1", seeds
+
+
+def test_no_excluded_arm_can_launch(code_cells):
+    """`proposed`, `proposed_v2` and `coreset` may be *named* but not selected."""
+
+    source = code_cells[index_of(code_cells, PARAMETERS_TAG)]
+    body = re.search(r"SESSION_ARMS = \(([^)]*)\)", source, re.DOTALL).group(1)
+    for excluded in ("proposed", "proposed_v2", "coreset"):
+        assert f'"{excluded}"' not in body, f"{excluded} is in SESSION_ARMS"
+    # and the launcher is handed SESSION_ARMS, not a literal list of arms
+    launcher = code_cells[index_of(code_cells, LAUNCHER_TAG)]
+    assert "*SESSION_ARMS" in launcher or "SESSION_ARMS" in launcher
+
+
+def test_bridge_is_imported_before_any_cell_uses_it(code_cells):
+    """The `NameError: name 'bridge' is not defined` class of failure."""
+
+    imports = [i for i, s in enumerate(code_cells)
+               if re.search(r"^from owl import .*\bbridge\b", s, re.MULTILINE)]
+    uses = [i for i, s in enumerate(code_cells)
+            if re.search(r"(?<!import )\bbridge\.", s)]
+    assert imports, "no cell imports `bridge`"
+    assert uses, "no cell uses `bridge` — this test would be vacuous"
+    assert min(imports) < min(uses), (
+        f"`bridge` is used in cell {min(uses)} but only imported in "
+        f"{min(imports)}; a clean Run all would raise NameError"
+    )
+
+
+def test_the_first_bridge_user_names_the_cell_it_needs(code_cells):
+    """A bare NameError says nothing; this says which cell to run."""
+
+    first = min(i for i, s in enumerate(code_cells)
+                if re.search(r"(?<!import )\bbridge\.", s))
+    assert '"bridge" not in globals()' in code_cells[first]
+    assert "[3/10]" in code_cells[first]
+
+
+def test_the_time_budget_covers_the_priced_session(code_cells):
+    """Three baseline arms at ~2.23 h each is ~6.7 h; the cap must exceed it."""
+
+    source = code_cells[index_of(code_cells, PARAMETERS_TAG)]
+    budget = int(re.search(r"TIME_BUDGET_MINUTES = (\d+)", source).group(1))
+    assert budget >= 420, f"{budget} min is under the ~6.7 h this session needs"
+
+
+def test_no_cell_advertises_a_stale_runtime(code_cells, markdown):
+    """A nine-hour banner on a seven-hour session is operationally misleading."""
+
+    joined = "\n".join(code_cells) + markdown
+    assert "nine hours" not in joined
