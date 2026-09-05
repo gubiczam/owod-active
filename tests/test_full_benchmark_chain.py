@@ -840,3 +840,66 @@ def test_the_allocator_config_is_set_before_torch_can_load():
     source = Path(launcher.__file__).read_text(encoding="utf-8")
     assert source.index("def configure_allocator") < source.index("def main()")
     assert "configure_allocator()" in source.split("def main() -> None:")[1][:200]
+
+
+# --------------------------------------------- seed isolation, replication ---
+
+
+def test_a_seed_cannot_overwrite_another_seeds_trajectory():
+    """Two independent mechanisms, because the seed-0 results are irreplaceable."""
+
+    for arm in ("random", "admissibility", "entropy"):
+        # 1. different directories
+        assert benchmark.trajectory_name(arm, 0) != benchmark.trajectory_name(arm, 1)
+        assert benchmark.trajectory_name(arm, 1).endswith("__seed1")
+        # 2. and if they were ever pointed at one, the fingerprint refuses it
+        zero = benchmark.cycle_config(arm, 0).fingerprint()
+        one = benchmark.cycle_config(arm, 1).fingerprint()
+        assert zero != one
+        assert {k for k in zero if zero[k] != one[k]} == {"seed"}
+
+
+def test_a_seed_one_run_refuses_a_seed_zero_workspace(
+    tmp_path, small_index, small_config
+):
+    """The fingerprint guard is what makes the directory scheme belt-and-braces."""
+
+    from dataclasses import replace
+
+    workspace = tmp_path / "shared"
+    _run(tmp_path / "a", small_index, small_config, "random", workspace=workspace)
+    with pytest.raises(RuntimeError, match="different configuration"):
+        _run(tmp_path / "a", small_index, replace(small_config, seed=1), "random",
+             workspace=workspace)
+
+
+def test_the_replication_session_names_only_surviving_baselines():
+    """`proposed`, `proposed_v2` and `coreset` are excluded for recorded reasons."""
+
+    import json as _json
+
+    notebook = _json.loads(
+        (Path(__file__).resolve().parent.parent / "notebooks"
+         / "full_owod_active_benchmark_v1.ipynb").read_text(encoding="utf-8")
+    )
+    source = "".join(notebook["cells"][1]["source"])
+    import re as _re
+
+    named = _re.findall(
+        r'"([a-z_]+)"', _re.search(r"SESSION_ARMS = \(([^)]*)\)", source, _re.DOTALL).group(1)
+    )
+    seeds = _re.search(r"SEEDS = \(([^)]*)\)", source).group(1)
+    assert named == ["random", "admissibility", "entropy"], named
+    assert seeds.strip().rstrip(",") == "1", seeds
+    for excluded in ("proposed", "proposed_v2", "coreset"):
+        assert excluded not in named
+
+
+def test_the_kill_rule_stops_proposed_v2_on_its_measured_seed_zero():
+    """0.06 against a 3.56 floor. Recorded so the verdict cannot drift."""
+
+    outcome = benchmark.KILL_RULE.decide(0.06, 48.07)
+    assert outcome["verdict"] == "STOP"
+    assert any("0.06" in reason for reason in outcome["reasons"])
+    # the guard threshold was met; the new-class threshold is what stopped it
+    assert not any("known_mAP50" in reason for reason in outcome["reasons"])

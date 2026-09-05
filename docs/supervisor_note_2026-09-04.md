@@ -1,8 +1,9 @@
 # Distribution-aware active annotation for open-world detection
 ## Controlled full-chain benchmark — development-seed results
 
-2026-09-04. Four arms complete at seed 0. **Seed 0 is the development seed; no
-statistical claim is made from it.**
+2026-09-04, updated 2026-09-05. Five arms complete at seed 0 — four baselines
+plus Proposed-v2, both proposed methods returning negative results. **Seed 0 is
+the development seed; no statistical claim is made from it.**
 
 ---
 
@@ -214,18 +215,52 @@ the three baselines are the next mandatory work.
 
 ---
 
-## 6. Proposed-v2
+## 6. Proposed-v2 — a second negative result
 
-**Awaiting development-seed result.**
+**Designed after inspecting Proposed-v1's seed-0 endpoints, therefore
+development-seed-informed and not pre-registered.** Informativeness first,
+diversity second: the admissibility gate, then entropy at or above the median of
+the gated population, then farthest-first *inside* that subset with the task-1
+reference removed — DINOv2 demoted from novelty objective to redundancy remover.
+One new explicit design choice, the median filter.
 
-Frozen and implemented, **not yet run**. Informativeness first, diversity
-second: the admissibility gate, then entropy at or above the median of the gated
-population, then farthest-first *inside* that subset with the task-1 reference
-removed — DINOv2 demoted from novelty objective to redundancy remover. One new
-explicit design choice (the median filter). **Designed after inspecting
-Proposed-v1's seed-0 endpoints, therefore development-seed-informed and not
-pre-registered.** A kill rule is frozen in code: it earns seeds 1 and 2 only if
-seed 0 gives mean `new_class_AP50` ≥ 3.56 and final `known_mAP50` ≥ 44.89.
+**Seed 0, measured:**
+
+| | |
+|---|---:|
+| mean `known_mAP50` | 50.21 |
+| final `known_mAP50` (t4) | 48.07 |
+| mean `new_class_AP50` | **0.06** |
+| mean `U_Recall50` | **18.76** |
+| cumulative forgetting | 7.31 |
+| final `mAP50_tail` (t4) | 39.01 |
+| total oracle answers | 8 977 |
+| total supervised boxes | 4 101 |
+
+**The frozen kill rule, applied mechanically: STOP.**
+Mean `new_class_AP50` 0.06 < 3.56 fails; final `known_mAP50` 48.07 ≥ 44.89
+passes. Both were required. Proposed-v2 does **not** get seeds 1 and 2, and it
+is **not** tuned. It is preserved as a negative development-seed-informed
+result.
+
+**The interpretation, and it is the most informative thing in this note.**
+Proposed-v2 delivered the **highest mean U-Recall of any seed-0 arm** (18.76,
+above Proposed-v1's 18.05) *and* the **largest total supervised-box count**
+(4 101) — and still essentially failed new-class learning. So neither semantic
+breadth nor sheer quantity of supervision translated into incremental new-class
+AP in this development run.
+
+Placed beside Proposed-v1, this is now a **pattern rather than an incident**:
+the two coverage-based formulations hold the top two `U_Recall50` values and the
+bottom two `new_class_AP50` values, under two materially different objectives —
+one maximising coverage against a fixed labelled reference, the other using
+coverage only to de-duplicate an uncertainty-filtered subset. On one seed that
+is a direction, not an effect; but it is the same direction twice, from
+different mechanisms, and it is what section 5.2 predicted.
+
+Its retention is unremarkable: final `known_mAP50` 48.07 sits with
+`admissibility` (48.34) and `entropy` (48.03). Proposed-v2 is a good citizen on
+stability and useless on plasticity.
 
 ---
 

@@ -496,6 +496,81 @@ independent finding. Decomposing it needs `per_class_ap.csv`.
 
 ---
 
+## 2026-09-05 — Proposed-v2 seed 0: STOP. Frozen negative result
+
+**The kill rule, applied mechanically to the numbers it was written for:**
+
+| | measured | threshold | |
+|---|---:|---:|---|
+| mean `new_class_AP50` | **0.06** | ≥ 3.56 | **fails** |
+| final `known_mAP50` | 48.07 | ≥ 44.89 | passes |
+
+Both were required. **Verdict: STOP.** Proposed-v2 does not get seeds 1 and 2.
+It is **not** tuned, **not** redesigned, and is preserved as a negative
+development-seed-informed result.
+
+**Seed 0, in full:** mean `known_mAP50` 50.21 · final `known_mAP50` 48.07 ·
+mean `new_class_AP50` 0.06 · mean `U_Recall50` 18.76 · cumulative forgetting
+7.31 · final `mAP50_tail` 39.01 · total oracle answers 8 977 · total supervised
+boxes 4 101.
+
+**What it establishes, carefully.** Proposed-v2 achieved the **highest mean
+U-Recall of any seed-0 arm** (18.76 > Proposed-v1's 18.05 > entropy 16.98 >
+admissibility 15.47 > random 15.34) **and** the **largest total supervised-box
+count** (4 101) — while essentially failing new-class learning. Breadth of
+unknown discovery did not translate into incremental new-class AP, and neither
+did quantity of supervision. One seed: a direction, not an effect.
+
+**Why this is more than a repeat of v1.** The two failures come from
+*different* mechanisms. v1 maximised coverage against a fixed labelled
+reference; v2 used coverage only to de-duplicate an uncertainty-filtered subset,
+with REF-T1 removed and an entropy median filter in front. They share only the
+farthest-first traversal. Both land in the bottom two on `new_class_AP50` and
+the top two on `U_Recall50`. The common factor is the traversal, which is
+exactly what section 5.2 of the supervisor note predicted: farthest-first caps
+per-class multiplicity by construction, so it buys one or two of everything and
+never the tens of instances a class needs.
+
+**What must not be concluded.** That semantic selection cannot work — two
+formulations of one traversal is not the space of semantic methods. That the
+admissibility gate is at fault — the `coreset` ablation that would have tested
+it is still unavailable (CUDA OOM, no endpoint). That any of this is
+statistically established — it is one development seed with an unmeasured
+nondeterminism floor.
+
+**The banking defect is not the explanation.** Mean `new_class_AP50` averages
+t2, t3 and t4, and t2's class is immune to the defect and best supplied. A mean
+of 0.06 requires ~zero at t2. See `docs/banking_defect_forensics_2026-09-04.md`.
+
+**Endpoints inspected?** Yes — Proposed-v2's own, which is what the kill rule
+exists to consume. No method was changed in response.
+
+---
+
+## 2026-09-05 — next: the mandatory replication, seed 1
+
+`random`, `admissibility`, `entropy` at **seed 1**. Nothing scientific changes:
+task chain, budget, candidate-pool semantics, full-image annotation, banking
+behaviour, `uniform` M=400 replay, training hyperparameters, evaluator, seed
+semantics and result schema are all as frozen. Only the seed moves.
+
+Excluded: `proposed` and `proposed_v2` (seed-0 negative results, preserved not
+replicated) and `coreset` (incomplete, CUDA OOM).
+
+Seed 0 is protected twice over — seed 1 writes `<arm>__seed1` directories, and a
+seed-1 configuration fingerprint differs from seed 0's, so a workspace collision
+would be refused rather than blended. Both are pinned by tests.
+
+One test changed with this entry, and it is worth recording why. The notebook
+validator asserted `SESSION_ARMS[:3] == ORDER[:3]`, which encoded "a short
+session still yields the primary contrast" — true while the whole pre-declared
+order was being run and a timeout would truncate it. A session now names a
+deliberate subset, so that property is **obsolete rather than violated**. The
+assertion was replaced with the invariant that still holds: the arms named must
+appear in the registry's relative order, and none twice.
+
+---
+
 ## Entries to add before the supervisor meeting
 
 * the outcome of the seed-0 session, and whether any stopping rule fired;

@@ -154,6 +154,61 @@ among real object-like candidates. Object-versus-background is left to PROB's
 objectness, which is what `A` is, because DINOv2 was measured **not** to
 separate those (`D_NO_GO`).
 
+### 3.1 Proposed-v2 — development-seed-informed. Ran, and STOPPED
+
+> **Provenance, first, because it changes how every number here must be read.**
+> Proposed-v2 was designed **after** inspection of Proposed-v1's seed-0 detector
+> endpoints. It is **not pre-registered**. Any table reporting it says so.
+>
+> The `coreset` gate ablation that was to have decided *why* v1 failed is
+> **unavailable**: its seed-0 run terminated with CUDA OOM and reported no
+> endpoint. **The A gate has therefore not been causally ruled out.**
+
+**Informativeness first, diversity second.** DINOv2 is demoted from the primary
+novelty objective to a redundancy-removal mechanism.
+
+1. population `P_nms` — **unchanged**;
+2. admissibility gate: top **0.30** by `A` — the existing frozen gate;
+3. **informativeness filter:** within the gated population, keep
+   `U >= median(U within the gated population)`. The median is over the
+   **gate**, not over `P_nms`;
+4. **farthest-first inside that subset only**, on the frozen DINOv2 ViT-B/14
+   crop. DINOv2 is no longer a distance-to-REF-T1 novelty score;
+5. **reference:** REF-T1 **removed**; only what this trajectory has itself
+   bought, growing per opened image and carrying across tasks. *Consequence of
+   step 4:* it holds ranked-subset embeddings, since nothing outside the subset
+   is embedded;
+6. **empty reference at t2:** first pick = maximum `A`, ties to lowest stable
+   pool index; coverage distance recorded as **null, not infinity**;
+7. everything else identical to sections 1, 2.1 and 4–7. `proposed_v2` is a
+   **new arm**; `proposed` is untouched.
+
+**Hyperparameters: one new explicit design choice, the median filter.** It is
+fixed as a parameter-free central quantile and never swept. It must **not** be
+described as free.
+
+**Outcome, seed 0, 2026-09-05 — the frozen kill rule says STOP.**
+
+| | measured | threshold | |
+|---|---:|---:|---|
+| mean `new_class_AP50` | **0.06** | ≥ 3.56 | **fails** |
+| final `known_mAP50` | 48.07 | ≥ 44.89 | passes |
+
+Both were required. Also measured: mean `known_mAP50` 50.21 · mean
+`U_Recall50` **18.76** · cumulative forgetting 7.31 · final `mAP50_tail` 39.01 ·
+total oracle answers 8 977 · total supervised boxes **4 101**.
+
+Proposed-v2 is preserved as a **negative development-seed-informed result**. It
+is not tuned, not redesigned and not replicated at seeds 1 and 2.
+
+**What it establishes.** It recorded the **highest mean `U_Recall50` of any
+seed-0 arm** and the **largest total supervised-box count**, and still failed
+new-class learning. Neither semantic breadth nor quantity of supervision
+translated into incremental new-class AP. Placed beside Proposed-v1 — a
+materially different objective sharing only the farthest-first traversal — the
+two coverage formulations hold the top two `U_Recall50` values and the bottom
+two `new_class_AP50` values. On one seed that is a direction, not an effect.
+
 ## 4. Annotation cost — the confound Method V3 exposed
 
 **Primary unit: the oracle answer, under full-image labelling.**

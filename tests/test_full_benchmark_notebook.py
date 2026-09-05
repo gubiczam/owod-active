@@ -262,8 +262,19 @@ def test_the_arms_come_from_the_registry(code_cells):
     named = re.findall(r'"([a-z_]+)"', match.group(1))
     assert named, "no arms named"
     assert set(named) <= set(arms.ARMS), named
-    # the pre-declared prefix, so a short session still yields the primary contrast
-    assert named[:3] == list(arms.ORDER[:3]), named
+    assert len(set(named)) == len(named), f"an arm is named twice: {named}"
+
+    # Relative order follows the registry. This used to assert the *prefix* of
+    # ORDER, which encoded "a short session still yields the primary contrast" —
+    # true while the whole pre-declared order was being run and a timeout would
+    # truncate it. A session may now name a deliberate subset (seed-1 replicates
+    # the three surviving baselines; `proposed`, `proposed_v2` and `coreset` are
+    # excluded for recorded reasons), so the prefix property is obsolete. What
+    # must still hold is that nobody reorders the arms.
+    positions = [arms.ORDER.index(name) for name in named]
+    assert positions == sorted(positions), (
+        f"{named} is not in the registry's order {list(arms.ORDER)}"
+    )
 
 
 def test_the_reporting_rules_are_printed_before_the_launcher(code_cells):
