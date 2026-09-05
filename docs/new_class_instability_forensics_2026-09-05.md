@@ -74,7 +74,19 @@ below.
 
 ### A. t2 `traffic light`: AP ≈ 0 even at 146 acquired objects
 
-**Not a supply failure. A learning failure, and the cause is object size.**
+> **Claim hygiene, added 2026-09-05.** An earlier version of this section said
+> "not a supply failure — a learning failure, and the cause is object size", and
+> my covering note said "the selector did its job; the detector couldn't use
+> it". **Both overstated what was measured.** Corrected below and in section 9.
+
+**MEASURED.** The object-size distribution; the acquired count (146, reported to
+me); the AP; the evaluation support. **HYPOTHESIS,** not tested here: that small
+object size together with a frozen objectness head and a five-epoch fine-tune is
+what makes `traffic light` hard to learn. Nothing in this report varies size,
+epochs or the frozen head, so the causal chain is inferred, not demonstrated.
+
+What the measurements rule *out* is the supply explanation specifically —
+and only that.
 
 Supply at t2 is the *best* of the three tasks by a wide margin. A random
 300-image draw is expected to contain ~70 `traffic light` boxes — **6.0 % of all
@@ -83,12 +95,13 @@ roughly twice that. Method V3's audit measured ≈0 AP from 23–101 instances a
 concluded supply was the binding constraint; at 146 instances and 6 % of the
 training set, that explanation is exhausted.
 
-What is left is the target itself: a **17-pixel** object, 78.5 % of instances
-below COCO-small, being learned by a Deformable-DETR fine-tuned for **5 epochs**
-on a few hundred images with **`freeze_prob_model=True`** — PROB's own
-procedure, which holds the objectness head fixed. The detector is not being
-asked to learn a new category so much as to detect a category it has no
-resolution for.
+What remains *unexplained by supply* is the target itself: a **17-pixel**
+object, 78.5 % of instances below COCO-small, learned by a Deformable-DETR
+fine-tuned for **5 epochs** on a few hundred images with
+**`freeze_prob_model=True`** — PROB's own procedure, which holds the objectness
+head fixed. The reading that this combination is what defeats the class is a
+**hypothesis consistent with the measurements**; it is not established, and
+experiment 3 of section 7E is what would test it.
 
 The zero is also **well measured**: 534 test objects on 160 images. It is a
 trustworthy zero, unlike the t3/t4 numbers below.
@@ -118,11 +131,13 @@ median 61 px side, 40 % of instances COCO-large — which is why anything is
 learned here at all and nothing is at t2.
 
 The **bimodality is the striking part**: across t3 and t4 the per-task outcomes
-are ≈0 or ≈20, with nothing between. That is the signature of a *few-shot
-threshold* — a class either catches or it does not — measured on a test set
-small enough that catching moves AP 20 points at once. Which arm lands on which
-side of the threshold at which task is, on present evidence, not shown to be a
-property of the selector.
+are ≈0 or ≈20, with nothing between. **MEASURED:** that pattern, in five arms ×
+two tasks. **INTERPRETATION, untested:** that it reflects a *few-shot threshold*
+— a class either catches or it does not. Distinguishing that from ordinary
+run-to-run variance needs repeated training of one fixed configuration, which is
+experiment 2 of section 7E and has never been run. What *is* supportable now is
+the negative: which arm lands on which side, at which task, has **not been shown**
+to be a property of the selector.
 
 ### D. Proposed-v2: 4 101 supervised boxes, highest U-Recall, 0.06 new-class AP
 
@@ -271,11 +286,14 @@ not convert into incremental new-class AP**, twice, under different objectives.
 
 **Both, cleanly separated by task — and this is the report's main finding.**
 
-* **t2 is a learning failure.** The selector delivered; the detector could not
-  use it. No acquisition strategy fixes a 17-pixel object.
-* **t3 and t4 are a supply-and-measurement failure.** No selector can acquire
-  many instances of a class present in ~3 % of pool images at a 300-image
-  budget, and no evaluation on 75 objects can resolve the difference if one did.
+* **t2: the supply explanation is ruled out** (6 % of boxes, 5.3× the median
+  class, 146 acquired, a zero measured on 534 objects). That the residual cause
+  is the detector — 17-pixel target, frozen objectness head, five epochs — is
+  the *leading hypothesis*, not a demonstrated fact.
+* **t3 and t4: supply and evaluation support are both measured to be tiny** —
+  ~10 acquired instances, 0.9 % of boxes, evaluated against 101 and 75 objects.
+  That these are *the* binding constraints is an inference from those numbers,
+  and the noise floor that would confirm it is unmeasured.
 
 **What is *not* supported: that any arm's selection quality has been shown to
 cause its new-class AP.** The t3/t4 differences that carry the entire arm
@@ -306,6 +324,38 @@ Nothing on this list is a new selection method, and none of it should be run
 before the seed-1 replication finishes.
 
 ---
+
+## 9. Measured versus hypothesised — the explicit list
+
+**MEASURED, from committed data or reported endpoints:**
+
+* object-size distributions per class, absolute and relative, on the exact
+  evaluation split (`traffic light` median 282 px², 78.5 % COCO-small);
+* evaluation support per class: 534 / 101 / 75 / **2** objects for
+  `traffic light` / `fire hydrant` / `stop sign` / `bear`, and that the frozen
+  split already contains **every** test image holding the latter three;
+* structural supply per task: 6.0 % / 0.88 % / 0.90 % of declared boxes, and
+  1:11 / 1:76 / 1:74 against `person`;
+* `entropy` acquired 146 `traffic light` objects at t2 (reported to me);
+* the per-arm and per-task AP values (reported to me);
+* mean `U_Recall50` vs mean `new_class_AP50`: Spearman −0.500, Pearson −0.613,
+  n = 5;
+* zero overlap between the evaluation split and anything trainable.
+
+**HYPOTHESIS, consistent with the above but not tested here:**
+
+* that small object size, a frozen objectness head and a five-epoch fine-tune
+  jointly explain t2's zero;
+* that the ≈0 / ≈20 bimodality at t3 and t4 is few-shot threshold behaviour
+  rather than ordinary training variance;
+* that `random`'s 6.82 at t3 is not a selection effect;
+* that Proposed-v2's extra supervised boxes are predominantly `person`.
+
+**NOT SUPPORTED by anything in this report:**
+
+* that any arm's selection quality causes its new-class AP;
+* that semantic coverage cannot work — two formulations of one traversal is not
+  the space of semantic methods.
 
 ## 8. A prediction of mine that has now failed
 
