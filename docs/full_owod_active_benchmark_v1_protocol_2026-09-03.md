@@ -503,8 +503,8 @@ contract.
   "seeds": [0, 1, 2],
   "nms_iou": 0.6,
   "admissible_share": 0.3,
-  "arms": ["random", "admissibility", "proposed", "entropy", "coreset", "proposed_v2"],
-  "development_seed_informed": ["proposed_v2"],
+  "arms": ["random", "admissibility", "proposed", "entropy", "coreset", "proposed_v2", "cost_aware", "distribution_aware_v1"],
+  "development_seed_informed": ["proposed_v2", "cost_aware", "distribution_aware_v1"],
   "kill_rule": {
     "arm": "proposed_v2",
     "seed": 0,

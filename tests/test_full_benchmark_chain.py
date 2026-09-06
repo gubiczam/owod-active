@@ -820,7 +820,15 @@ def test_the_kill_rule_reaches_the_manifest():
         test_set="owl_shared_test", test_images=837,
     )
     assert payload["kill_rule"] == benchmark.KILL_RULE.as_dict()
-    assert payload["development_seed_informed"] == ["proposed_v2"]
+    # Compared against the module rather than a literal: three arms are now
+    # development-seed-informed and the list will grow again. What must not
+    # change is that the manifest carries it and that nothing already on it
+    # silently drops off.
+    assert payload["development_seed_informed"] == list(
+        benchmark.DEVELOPMENT_SEED_INFORMED
+    )
+    assert "proposed_v2" in payload["development_seed_informed"]
+    assert set(payload["development_seed_informed"]) <= set(arms.ARMS)
     assert any("not\npre-registered" in line or "not pre-registered" in line
                for line in payload["provenance"])
     assert any("CUDA OOM" in line for line in payload["provenance"])

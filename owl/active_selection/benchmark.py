@@ -249,9 +249,18 @@ KILL_RULE = KillRule()
 #: Arms whose design followed inspection of a detector endpoint. Reported as
 #: such, always. Everything else in :data:`owl.active_selection.arms.ORDER` was
 #: fixed before the first trajectory ran.
-DEVELOPMENT_SEED_INFORMED: tuple[str, ...] = ("proposed_v2",)
+DEVELOPMENT_SEED_INFORMED: tuple[str, ...] = (
+    "proposed_v2", "cost_aware", "distribution_aware_v1",
+)
 
 PROVENANCE: tuple[str, ...] = (
+    (
+        "distribution_aware_v1 and its mandatory cost_aware control were frozen "
+        "on 2026-09-06 in docs/distribution_aware_decision_memo_2026-09-06.md, "
+        "after seed-0 and seed-1 endpoints were known. They are "
+        "development-seed-informed, not pre-registered, and no table may "
+        "present them otherwise."
+    ),
     (
         "Proposed-v2 was designed after inspection of Proposed-v1 "
         "development-seed (seed 0) results and is therefore "

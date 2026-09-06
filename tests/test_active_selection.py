@@ -573,14 +573,31 @@ def test_the_earlier_arms_keep_their_defaults():
     assert v2.gated is True and v2.needs_semantic is True
 
 
-def test_v2_is_last_in_the_declared_order():
-    """It was designed after seeing results, so it may not displace a baseline."""
+def test_no_development_seed_informed_arm_displaces_a_baseline():
+    """An arm designed after seeing results may not push a baseline down the list.
 
-    assert arms.ORDER[-1] == "proposed_v2"
+    This used to assert ``ORDER[-1] == "proposed_v2"``, which was the same
+    property when ``proposed_v2`` was the only development-seed-informed arm.
+    Three more were frozen on 2026-09-06 (``cost_aware`` and
+    ``distribution_aware_v1``), so "last" is now under-specified rather than
+    wrong: what must hold is that **every** such arm sits after **every**
+    pre-registered one, and that the pre-registered prefix is untouched.
+    """
+
+    from owl.active_selection import benchmark as bm
+
     assert arms.ORDER[:5] == (
         "random", "admissibility", "proposed", "entropy", "coreset"
     )
     assert set(arms.ORDER) == set(arms.ARMS)
+    informed = set(bm.DEVELOPMENT_SEED_INFORMED)
+    assert informed <= set(arms.ARMS), informed - set(arms.ARMS)
+    positions = [i for i, a in enumerate(arms.ORDER) if a in informed]
+    baselines = [i for i, a in enumerate(arms.ORDER) if a not in informed]
+    assert min(positions) > max(baselines), (
+        f"{[arms.ORDER[i] for i in positions]} must follow every pre-registered "
+        f"arm, but the order is {list(arms.ORDER)}"
+    )
 
 
 def test_v2_refuses_features_for_the_wrong_subset(built):

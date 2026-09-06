@@ -61,6 +61,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from owl import scoring
+from owl.active_selection import allocation as allocation_module
 from owl.active_selection import budget as ledger_module
 from owl.active_selection import coverage as coverage_module
 from owl.active_selection import population as population_module
@@ -144,6 +145,31 @@ ARMS: dict[str, Arm] = {
         description="A-gated, above-median-U, DINOv2 farthest-first for "
                     "redundancy removal only",
     ),
+    # ------------------------------------------- 2026-09-06, the D/R/C allocator
+    # Frozen by docs/distribution_aware_decision_memo_2026-09-06.md. Like
+    # `proposed_v2` it is development-seed-informed and NOT pre-registered, and
+    # every table that reports it must say so.
+    #
+    # It is a *ranking* arm that reads semantic features, which no earlier arm
+    # was: the plan's `R` is an allocation over clusters, and an allocation
+    # produces an order, not a traversal. `owl.active_selection.allocation`
+    # holds the algorithm and the reasons for each of its parts.
+    "distribution_aware_v1": Arm(
+        name="distribution_aware_v1", kind="ranking", needs_semantic=True,
+        gated=True, reference_aware=True, reference_scope="labelled",
+        description="A-gated HDBSCAN; coherence gate, cluster rarity quota "
+                    "against the labelled reference, entropy within cluster",
+    ),
+    # The mandatory control. The ceiling audit found that simply opening cheap
+    # images beats a perfect-cluster stratified allocator on raw tail counts, so
+    # without this arm a win by the allocator is not attributable to
+    # distribution-awareness. Label-free: it reads `A` and nothing else.
+    "cost_aware": Arm(
+        name="cost_aware", kind="ranking", needs_semantic=False, gated=True,
+        reference_aware=False,
+        description="A-gated, images ordered by descending sum-A over G — a "
+                    "label-free cheap-image preference, no clustering",
+    ),
 }
 
 #: Execution priority, fixed before the first trajectory ran. A session that
@@ -155,9 +181,20 @@ ARMS: dict[str, Arm] = {
 #: ``proposed_v2`` is **appended**, not inserted. It was designed after seeing
 #: seed-0 results, so it may not displace a baseline in the execution order; a
 #: short session completes the pre-registered prefix first and reaches v2 last.
+#: ``cost_aware`` and ``distribution_aware_v1`` are **appended** for the same
+#: reason ``proposed_v2`` was: both were designed after seeing seed-0 results and
+#: may not displace a pre-registered baseline in the execution order.
 ORDER: tuple[str, ...] = (
     "random", "admissibility", "proposed", "entropy", "coreset", "proposed_v2",
+    "cost_aware", "distribution_aware_v1",
 )
+
+
+#: The ranking arms whose order comes from an allocation rather than a score.
+#: Membership is what routes an arm away from the frozen `ranking()` path, so an
+#: arm that is not in here cannot have its measured behaviour changed by this
+#: module's 2026-09-06 additions.
+ALLOCATED: frozenset[str] = frozenset({"distribution_aware_v1", "cost_aware"})
 
 
 class ArmError(ValueError):
@@ -205,6 +242,53 @@ def ranking(
     else:
         raise ArmError(f"{arm!r} is not a ranking arm; kinds are {sorted(ARMS)}.")
     return np.argsort(-score, kind="mergesort").astype(np.int64)
+
+
+def allocated_ranking(
+    arm: str,
+    pool: Population,
+    index: np.ndarray,
+    *,
+    cost_of: Callable[[str], int],
+    answer_budget: int,
+    semantic: np.ndarray | None,
+    reference: np.ndarray | None,
+) -> tuple[np.ndarray, dict]:
+    """Pool positions for the two arms frozen on 2026-09-06.
+
+    Both are *ranking* arms that select inside the admissible subset ``G``, so
+    the order they build is over ``index`` and is mapped back to pool positions
+    before the ledger sees it. Neither reads an oracle class, an oracle box or a
+    future declaration; ``cost_of`` is the same annotation cost function the
+    ledger hands every arm.
+    """
+
+    if arm == "cost_aware":
+        order, diagnostics = allocation_module.cost_aware_order(
+            pool.admissibility[index], pool.candidates.image_ids[index],
+        )
+        return index[order], {"selector_detail": "sum_A_per_image"} | diagnostics
+
+    if arm != "distribution_aware_v1":
+        raise ArmError(f"{arm!r} has no allocated ranking")
+
+    features = np.asarray(semantic, dtype=np.float32)
+    if features.shape[0] != index.size:
+        raise ArmError(
+            f"semantic has {features.shape[0]} rows and arm {arm!r} selects over "
+            f"{index.size} candidates (the admissible subset G); the export does "
+            "not describe what this arm ranks."
+        )
+    entropy = scoring.uncertainty(pool.candidates, "entropy")[index]
+    result = allocation_module.distribution_aware_order(
+        features,
+        entropy=entropy,
+        image_ids=pool.candidates.image_ids[index],
+        cost_of=cost_of,
+        budget=int(answer_budget),
+        reference=reference,
+    )
+    return index[result.order], {"selector_detail": "cluster_quota"} | result.diagnostics
 
 
 def ranked_positions(arm: str, pool: Population) -> np.ndarray:
@@ -287,12 +371,26 @@ def select(
         )
 
     if spec.kind == "ranking":
-        order = ranking(arm, pool, seed=seed)
+        # The three pre-registered ranking arms keep the exact code path they
+        # were measured on. The two frozen on 2026-09-06 select inside `G` and
+        # build their order from an allocation, so they take the branch below;
+        # nothing about `random`, `entropy` or `admissibility` moves.
+        detail: dict[str, object] = {}
+        if arm in ALLOCATED:
+            index = ranked_positions(arm, pool)
+            order, detail = allocated_ranking(
+                arm, pool, index, cost_of=cost_of, answer_budget=answer_budget,
+                semantic=semantic, reference=reference,
+            )
+        else:
+            order = ranking(arm, pool, seed=seed)
         spend = ledger_module.spend_ranking(
             order, pool.candidates.image_ids, cost_of,
             budget=answer_budget, excluded_images=excluded_images,
         )
-        row: dict[str, object] = {"arm": arm, "selector": spec.kind} | spend.summary()
+        row: dict[str, object] = (
+            {"arm": arm, "selector": spec.kind} | spend.summary() | detail
+        )
         covered = np.isin(
             np.asarray(pool.candidates.image_ids, dtype=str),
             np.asarray(spend.images, dtype=str),
