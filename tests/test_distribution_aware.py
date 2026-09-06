@@ -8,6 +8,9 @@ that does not reproduce, a gate whose threshold drifted, a run that trains.
 
 from __future__ import annotations
 
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -318,6 +321,12 @@ def test_the_two_arms_are_marked_development_seed_informed():
 
 NOTEBOOK = ROOT / "notebooks" / "distribution_aware_diagnostic.ipynb"
 
+#: The frozen REF-T1 identity, from docs/method_v2_stage2_protocol_2026-09-02.md
+#: and tools/bootstrap_stage2_data.py. Restated here so a notebook that quietly
+#: stopped checking it fails a test rather than a run.
+FROZEN_REF_MANIFEST = (
+    "a062fc8f4fd43ea52842725aeaa5eccc0e06eab1894b867b248927bd9d2a2a63")
+
 
 def _cells(kind: str) -> list[str]:
     import json as _json
@@ -347,14 +356,22 @@ def test_the_notebook_pins_a_full_sha_that_carries_this_code():
         ["git", "-C", str(ROOT), "cat-file", "-e", f"{commit}^{{commit}}"],
         capture_output=True, check=False,
     ).returncode == 0, f"{commit} is not a commit in this repository"
-    drift = subprocess.run(
-        ["git", "-C", str(ROOT), "diff", "--name-only", commit, "HEAD", "--", "owl/"],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    assert not drift, (
-        f"owl/ differs between the pinned {commit[:12]} and HEAD:\n{drift}\n"
-        "Re-pin the notebook, or the session runs code this tree no longer has."
-    )
+    # `owl/` is not enough: the notebook also *executes* tools from the pinned
+    # checkout, so a fixed driver that the pin predates would be silently
+    # unfixed in Colab. Both trees are compared.
+    for tree in ("owl/", "tools/run_distribution_aware_diagnostic.py",
+                 "tools/prepare_full_owod_benchmark.py",
+                 "tools/export_ref_t1_features.py",
+                 "tools/bootstrap_stage2_data.py",
+                 "tools/materialize_pool_images.py"):
+        drift = subprocess.run(
+            ["git", "-C", str(ROOT), "diff", "--name-only", commit, "HEAD", "--", tree],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        assert not drift, (
+            f"{tree} differs between the pinned {commit[:12]} and HEAD:\n{drift}\n"
+            "Re-pin the notebook, or the session runs code this tree no longer has."
+        )
 
 
 def test_the_notebook_prints_the_gates_before_it_measures_anything():
@@ -365,9 +382,19 @@ def test_the_notebook_prints_the_gates_before_it_measures_anything():
 
 
 def test_the_notebook_cannot_train_and_says_so():
-    joined = "\n".join(_cells("code"))
-    for forbidden in ("run_full_owod_benchmark.py", "--epochs", "bridge.train"):
-        assert forbidden not in joined, forbidden
+    """No cell may *call* a training path. Prose that says it will not is fine —
+    and is in fact required by the second half of this test."""
+
+    import ast
+
+    for source in _cells("code"):
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            rendered = ast.unparse(node)
+            for forbidden in ("run_full_owod_benchmark.py", "bridge.train(",
+                              "bridge.evaluate(", "--epochs"):
+                assert forbidden not in rendered, f"{forbidden} in {rendered[:120]}"
     markdown = "\n".join(_cells("markdown")).lower()
     assert "no prob training" in markdown
     assert "not pre-registered" in markdown
@@ -383,4 +410,138 @@ def test_the_notebook_names_the_cell_a_later_one_depends_on():
     code = _cells("code")
     first = min(i for i, s in enumerate(code) if "diagnostic.configuration()" in s)
     assert '"diagnostic" not in globals()' in code[first]
-    assert "[3/7]" in code[first]
+    assert "[3/10]" in code[first]
+
+
+def test_every_tool_the_notebook_calls_accepts_the_flags_it_is_given():
+    """The defect that started this: a command built against an interface that
+    does not exist.
+
+    ``prepare_full_owod_benchmark.py`` was invoked with ``--prob-root`` and
+    ``--staging``, neither of which it has ever had, and a fresh Colab found out
+    in cell five. This extracts every ``tools/<x>.py`` invocation from the
+    notebook and checks each flag against that tool's own ``--help``.
+    """
+
+    joined = "\n".join(_cells("code"))
+    invocations = re.findall(
+        r'"tools"\s*/\s*"([a-z0-9_]+\.py)"(.*?)\]', joined, re.DOTALL)
+    assert invocations, "no tool invocations found — this test would be vacuous"
+
+    seen = set()
+    for tool, tail in invocations:
+        seen.add(tool)
+        path = ROOT / "tools" / tool
+        assert path.is_file(), f"{tool} does not exist"
+        help_text = subprocess.run(
+            [sys.executable, str(path), "--help"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        for flag in re.findall(r'"(--[a-z0-9-]+)"', tail):
+            assert flag in help_text, f"{tool} has no {flag}"
+    assert "prepare_full_owod_benchmark.py" in seen
+    assert "run_distribution_aware_diagnostic.py" in seen
+
+
+def test_the_notebook_prepares_annotations_and_not_the_evaluation_pixels():
+    """The diagnostic never evaluates, so the eval split's pixels are not read.
+
+    Both preparation modes extract the committed archives — which is where the
+    benchmark XML for every candidate image comes from — so the annotations the
+    detector needs are present either way.
+    """
+
+    joined = "\n".join(_cells("code"))
+    assert '"--annotations-only"' in joined
+    assert "Annotations" in joined and "per_image_class_counts.json" in joined
+
+
+def test_the_notebook_materialises_candidate_pixels():
+    """``prepare_full_owod_benchmark.py`` deliberately fetches no candidate
+    images, so something else must. Prove the notebook and the driver both know."""
+
+    prepare_help = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "prepare_full_owod_benchmark.py"), "--help"],
+        capture_output=True, text=True, check=True).stdout
+    assert "not** fetched here" in prepare_help or "not fetched here" in prepare_help.replace("*", "")
+
+    driver = (ROOT / "tools" / "run_distribution_aware_diagnostic.py").read_text(
+        encoding="utf-8")
+    assert "from tools.materialize_pool_images import materialise" in driver
+    assert "prepare_images(candidate_ids)" in driver
+    joined = "\n".join(_cells("code"))
+    assert "materialize_pool_images" in joined
+
+
+def test_ref_t1_is_mandatory_and_verified():
+    """One protocol, not two. An absent REF-T1 must rebuild or fail, never
+    silently degrade to an empty reference."""
+
+    joined = "\n".join(_cells("code"))
+    assert "ref_t1_dinov2_vitb14_cap1000_v1.npz" in joined, "wrong export filename"
+    assert FROZEN_REF_MANIFEST in joined, "the frozen manifest is not verified"
+    assert "bootstrap_stage2_data.py" in joined and "export_ref_t1_features.py" in joined
+    assert '"--ref-t1", str(REF_T1)' in joined, "the run must be handed REF-T1"
+
+    driver = (ROOT / "tools" / "run_distribution_aware_diagnostic.py").read_text(
+        encoding="utf-8")
+    assert "def require_reference" in driver
+    assert "require_reference(args.arms, args.ref_t1)" in driver
+
+
+def test_the_driver_refuses_to_run_without_ref_t1(tmp_path):
+    """The rule, exercised rather than asserted about."""
+
+    from tools import run_distribution_aware_diagnostic as driver
+
+    with pytest.raises(driver.DiagnosticError, match="REF-T1"):
+        driver.require_reference(["distribution_aware_v1"], None)
+    with pytest.raises(driver.DiagnosticError, match="REF-T1"):
+        driver.require_reference(["distribution_aware_v1"], tmp_path / "absent.npz")
+    # arms that do not consult it are unaffected
+    driver.require_reference(["entropy", "cost_aware"], None)
+
+
+def test_a_clean_run_all_defines_every_name_before_use():
+    """The dependency graph, checked instead of hoped for."""
+
+    from tools.audit_notebook_dataflow import analyse, code_cells
+
+    report = analyse(code_cells(NOTEBOOK))
+    undefined = {row["cell"]: row["undefined"] for row in report if row["undefined"]}
+    assert not undefined, undefined
+    # and the producer of each cell's inputs is an earlier cell, by construction
+    for row in report:
+        assert all(producer < row["cell"] for producer in row["consumes"].values())
+
+
+def test_the_notebook_reads_its_arms_and_seeds_from_the_module():
+    """A retyped constant is a constant that can drift from the frozen gates."""
+
+    joined = "\n".join(_cells("code"))
+    assert "SESSION_ARMS = diagnostic.DIAGNOSTIC_ARMS" in joined
+    assert "SESSION_SEEDS = diagnostic.DIAGNOSTIC_SEEDS" in joined
+
+
+def test_the_notebook_streams_failures_instead_of_swallowing_them():
+    """`capture_output=True` hides the traceback of the step that failed, which
+    is the one thing a three-hour Run all must not do."""
+
+    joined = "\n".join(_cells("code"))
+    assert "def _streamed(" in joined
+    assert "stderr=subprocess.STDOUT" in joined
+    assert "its output is above" in joined
+    # Every expensive step goes through it — checked on the call graph rather
+    # than on a window of surrounding text, which a long comment defeats.
+    import ast
+
+    streamed: set[str] = set()
+    for source in _cells("code"):
+        for node in ast.walk(ast.parse(source)):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "_streamed"):
+                # ast.unparse renders string literals with single quotes
+                streamed |= set(re.findall(r"[a-z0-9_]+\.py", ast.unparse(node)))
+    for tool in ("prepare_full_owod_benchmark.py", "bootstrap_stage2_data.py",
+                 "export_ref_t1_features.py", "run_distribution_aware_diagnostic.py"):
+        assert tool in streamed, f"{tool} is not run through _streamed"
