@@ -267,10 +267,10 @@ def test_the_arms_come_from_the_registry(code_cells):
     # Relative order follows the registry. This used to assert the *prefix* of
     # ORDER, which encoded "a short session still yields the primary contrast" —
     # true while the whole pre-declared order was being run and a timeout would
-    # truncate it. A session may now name a deliberate subset (seed-1 replicates
-    # the three surviving baselines; `proposed`, `proposed_v2` and `coreset` are
-    # excluded for recorded reasons), so the prefix property is obsolete. What
-    # must still hold is that nobody reorders the arms.
+    # truncate it. A session may now name a deliberate subset (the replication
+    # seeds run the three surviving baselines; `proposed`, `proposed_v2` and
+    # `coreset` are excluded for recorded reasons), so the prefix property is
+    # obsolete. What must still hold is that nobody reorders the arms.
     positions = [arms.ORDER.index(name) for name in named]
     assert positions == sorted(positions), (
         f"{named} is not in the registry's order {list(arms.ORDER)}"
@@ -366,7 +366,15 @@ def test_the_pinned_revision_carries_the_code_the_run_imports(code_cells):
     )
 
 
-def test_the_session_is_the_seed_one_replication(code_cells):
+def test_the_session_is_the_seed_two_replication(code_cells):
+    """The committed notebook launches exactly the session it advertises.
+
+    Seed 0 and seed 1 are complete for these three arms; this is the third and
+    last of the pre-registered seeds. The assertion moves with the session on
+    purpose — its job is that whoever presses Run all gets the run the file
+    claims, not some seed left behind by the previous session.
+    """
+
     source = code_cells[index_of(code_cells, PARAMETERS_TAG)]
     named = re.findall(
         r'"([a-z_]+)"',
@@ -374,7 +382,24 @@ def test_the_session_is_the_seed_one_replication(code_cells):
     )
     assert named == ["random", "admissibility", "entropy"], named
     seeds = re.search(r"SEEDS = \(([^)]*)\)", source).group(1)
-    assert seeds.strip().rstrip(",") == "1", seeds
+    assert seeds.strip().rstrip(",") == "2", seeds
+
+
+def test_the_session_runs_one_pre_registered_seed(code_cells):
+    """A seed is never invented by the notebook, and never batched with another.
+
+    Two seeds in one Run all would exceed the time budget and leave the second
+    trajectory half-trained; a seed outside the pre-registration would be a
+    protocol change made in a notebook cell.
+    """
+
+    source = code_cells[index_of(code_cells, PARAMETERS_TAG)]
+    body = re.search(r"SEEDS = \(([^)]*)\)", source).group(1)
+    values = [int(v) for v in re.findall(r"\d+", body)]
+    assert len(values) == 1, f"one seed per session, got {values}"
+    assert values[0] in benchmark.SEEDS, (
+        f"seed {values[0]} is not one of the pre-registered {benchmark.SEEDS}"
+    )
 
 
 def test_no_excluded_arm_can_launch(code_cells):

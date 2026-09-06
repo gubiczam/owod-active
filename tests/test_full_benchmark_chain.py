@@ -890,7 +890,9 @@ def test_the_replication_session_names_only_surviving_baselines():
     )
     seeds = _re.search(r"SEEDS = \(([^)]*)\)", source).group(1)
     assert named == ["random", "admissibility", "entropy"], named
-    assert seeds.strip().rstrip(",") == "1", seeds
+    # The seed moves with the session; it is pinned here as well as in
+    # tests/test_full_benchmark_notebook.py, so bumping a seed must update both.
+    assert seeds.strip().rstrip(",") == "2", seeds
     for excluded in ("proposed", "proposed_v2", "coreset"):
         assert excluded not in named
 

@@ -571,6 +571,70 @@ appear in the registry's relative order, and none twice.
 
 ---
 
+## 2026-09-06 — seed 1 completed. Recorded, not yet interpreted
+
+`random`, `admissibility` and `entropy` all completed at seed 1. Reported by the
+session, mean `new_class_AP50` over t2/t3/t4:
+
+| arm | seed 0 | seed 1 |
+|---|---|---|
+| `random` | 2.40 | 1.20 |
+| `admissibility` | 7.12 | 5.64 |
+| `entropy` | 7.31 | 10.06 |
+
+Contrasts against `random`, the pre-registered comparison:
+
+| contrast | seed 0 | seed 1 |
+|---|---|---|
+| `admissibility` − `random` | +4.71 | +4.44 |
+| `entropy` − `random` | +4.91 | +8.87 |
+
+**What is measured.** Both contrasts are positive on both seeds, and both arms
+outrank `random` on both seeds. `admissibility` − `random` is close to the same
+size twice (+4.71, +4.44). `entropy` − `random` is positive twice but not the
+same size (+4.91, +8.87).
+
+**What is not measured, and must not be asserted yet.** Whether the ordering
+survives a third seed — seed 2 is being run for that reason. Whether the gap is
+larger than the training-nondeterminism floor: that floor is still **unmeasured**
+(the Experiment-2 exact-repeat design in
+`docs/measurement_experiments_2026-09-05.md` is written and has not been run),
+so no separation claim is available from these six numbers. `random`'s own
+between-seed spread is 1.20 AP, which is the only variance figure that exists
+here and it is a single-arm, two-point range, not a variance estimate. Two seeds
+give a direction and a rough magnitude; they do not give an effect.
+
+Nothing about the arms, the acquisition, the banking defect or the small-object
+and low-supply findings in
+`docs/new_class_instability_forensics_2026-09-05.md` changes on this evidence.
+Those remain as written.
+
+---
+
+## 2026-09-06 — next: seed 2, the last pre-registered seed
+
+`random`, `admissibility`, `entropy` at **seed 2**. Session configuration only;
+every scientific constant is unchanged — task chain, budget, candidate-pool
+semantics, full-image annotation, banking behaviour, `uniform` M=400 replay,
+training hyperparameters, evaluator, checkpoint retention, seed semantics and
+result schema. Only the seed moves.
+
+Still excluded, unchanged reasons: `proposed` and `proposed_v2` (seed-0 negative
+results, preserved not replicated) and `coreset` (incomplete, CUDA OOM).
+
+Seed 2 is run because the pre-registration declares three seeds, **not** because
+seeds 0 and 1 were inspected and found ambiguous. Recording it this way matters:
+a third seed chosen after reading the first two would be a stopping rule made
+after the fact.
+
+Seeds 0 and 1 are protected the same way seed 0 was — seed 2 writes
+`<arm>__seed2` directories that neither occupies, and a seed-2 configuration
+fingerprint differs from both, so a workspace collision is refused rather than
+blended. Two tests pin it: the committed notebook names exactly one seed, and
+that seed must be one of the pre-registered `benchmark.SEEDS`.
+
+---
+
 ## Entries to add before the supervisor meeting
 
 * the outcome of the seed-0 session, and whether any stopping rule fired;
