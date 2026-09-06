@@ -63,6 +63,72 @@ class DiagnosticError(RuntimeError):
     """Raised when the diagnostic is asked for something it must not do."""
 
 
+#: Arrays a PROB predict export must carry to be readable by
+#: :func:`owl.proposals.from_predict`.
+PREDICT_ARRAYS = frozenset({"image_ids", "boxes", "posterior", "objectness",
+                            "embeddings"})
+
+
+def predict_cache_is_usable(path: Path) -> bool:
+    """Is this cached detector export complete, or was it cut off mid-write?
+
+    ``bridge.predict`` caches on the output path *existing*, and PROB writes that
+    file in place rather than through a temporary — so a session killed during a
+    detector pass leaves a truncated ``.npz`` that the next run would treat as
+    finished. The DINOv2 cache does not have this problem: it writes to
+    ``.npz.part`` and renames, so it is atomic by construction.
+
+    An ``.npz`` is a zip whose central directory sits at the **end** of the file,
+    so a truncated one cannot be opened at all — which makes the check cheap:
+    open the archive and look for the arrays, without decompressing any of them.
+    A full read would cost as much as the reuse it is protecting.
+    """
+
+    import zipfile
+
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    try:
+        with zipfile.ZipFile(path) as archive:
+            stored = {name.rsplit(".", 1)[0] for name in archive.namelist()}
+    except (zipfile.BadZipFile, OSError):
+        return False
+    return PREDICT_ARRAYS <= stored
+
+
+def quarantine(path: Path) -> Path:
+    """Move an unusable cache entry aside instead of deleting it.
+
+    Deleting would be the easy thing and the wrong one: a corrupt export is
+    evidence about how the session died, and the rule for this directory is that
+    nothing valid is ever destroyed. The next run simply does not find it.
+    """
+
+    spoiled = path.with_suffix(path.suffix + ".incomplete")
+    path.replace(spoiled)
+    return spoiled
+
+
+def verify_cache(workspace: Path) -> dict[str, object]:
+    """Report what an interrupted run left behind. Read-only."""
+
+    predicts = sorted((workspace / "_predict").glob("*.npz"))
+    usable = [p for p in predicts if predict_cache_is_usable(p)]
+    spoiled = [p for p in predicts if p not in set(usable)]
+    dino = sorted(workspace.glob("*__seed*/t*/dinov2_pool.npz"))
+    partial = sorted(workspace.glob("*__seed*/t*/*.part"))
+    references = sorted(workspace.glob("*__seed*/t*/coverage_reference.npz"))
+    return {
+        "predict_exports": len(predicts),
+        "predict_usable": len(usable),
+        "predict_incomplete": [str(p) for p in spoiled],
+        "dinov2_exports": len(dino),
+        "dinov2_tasks": [str(p.parent.relative_to(workspace)) for p in dino],
+        "coverage_reference_blocks": len(references),
+        "abandoned_part_files": [str(p) for p in partial],
+    }
+
+
 def require_reference(selected: Sequence[str], ref_t1: Path | None) -> None:
     """REF-T1 is a scientific prerequisite, not a convenience.
 
@@ -210,6 +276,11 @@ def run_arm(
         digest = hashlib.sha256("\n".join(sorted(candidate_ids)).encode()).hexdigest()
         shared = workspace / "_predict" / f"{digest[:16]}.npz"
         shared.parent.mkdir(parents=True, exist_ok=True)
+        if shared.exists() and not predict_cache_is_usable(shared):
+            spoiled = quarantine(shared)
+            print(f"  [{task.name}/{arm}] {shared.name} is incomplete — a session "
+                  f"died during that detector pass. Moved to {spoiled.name}; "
+                  "recomputing it.", flush=True)
         export = predict_for(candidate_ids, task=task, output=shared)
         candidates = proposals.from_predict(export)
         pool = population_module.build(candidates)
@@ -274,12 +345,23 @@ def main(argv=None) -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--seeds", type=int, nargs="+", default=list(gates.DIAGNOSTIC_SEEDS))
     parser.add_argument("--arms", nargs="+", default=list(gates.DIAGNOSTIC_ARMS))
+    parser.add_argument("--verify-cache", action="store_true",
+                        help="report what is already on disk and exit, changing "
+                             "nothing. Answers 'what is left to run?' before a "
+                             "resumed session spends anything")
     parser.add_argument("--fetch-workers", type=int, default=32)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--dry-run", action="store_true",
                         help="stub the detector and DINOv2; exercises every other line")
     args = parser.parse_args(argv)
+
+    if args.verify_cache:
+        report = verify_cache(args.out / "work")
+        print(json.dumps(report, indent=2))
+        if report["predict_incomplete"]:
+            print("\nThese will be recomputed on the next run; nothing else is lost.")
+        return 0
 
     print("=" * 78)
     print("FROZEN GATE CONFIGURATION — printed before anything is measured")
@@ -394,7 +476,12 @@ def _stubs(counts):
     """
 
     def predict_for(image_ids, *, task, output):
-        generator = np.random.default_rng(abs(hash((task.name, len(image_ids)))) % 2**32)
+        # A *stable* seed. `hash()` on strings is salted per interpreter, so a
+        # stub keyed on it produces different pools in every process — which
+        # silently makes a dry run non-reproducible and, worse, makes it useless
+        # for testing resume, since no cache entry is ever asked for twice.
+        key = hashlib.sha256(f"{task.name}:{len(image_ids)}".encode()).digest()
+        generator = np.random.default_rng(int.from_bytes(key[:8], "big"))
         n = len(image_ids) * bm.PROPOSALS_PER_IMAGE
         posterior = generator.dirichlet(np.full(81, 0.4), size=n).astype(np.float32)
         payload = {

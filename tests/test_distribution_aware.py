@@ -545,3 +545,119 @@ def test_the_notebook_streams_failures_instead_of_swallowing_them():
     for tool in ("prepare_full_owod_benchmark.py", "bootstrap_stage2_data.py",
                  "export_ref_t1_features.py", "run_distribution_aware_diagnostic.py"):
         assert tool in streamed, f"{tool} is not run through _streamed"
+
+
+# ---------------------------------------------------------------- resuming ---
+#
+# A three-hour session that dies at 90% must not cost three hours. The DINOv2
+# cache is atomic by construction (`.npz.part` then rename) and validated on
+# read by fingerprint; the detector cache is written in place by PROB and cached
+# on the path merely *existing*, so a pass cut off mid-write is the one way this
+# directory can hold a file that looks finished and is not.
+
+
+def _npz(path: Path, **arrays) -> Path:
+    import numpy as _np
+
+    _np.savez_compressed(path, **arrays)
+    return path
+
+
+def test_a_complete_predict_export_is_reusable(tmp_path):
+    from tools.run_distribution_aware_diagnostic import predict_cache_is_usable
+
+    good = _npz(
+        tmp_path / "good.npz",
+        image_ids=np.array(["a", "b"]), boxes=np.zeros((2, 4)),
+        posterior=np.ones((2, 81)) / 81, objectness=np.ones(2),
+        embeddings=np.zeros((2, 8)),
+    )
+    assert predict_cache_is_usable(good)
+
+
+@pytest.mark.parametrize("damage", ["truncate", "empty", "missing_array", "absent"])
+def test_an_incomplete_predict_export_is_not_reusable(tmp_path, damage):
+    """Each is a way a killed session leaves something that looks finished."""
+
+    from tools.run_distribution_aware_diagnostic import predict_cache_is_usable
+
+    path = tmp_path / "export.npz"
+    if damage == "absent":
+        assert not predict_cache_is_usable(path)
+        return
+    if damage == "empty":
+        path.write_bytes(b"")
+    elif damage == "missing_array":
+        _npz(path, image_ids=np.array(["a"]), boxes=np.zeros((1, 4)))
+    else:
+        full = _npz(tmp_path / "full.npz", image_ids=np.array(["a"] * 200),
+                    boxes=np.zeros((200, 4)), posterior=np.ones((200, 81)) / 81,
+                    objectness=np.ones(200), embeddings=np.zeros((200, 8)))
+        blob = full.read_bytes()
+        path.write_bytes(blob[: len(blob) // 2])
+    assert not predict_cache_is_usable(path)
+
+
+def test_an_unusable_entry_is_moved_aside_and_not_destroyed(tmp_path):
+    """The rule for this directory is that nothing is deleted. A corrupt export
+    is also evidence about how the session died."""
+
+    from tools.run_distribution_aware_diagnostic import quarantine
+
+    path = tmp_path / "export.npz"
+    path.write_bytes(b"not a zip")
+    spoiled = quarantine(path)
+    assert not path.exists()
+    assert spoiled.exists() and spoiled.read_bytes() == b"not a zip"
+    assert spoiled.name.endswith(".npz.incomplete")
+
+
+def test_verify_cache_reports_without_changing_anything(tmp_path):
+    from tools.run_distribution_aware_diagnostic import verify_cache
+
+    workspace = tmp_path / "work"
+    (workspace / "_predict").mkdir(parents=True)
+    _npz(workspace / "_predict" / "aaaa.npz", image_ids=np.array(["a"]),
+         boxes=np.zeros((1, 4)), posterior=np.ones((1, 81)) / 81,
+         objectness=np.ones(1), embeddings=np.zeros((1, 8)))
+    (workspace / "_predict" / "bbbb.npz").write_bytes(b"")
+    task = workspace / "entropy__seed0" / "t2"
+    task.mkdir(parents=True)
+    _npz(task / "dinov2_pool.npz", features=np.zeros((3, 4)))
+    (task / "dinov2_pool.npz.part").write_bytes(b"half")
+
+    before = sorted(p.name for p in workspace.rglob("*"))
+    report = verify_cache(workspace)
+    assert sorted(p.name for p in workspace.rglob("*")) == before
+
+    assert report["predict_exports"] == 2 and report["predict_usable"] == 1
+    assert len(report["predict_incomplete"]) == 1
+    assert report["dinov2_exports"] == 1
+    assert len(report["abandoned_part_files"]) == 1
+
+
+def test_a_resumed_run_reproduces_an_uninterrupted_one(tmp_path):
+    """The property the whole resume path exists for.
+
+    Run the diagnostic, corrupt a cached detector export the way a killed
+    session would, run again, and require the rows to be **byte-identical**. If
+    resuming could change a number, the cache would be a liability rather than a
+    saving.
+    """
+
+    from tools import run_distribution_aware_diagnostic as driver
+
+    out = tmp_path / "out"
+    arguments = ["--dry-run", "--out", str(out), "--seeds", "0"]
+    assert driver.main(arguments) == 0
+    first = (out / "diagnostic_rows.csv").read_bytes()
+
+    exports = sorted((out / "work" / "_predict").glob("*.npz"))
+    assert exports, "the dry run cached no detector export — this would be vacuous"
+    blob = exports[0].read_bytes()
+    exports[0].write_bytes(blob[: len(blob) // 2])
+    assert not driver.predict_cache_is_usable(exports[0])
+
+    assert driver.main(arguments) == 0
+    assert (out / "diagnostic_rows.csv").read_bytes() == first
+    assert list((out / "work" / "_predict").glob("*.incomplete"))
