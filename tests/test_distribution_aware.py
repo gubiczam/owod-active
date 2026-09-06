@@ -337,43 +337,65 @@ def _cells(kind: str) -> list[str]:
     return ["".join(c["source"]) for c in payload["cells"] if c["cell_type"] == kind]
 
 
-def test_the_notebook_pins_a_full_sha_that_carries_this_code():
-    """The pin may lag HEAD, but only by commits that do not touch ``owl/``.
+def test_the_pinned_revision_selects_identically_for_the_completed_no_go():
+    """The one-shot diagnostic is finished. Its pin stays; its behaviour must not.
 
-    The notebook cannot pin the commit that contains itself, so it pins the one
-    that contains the code it runs. This is the assertion that keeps that from
-    silently going stale: whatever it pins must give a byte-identical ``owl/``.
+    This used to compare ``git diff <pin> HEAD`` over ``owl/`` and the invoked
+    tools, which was right while the notebook was still being prepared. It is
+    the wrong check for a **completed** experiment: re-pinning a finished run
+    onto later code is how a result quietly becomes a different result, so the
+    pin is deliberately fixed and the tree is expected to move past it — the
+    iterative arm frozen afterwards necessarily changes ``owl/``.
+
+    The property stated behaviourally instead, and it is stronger: check out the
+    pinned ``owl/``, run the three arms this notebook ran on a fixed synthetic
+    pool in a subprocess, and require the same gated subsets and the same opened
+    images as this tree produces. If a change ever does reach ``entropy``,
+    ``cost_aware`` or ``distribution_aware_v1``, the completed NO-GO is no longer
+    reproducible and this fails.
     """
 
-    import re
+    import os
     import subprocess
+    import tempfile
 
     source = _cells("code")[0]
     match = re.search(r'OWL_COMMIT = "([0-9a-f]*)"', source)
     assert match and len(match.group(1)) == 40, "OWL_COMMIT must be a full 40-char SHA"
     assert 'assert len(PROB_COMMIT) == 40 and len(OWL_COMMIT) == 40' in source
     commit = match.group(1)
-
     assert subprocess.run(
         ["git", "-C", str(ROOT), "cat-file", "-e", f"{commit}^{{commit}}"],
-        capture_output=True, check=False,
-    ).returncode == 0, f"{commit} is not a commit in this repository"
-    # `owl/` is not enough: the notebook also *executes* tools from the pinned
-    # checkout, so a fixed driver that the pin predates would be silently
-    # unfixed in Colab. Both trees are compared.
-    for tree in ("owl/", "tools/run_distribution_aware_diagnostic.py",
-                 "tools/prepare_full_owod_benchmark.py",
-                 "tools/export_ref_t1_features.py",
-                 "tools/bootstrap_stage2_data.py",
-                 "tools/materialize_pool_images.py"):
-        drift = subprocess.run(
-            ["git", "-C", str(ROOT), "diff", "--name-only", commit, "HEAD", "--", tree],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        assert not drift, (
-            f"{tree} differs between the pinned {commit[:12]} and HEAD:\n{drift}\n"
-            "Re-pin the notebook, or the session runs code this tree no longer has."
-        )
+        capture_output=True, check=False).returncode == 0
+
+    # The notebook reads its arms from `diagnostic.DIAGNOSTIC_ARMS` rather than
+    # naming them, so the set it ran is that tuple as of the pinned revision.
+    import json as _json
+
+    named = _json.dumps(list(gates.DIAGNOSTIC_ARMS))
+    assert gates.DIAGNOSTIC_ARMS == (
+        "entropy", "cost_aware", "distribution_aware_v1"), gates.DIAGNOSTIC_ARMS
+    probe = ROOT / "tests" / "data" / "arm_behaviour_probe.py"
+
+    def fingerprint(tree: Path) -> str:
+        done = subprocess.run(
+            [sys.executable, str(probe), named],
+            capture_output=True, text=True, check=False,
+            env=dict(os.environ, PYTHONPATH=str(tree)), cwd=str(tree))
+        assert done.returncode == 0, done.stderr[-2000:]
+        return done.stdout.strip()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        pinned = Path(temporary)
+        archive = subprocess.run(["git", "-C", str(ROOT), "archive", commit, "owl"],
+                                 capture_output=True, check=True).stdout
+        subprocess.run(["tar", "-x", "-C", str(pinned)], input=archive, check=True)
+        before = fingerprint(pinned)
+    assert before == fingerprint(ROOT), (
+        f"the arms the completed diagnostic ran behave differently at the "
+        f"pinned {commit[:12]} than in this tree. Its NO-GO is no longer "
+        "reproducible from what this repository contains."
+    )
 
 
 def test_the_notebook_prints_the_gates_before_it_measures_anything():
@@ -903,3 +925,79 @@ def test_the_reconstruction_refuses_a_negative_split(tmp_path):
     with pytest.raises(ForensicError):
         early_purchases(load(path), "entropy", 0)
 
+
+
+# ------------------------------------------------- the iterative notebook ---
+
+ITERATIVE_NOTEBOOK = (
+    ROOT / "notebooks" / "distribution_aware_iterative_diagnostic.ipynb")
+
+
+def _iter_cells(kind: str) -> list[str]:
+    import json as _json
+
+    payload = _json.loads(ITERATIVE_NOTEBOOK.read_text(encoding="utf-8"))
+    return ["".join(c["source"]) for c in payload["cells"] if c["cell_type"] == kind]
+
+
+def test_the_iterative_notebook_writes_somewhere_new():
+    """The completed NO-GO must survive this session untouched."""
+
+    joined = "\n".join(_iter_cells("code"))
+    assert ('RESULTS_RELATIVE = "results/distribution_aware_iterative_diagnostic"'
+            in joined)
+    assert 'ONE_SHOT = DRIVE / "results" / "distribution_aware_diagnostic"' in joined
+    assert "assert RESULTS not in (FROZEN, ONE_SHOT)" in joined
+
+
+def test_the_iterative_notebook_runs_six_rounds_read_from_the_module():
+    joined = "\n".join(_iter_cells("code"))
+    assert "SESSION_ARMS = diagnostic.ITERATIVE_ARMS" in joined
+    assert "SESSION_ROUNDS = diagnostic.ITERATIVE_ROUNDS" in joined
+    assert '"--rounds", str(SESSION_ROUNDS)' in joined
+    assert "assert SESSION_ROUNDS == 6" in joined
+
+
+def test_the_iterative_notebook_prints_the_gates_first():
+    cells = _iter_cells("code")
+    printed = next(i for i, s in enumerate(cells) if "diagnostic.configuration()" in s)
+    ran = next(i for i, s in enumerate(cells)
+               if "run_distribution_aware_diagnostic.py" in s and "--rounds" in s)
+    assert printed < ran
+
+
+def test_the_iterative_notebook_pin_carries_this_code():
+    import subprocess as _sp
+
+    source = _iter_cells("code")[0]
+    match = re.search(r'OWL_COMMIT = "([0-9a-f]*)"', source)
+    assert match and len(match.group(1)) == 40
+    commit = match.group(1)
+    assert _sp.run(["git", "-C", str(ROOT), "cat-file", "-e", f"{commit}^{{commit}}"],
+                   capture_output=True, check=False).returncode == 0
+    for tree in ("owl/", "tools/run_distribution_aware_diagnostic.py"):
+        drift = _sp.run(
+            ["git", "-C", str(ROOT), "diff", "--name-only", commit, "HEAD", "--", tree],
+            capture_output=True, text=True, check=True).stdout.strip()
+        assert not drift, f"{tree} differs from the pinned {commit[:12]}:\n{drift}"
+
+
+def test_every_tool_the_iterative_notebook_calls_accepts_its_flags():
+    import subprocess as _sp
+
+    joined = "\n".join(_iter_cells("code"))
+    invocations = re.findall(
+        r'"tools"\s*/\s*"([a-z0-9_]+\.py)"(.*?)\]', joined, re.DOTALL)
+    assert invocations
+    for tool, tail in invocations:
+        help_text = _sp.run([sys.executable, str(ROOT / "tools" / tool), "--help"],
+                            capture_output=True, text=True, check=True).stdout
+        for flag in re.findall(r'"(--[a-z0-9-]+)"', tail):
+            assert flag in help_text, f"{tool} has no {flag}"
+
+
+def test_the_iterative_notebook_defines_every_name_before_use():
+    from tools.audit_notebook_dataflow import analyse, code_cells
+
+    report = analyse(code_cells(ITERATIVE_NOTEBOOK))
+    assert not {r["cell"]: r["undefined"] for r in report if r["undefined"]}
