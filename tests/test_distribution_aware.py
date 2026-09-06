@@ -312,3 +312,75 @@ def test_the_two_arms_are_marked_development_seed_informed():
         assert arm in bm.DEVELOPMENT_SEED_INFORMED, arm
     joined = " ".join(bm.PROVENANCE)
     assert "distribution_aware_v1" in joined and "not pre-registered" in joined
+
+
+# ------------------------------------------------- the diagnostic notebook ---
+
+NOTEBOOK = ROOT / "notebooks" / "distribution_aware_diagnostic.ipynb"
+
+
+def _cells(kind: str) -> list[str]:
+    import json as _json
+
+    payload = _json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    return ["".join(c["source"]) for c in payload["cells"] if c["cell_type"] == kind]
+
+
+def test_the_notebook_pins_a_full_sha_that_carries_this_code():
+    """The pin may lag HEAD, but only by commits that do not touch ``owl/``.
+
+    The notebook cannot pin the commit that contains itself, so it pins the one
+    that contains the code it runs. This is the assertion that keeps that from
+    silently going stale: whatever it pins must give a byte-identical ``owl/``.
+    """
+
+    import re
+    import subprocess
+
+    source = _cells("code")[0]
+    match = re.search(r'OWL_COMMIT = "([0-9a-f]*)"', source)
+    assert match and len(match.group(1)) == 40, "OWL_COMMIT must be a full 40-char SHA"
+    assert 'assert len(PROB_COMMIT) == 40 and len(OWL_COMMIT) == 40' in source
+    commit = match.group(1)
+
+    assert subprocess.run(
+        ["git", "-C", str(ROOT), "cat-file", "-e", f"{commit}^{{commit}}"],
+        capture_output=True, check=False,
+    ).returncode == 0, f"{commit} is not a commit in this repository"
+    drift = subprocess.run(
+        ["git", "-C", str(ROOT), "diff", "--name-only", commit, "HEAD", "--", "owl/"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert not drift, (
+        f"owl/ differs between the pinned {commit[:12]} and HEAD:\n{drift}\n"
+        "Re-pin the notebook, or the session runs code this tree no longer has."
+    )
+
+
+def test_the_notebook_prints_the_gates_before_it_measures_anything():
+    code = _cells("code")
+    printed = next(i for i, s in enumerate(code) if "diagnostic.configuration()" in s)
+    ran = next(i for i, s in enumerate(code) if "run_distribution_aware_diagnostic.py" in s)
+    assert printed < ran, "the frozen criteria must be on the record before the run"
+
+
+def test_the_notebook_cannot_train_and_says_so():
+    joined = "\n".join(_cells("code"))
+    for forbidden in ("run_full_owod_benchmark.py", "--epochs", "bridge.train"):
+        assert forbidden not in joined, forbidden
+    markdown = "\n".join(_cells("markdown")).lower()
+    assert "no prob training" in markdown
+    assert "not pre-registered" in markdown
+
+
+def test_the_notebook_writes_beside_the_frozen_benchmark_not_into_it():
+    joined = "\n".join(_cells("code"))
+    assert 'RESULTS_RELATIVE = "results/distribution_aware_diagnostic"' in joined
+    assert "assert RESULTS != FROZEN" in joined
+
+
+def test_the_notebook_names_the_cell_a_later_one_depends_on():
+    code = _cells("code")
+    first = min(i for i, s in enumerate(code) if "diagnostic.configuration()" in s)
+    assert '"diagnostic" not in globals()' in code[first]
+    assert "[3/7]" in code[first]

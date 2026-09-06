@@ -635,6 +635,47 @@ that seed must be one of the pre-registered `benchmark.SEEDS`.
 
 ---
 
+## 2026-09-06 — `distribution_aware_v1` implemented and frozen. Not yet measured
+
+The decision memo's method and its mandatory `cost_aware` control are
+implemented (`owl/active_selection/allocation.py`), the six gates are frozen as
+data (`owl/active_selection/diagnostic.py`) and the driver runs selection only.
+**No oracle outcome for either arm exists yet**, so nothing here is a result.
+
+**Declared before the run, because it is a real deviation.** A benchmark
+trajectory scores task *n*'s pool with the checkpoint task *n−1* produced for
+that arm. The diagnostic trains nothing, so there are no per-arm checkpoints and
+**every task of every arm is scored with the t1 anchor**. That holds the
+detector fixed and makes the comparison purely one about selection — which is
+what a candidate-side diagnostic is for — but `entropy` measured here is entropy
+under the anchor, not under an arm's own evolving model. It applies identically
+to all three arms, so it cannot favour one; it does mean the diagnostic's
+`entropy` rows are not comparable to the benchmark's `entropy` trajectory.
+
+**Two definitions pinned in code that the memo left as prose**, both fixed
+before any outcome:
+
+* *background share* = the share of opened images carrying **no** annotated
+  object. At image granularity under full-image labelling that is the
+  barren-image share, and it is what the committed candidate index supports.
+* *medoid* = the cluster member minimising the sum of **squared** distances to
+  its cluster, which on L2-normalised features is the member of greatest cosine
+  to the cluster mean. Exact and `O(n·d)`; the sum-of-unsquared-distances medoid
+  is `O(n²d)` and infeasible at 19,000 rows.
+
+**Seed 2 is untouched and remains a valid replication.** The launcher notebook
+keeps its `651adf02…` pin deliberately — a replication must run the revision its
+earlier seeds ran, so the pin is fixed and the tree is expected to move past it.
+The test that guarded this used to compare `git diff <pin> HEAD -- owl/`, which
+was the right check while the notebook tracked HEAD and the wrong one for a
+replication launcher. It now checks out the pinned `owl/` and requires
+`random`, `admissibility` and `entropy` to produce **identical orders, gated
+subsets and opened images** at the pin and in this tree. That is stronger than
+the file diff was, and it is what the replication claim actually needs.
+Verified non-vacuous by flipping the entropy sign at HEAD and watching it fail.
+
+---
+
 ## Entries to add before the supervisor meeting
 
 * the outcome of the seed-0 session, and whether any stopping rule fired;

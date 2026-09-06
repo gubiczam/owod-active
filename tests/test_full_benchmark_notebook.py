@@ -341,29 +341,73 @@ def test_the_owl_pin_is_a_full_forty_character_sha(code_cells):
     )
 
 
-def test_the_pinned_revision_carries_the_code_the_run_imports(code_cells):
-    """The pin may lag HEAD, but only by commits that do not touch ``owl/``.
+def test_the_pinned_revision_selects_identically_to_this_tree(code_cells):
+    """The pin must reproduce **what this session's arms do**, not the whole tree.
 
-    This is the reproducibility claim in one assertion: whatever the notebook
-    pins must give a byte-identical ``owl/`` to the working tree, so the run
-    executes the code this repository currently tests.
+    This used to assert ``git diff <pin> HEAD -- owl/`` was empty, which was the
+    right check while the notebook tracked HEAD. It is the wrong check for a
+    *replication* launcher. Seed 2 must run the revision seeds 0 and 1 ran, so
+    the pin is deliberately fixed and the tree is expected to move on — arms
+    frozen after the replication began (``cost_aware``,
+    ``distribution_aware_v1``) necessarily change ``owl/`` without changing
+    anything this session executes.
+
+    So the property is stated behaviourally instead, which is stronger than the
+    file diff ever was: check out the pinned ``owl/``, run the session's arms at
+    every seed on a fixed synthetic pool in a subprocess, and require the same
+    orders, the same gated subsets and the same opened images as this tree
+    produces. If a change ever does reach ``random``, ``admissibility`` or
+    ``entropy``, this fails and the replication is invalid.
     """
 
+    import hashlib
+    import os
+    import subprocess
+    import tempfile
+
     source = code_cells[index_of(code_cells, PARAMETERS_TAG)]
-    commit = re.search(r'OWL_COMMIT = "([0-9a-f]{40})"', source).group(1)
+    match = re.search(r'OWL_COMMIT = "([0-9a-f]*)"', source)
+    assert match and len(match.group(1)) == 40, "OWL_COMMIT must be a full 40-char SHA"
+    commit = match.group(1)
     assert subprocess.run(
         ["git", "-C", str(ROOT), "cat-file", "-e", f"{commit}^{{commit}}"],
         capture_output=True, check=False,
     ).returncode == 0, f"{commit} is not a commit in this repository"
 
-    drift = subprocess.run(
-        ["git", "-C", str(ROOT), "diff", "--name-only", commit, "HEAD", "--", "owl/"],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    assert not drift, (
-        f"owl/ differs between the pinned {commit[:12]} and HEAD:\n{drift}\n"
-        "Re-pin the notebook, or the session runs code this tree no longer has."
+    named = json.dumps(re.findall(
+        r'"([a-z_]+)"',
+        re.search(r"SESSION_ARMS = \(([^)]*)\)", source, re.DOTALL).group(1),
+    ))
+    probe = ROOT / "tests" / "data" / "arm_behaviour_probe.py"
+    assert probe.exists(), probe
+
+    def fingerprint(tree: Path) -> str:
+        environment = dict(os.environ, PYTHONPATH=str(tree))
+        done = subprocess.run(
+            [sys.executable, str(probe), named],
+            capture_output=True, text=True, env=environment, cwd=str(tree),
+            check=False,   # the assertion below reports the child's stderr
+        )
+        assert done.returncode == 0, done.stderr[-2000:]
+        return done.stdout.strip()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        pinned = Path(temporary)
+        archive = subprocess.run(
+            ["git", "-C", str(ROOT), "archive", commit, "owl"],
+            capture_output=True, check=True,
+        ).stdout
+        subprocess.run(["tar", "-x", "-C", str(pinned)], input=archive, check=True)
+        assert (pinned / "owl" / "active_selection" / "arms.py").exists()
+        before = fingerprint(pinned)
+    after = fingerprint(ROOT)
+
+    assert before == after, (
+        f"the arms this session runs behave differently at the pinned "
+        f"{commit[:12]} than in this tree ({before[:16]} vs {after[:16]}). "
+        "Seed 2 would not be a replication of seeds 0 and 1."
     )
+    assert len(before) == len(hashlib.sha256().hexdigest())
 
 
 def test_the_session_is_the_seed_two_replication(code_cells):
