@@ -393,3 +393,49 @@ because the test was pre-registered before this NO-GO, and because it costs
 If it fails, it is preserved as the fourth negative and **this D/R/C
 formulation stops there** — no v3, no tail-specific heuristic, no banking fix
 used to rescue it. Contribution B is not launched.
+
+---
+
+## 8. Correction to §2.2, and the state of A1 / A2
+
+**Recorded as a correction rather than an edit, because §2.2 was wrong about
+what the file can do.** It said per-class early purchase was unavailable. It is
+**exactly recoverable**, and the conclusions in §1–§7 are unaffected.
+
+No column is a per-class counter, but three are linear in the quantities wanted.
+Writing `FH2` for fire hydrants on images opened at t2 and `SS2`, `SS3` for stop
+signs opened at t2 and t3, then from `oracle_row`:
+
+* `future_new_objects` sums the **later-declared** classes: `FH2 + SS2` at t2,
+  `SS3` at t3, `0` at t4;
+* `banked_from_earlier` is `held[declared class]` read **before** the task's own
+  purchases are added: `0` at t2, `FH2` at t3, `SS2 + SS3` at t4.
+
+So `FH2 = banked(t3)`, `SS3 = future_new(t3)`, `SS2 = banked(t4) − future_new(t3)`
+— and the system is over-determined, which yields a free audit:
+
+```
+future_new(t2)  ==  banked(t3) + banked(t4) - future_new(t3)
+```
+
+`tools/close_part_a.py` performs the reconstruction and **refuses to report if
+that identity fails**, rather than printing a plausible number.
+
+| | status |
+|---|---|
+| **A1** — did it buy more future t3/t4 objects early than entropy? | **open.** Exactly answerable; the file is on Drive and unreachable from the machine this was written on. One command closes it. |
+| **A2** — what fraction of early purchases banking lost, per arm | **NOT RECOVERABLE FROM PERSISTED ARTEFACTS.** Banking survival is a property of *which* images were opened, and the opened image identities were never written. Not estimated. |
+
+```bash
+python tools/close_part_a.py \
+  /content/drive/MyDrive/OWL/results/distribution_aware_diagnostic/diagnostic_rows.csv
+```
+
+**No A1 outcome can change the decision in §7, and this was settled before the
+numbers were seen.** If it bought *more* early, its discovery mechanism works
+and the failure is in the per-image normalisation — which leaves the NO-GO
+standing and, if anything, strengthens the case for testing whether rounds
+convert discovery into supply. If it bought *fewer*, that is the selector
+failing at discovery, which is §3.1's prediction and also leaves the NO-GO
+standing. Both readings say run the iterative test once. A1 is worth closing
+because it decides *which* negative we are looking at, not whether to look.
