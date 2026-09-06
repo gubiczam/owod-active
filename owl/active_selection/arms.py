@@ -55,6 +55,7 @@ object-like candidates, which is what it was measured to improve.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -160,6 +161,24 @@ ARMS: dict[str, Arm] = {
         description="A-gated HDBSCAN; coherence gate, cluster rarity quota "
                     "against the labelled reference, entropy within cluster",
     ),
+    # ------------------------------------------ 2026-09-06, the iterative form
+    # Frozen by docs/iterative_decision_memo_2026-09-06.md. The ONLY scientific
+    # difference from `distribution_aware_v1` is that the clustering, the rarity
+    # and the quota are recomputed after each annotation round against a
+    # reference that has grown by what the round bought.
+    #
+    # It exists because v1 tested a degenerate case of the specification: `R` is
+    # defined against what is already labelled, and one-shot froze that for a
+    # whole task. Rounds were on the register from the 2026-08-25 consultation,
+    # before v1's NO-GO, so this is completing a pre-registration rather than
+    # reacting to a result.
+    "distribution_aware_iterative_v1": Arm(
+        name="distribution_aware_iterative_v1", kind="iterative",
+        needs_semantic=True, gated=True, reference_aware=True,
+        reference_scope="labelled",
+        description="distribution_aware_v1 with the reference, clusters, rarity "
+                    "and quota recomputed after each annotation round",
+    ),
     # The mandatory control. The ceiling audit found that simply opening cheap
     # images beats a perfect-cluster stratified allocator on raw tail counts, so
     # without this arm a win by the allocator is not attributable to
@@ -186,7 +205,7 @@ ARMS: dict[str, Arm] = {
 #: may not displace a pre-registered baseline in the execution order.
 ORDER: tuple[str, ...] = (
     "random", "admissibility", "proposed", "entropy", "coreset", "proposed_v2",
-    "cost_aware", "distribution_aware_v1",
+    "cost_aware", "distribution_aware_v1", "distribution_aware_iterative_v1",
 )
 
 
@@ -195,6 +214,11 @@ ORDER: tuple[str, ...] = (
 #: arm that is not in here cannot have its measured behaviour changed by this
 #: module's 2026-09-06 additions.
 ALLOCATED: frozenset[str] = frozenset({"distribution_aware_v1", "cost_aware"})
+
+#: The arm whose selection is a loop over rounds rather than one ranking. It
+#: needs its own branch in :func:`select` because the ledger is consulted
+#: *between* recomputations, not once at the end.
+ITERATIVE: frozenset[str] = frozenset({"distribution_aware_iterative_v1"})
 
 
 class ArmError(ValueError):
@@ -347,6 +371,7 @@ def select(
     semantic: np.ndarray | None = None,
     reference: np.ndarray | None = None,
     excluded_images: frozenset[str] = frozenset(),
+    rounds: int = 1,
 ) -> ArmSelection:
     """Spend one task's annotation budget with ``arm``.
 
@@ -370,6 +395,43 @@ def select(
             "this arm."
         )
 
+    if spec.kind == "iterative":
+        features = np.asarray(semantic, dtype=np.float32)
+        index = ranked_positions(arm, pool)
+        if features.shape[0] != index.size:
+            raise ArmError(
+                f"semantic has {features.shape[0]} rows and arm {arm!r} selects "
+                f"over {index.size} candidates (the admissible subset G); the "
+                "export does not describe what this arm ranks."
+            )
+        result = allocation_module.distribution_aware_iterative_order(
+            features,
+            entropy=scoring.uncertainty(pool.candidates, "entropy")[index],
+            image_ids=pool.candidates.image_ids[index],
+            cost_of=cost_of, budget=int(answer_budget), rounds=int(rounds),
+            reference=reference, excluded_images=frozenset(excluded_images),
+        )
+        covered = np.zeros(len(pool), dtype=bool)
+        covered[index[result.covered]] = True
+        row = (
+            {"arm": arm, "selector": spec.kind, "rounds": int(rounds),
+             "selector_detail": "cluster_quota_iterative"}
+            | result.diagnostics
+            # The same ledger columns the ranking arms report, so one CSV
+            # describes both and `diagnostic.evaluate` needs no special case.
+            | {"answer_budget": int(answer_budget),
+               "answers_unspent": int(answer_budget) - int(result.diagnostics["answers_spent"]),
+               "answers_per_image": round(
+                   int(result.diagnostics["answers_spent"])
+                   / max(len(result.images), 1), 3),
+               "round_log": json.dumps(list(result.rounds))}
+        )
+        return ArmSelection(
+            arm=arm, images=result.images,
+            anchors=tuple(int(index[a]) for a in result.anchors),
+            row=row, covered=covered,
+        )
+
     if spec.kind == "ranking":
         # The three pre-registered ranking arms keep the exact code path they
         # were measured on. The two frozen on 2026-09-06 select inside `G` and
@@ -384,9 +446,14 @@ def select(
             )
         else:
             order = ranking(arm, pool, seed=seed)
-        spend = ledger_module.spend_ranking(
+        # The round schedule is applied to every arm, not only to the one that
+        # recomputes. For a static ranking it is provably a no-op under the
+        # carry rule, and asserting that on the real code path is what lets the
+        # completed one-shot rows stand as the 6-round rows.
+        spend = ledger_module.spend_ranking_in_rounds(
             order, pool.candidates.image_ids, cost_of,
-            budget=answer_budget, excluded_images=excluded_images,
+            budget=answer_budget, rounds=int(rounds),
+            excluded_images=excluded_images,
         )
         row: dict[str, object] = (
             {"arm": arm, "selector": spec.kind} | spend.summary() | detail

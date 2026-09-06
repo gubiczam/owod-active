@@ -46,6 +46,15 @@ DIAGNOSTIC_SEEDS: tuple[int, ...] = (0, 1)
 #: distribution-awareness.
 DIAGNOSTIC_ARMS: tuple[str, ...] = ("entropy", "cost_aware", "distribution_aware_v1")
 
+#: The iterative session, frozen by ``docs/iterative_decision_memo_2026-09-06.md``.
+#: Six rounds is the 2026-08-25 consultation's own declared ablation; 500 follows
+#: from this protocol's 3,000-answer budget. 6x100 belonged to the 600-region
+#: protocol and is not reused. The number of rounds was fixed before the arm
+#: existed and may not be chosen from an outcome.
+ITERATIVE_ROUNDS = 6
+ITERATIVE_ARMS: tuple[str, ...] = (
+    "entropy", "cost_aware", "distribution_aware_iterative_v1")
+
 
 @dataclass(frozen=True)
 class Gate:
@@ -131,6 +140,31 @@ def configuration() -> dict[str, object]:
 
 
 # ------------------------------------------------------------- measurement ---
+
+
+#: The two arms every gate is measured *against*. Frozen with the gates: the
+#: strong baseline, and the control without which a win is not attributable to
+#: distribution-awareness.
+COMPARATORS: tuple[str, ...] = ("entropy", "cost_aware")
+
+
+def method_under_test(arms: Sequence[str]) -> str:
+    """Which arm the gates judge. Derived, never assumed.
+
+    The gates compare one method against two fixed comparators, so the method is
+    whatever is left. Deriving it is not a nicety: the first version of
+    :func:`evaluate` defaulted to ``"distribution_aware_v1"`` by name, which
+    silently judged the wrong arm the moment a second method existed — it raised
+    ``KeyError`` on a session that ran the iterative arm instead.
+    """
+
+    rest = [a for a in arms if a not in COMPARATORS]
+    if len(rest) != 1:
+        raise ValueError(
+            f"the gates judge exactly one method against {list(COMPARATORS)}; "
+            f"{list(arms)} leaves {rest}"
+        )
+    return rest[0]
 
 
 def _by(rows: Sequence[Mapping[str, object]], arm: str, seed: int) -> list[dict]:
@@ -219,7 +253,7 @@ def evaluate(
     rows: Sequence[Mapping[str, object]],
     opened: Mapping[tuple[str, int, str], Sequence[str]],
     *,
-    method: str = "distribution_aware_v1",
+    method: str,
     seeds: Sequence[int] = DIAGNOSTIC_SEEDS,
 ) -> Verdict:
     """Apply the frozen gates to measured rows. No thresholds are read from data."""

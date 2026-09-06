@@ -251,6 +251,7 @@ KILL_RULE = KillRule()
 #: fixed before the first trajectory ran.
 DEVELOPMENT_SEED_INFORMED: tuple[str, ...] = (
     "proposed_v2", "cost_aware", "distribution_aware_v1",
+    "distribution_aware_iterative_v1",
 )
 
 PROVENANCE: tuple[str, ...] = (

@@ -229,6 +229,7 @@ def run_arm(
     prepare_images: Callable[[Sequence[str]], Sequence[str]] | None,
     budget: int,
     pool_size: int,
+    rounds: int = 1,
 ) -> tuple[list[dict], dict[tuple[str, int, str], list[str]]]:
     spec = arm_registry.ARMS[arm]
     cost_of = annotation_budget.cost_function(counts)
@@ -305,7 +306,7 @@ def run_arm(
         picked = arm_registry.select(
             arm, pool, cost_of=cost_of, answer_budget=budget, seed=seed,
             semantic=features, reference=reference,
-            excluded_images=frozenset(used),
+            excluded_images=frozenset(used), rounds=rounds,
         )
 
         if spec.needs_semantic and features is not None:
@@ -345,6 +346,13 @@ def main(argv=None) -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--seeds", type=int, nargs="+", default=list(gates.DIAGNOSTIC_SEEDS))
     parser.add_argument("--arms", nargs="+", default=list(gates.DIAGNOSTIC_ARMS))
+    parser.add_argument("--rounds", type=int, default=1,
+                        help="annotation rounds per task. 1 is one-shot and is "
+                             "what every completed arm ran; the frozen "
+                             "iterative session uses "
+                             f"{gates.ITERATIVE_ROUNDS}. The remainder is "
+                             "carried between rounds, which makes the schedule "
+                             "a provable no-op for a static ranking")
     parser.add_argument("--verify-cache", action="store_true",
                         help="report what is already on disk and exit, changing "
                              "nothing. Answers 'what is left to run?' before a "
@@ -423,7 +431,7 @@ def main(argv=None) -> int:
                 predict_for=predict_for, features_for=features_for,
                 reference_for=reference_for, ref_t1=args.ref_t1,
                 prepare_images=prepare, budget=bm.ANSWER_BUDGET_PER_TASK,
-                pool_size=bm.CANDIDATE_IMAGES_PER_TASK,
+                pool_size=bm.CANDIDATE_IMAGES_PER_TASK, rounds=args.rounds,
             )
             rows.extend(got)
             opened.update(by_task)
@@ -439,7 +447,8 @@ def main(argv=None) -> int:
         writer.writeheader()
         writer.writerows(rows)
 
-    verdict = gates.evaluate(rows, opened, seeds=args.seeds)
+    verdict = gates.evaluate(
+        rows, opened, method=gates.method_under_test(args.arms), seeds=args.seeds)
     payload = {"configuration": gates.configuration(), **verdict.as_dict()}
     (args.out / "verdict.json").write_text(
         json.dumps(payload, indent=2) + "\n", encoding="utf-8")

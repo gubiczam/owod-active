@@ -169,6 +169,58 @@ def spend_ranking(
     )
 
 
+def spend_ranking_in_rounds(
+    order: Sequence[int] | np.ndarray,
+    image_ids: np.ndarray,
+    cost_of: Callable[[str], int],
+    *,
+    budget: int,
+    rounds: int,
+    excluded_images: frozenset[str] = frozenset(),
+) -> Spend:
+    """Spend one task's budget in ``rounds`` instalments, carrying the remainder.
+
+    Round *r* is allowed ``budget * r // rounds`` in total, so whatever an
+    earlier round could not place is still available later. That carry is what
+    makes the schedule **exactly** equivalent to one pass for a ranking that does
+    not move between rounds: the order is the same, the skip rule is the same,
+    and the budget is conserved rather than being re-clipped six times.
+
+    Without the carry each round stops on its own unaffordable image and the
+    campaign quietly shrinks — measured, three fewer images out of 317 — which
+    would confound a comparison between a one-shot arm and an iterative one with
+    a difference that has nothing to do with either method.
+
+    For an arm whose order *does* move between rounds this is not equivalent, and
+    that is the point: it is the schedule, applied identically to every arm, so
+    the only thing that differs is whether the arm has anything to recompute.
+    """
+
+    if rounds < 1:
+        raise ValueError(f"rounds must be at least 1, got {rounds}")
+    image_ids = np.asarray(image_ids, dtype=str)
+    combined = Ledger(budget=int(budget))
+    images: list[str] = []
+    anchors: list[int] = []
+    scanned = redundant = 0
+    for index in range(1, int(rounds) + 1):
+        allowance = int(budget) * index // int(rounds) - combined.spent
+        if allowance <= 0:
+            continue
+        spend = spend_ranking(
+            order, image_ids, cost_of, budget=allowance,
+            excluded_images=frozenset(excluded_images) | set(images),
+        )
+        for image, cost in zip(spend.images, spend.ledger.costs, strict=True):
+            combined.charge(image, cost)
+        images.extend(spend.images)
+        anchors.extend(spend.anchors)
+        scanned += spend.scanned
+        redundant += spend.redundant
+    return Spend(images=tuple(images), anchors=tuple(anchors),
+                 ledger=combined, scanned=scanned, redundant=redundant)
+
+
 # ------------------------------------------------------------- supervision ---
 
 

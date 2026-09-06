@@ -296,6 +296,137 @@ def distribution_aware_order(
     )
 
 
+@dataclass(frozen=True)
+class IterativeSelection:
+    """What the iterative arm bought, and what each round did."""
+
+    images: tuple[str, ...]
+    anchors: tuple[int, ...]
+    covered: np.ndarray                   # positions on opened images
+    rounds: tuple[dict, ...]
+    diagnostics: dict = field(default_factory=dict)
+
+
+def round_allowance(budget: int, rounds: int, index: int, spent: int) -> int:
+    """This round's allowance, with the whole unspent remainder carried forward.
+
+    ``budget * index // rounds - spent``: round *r* may spend its own share plus
+    everything earlier rounds could not place. Without the carry the schedule
+    silently shrinks the campaign — six separate stopping decisions instead of
+    one — so a 6x500 run would not be comparable to the 3000 it replaces.
+    Measured: with the carry a static ranking opens the identical images in the
+    identical order; without it, three fewer.
+    """
+
+    return max(int(budget) * int(index) // int(rounds) - int(spent), 0)
+
+
+def distribution_aware_iterative_order(
+    features: np.ndarray,
+    *,
+    entropy: np.ndarray,
+    image_ids: Sequence[str],
+    cost_of: Callable[[str], int],
+    budget: int,
+    rounds: int,
+    reference: np.ndarray | None = None,
+    excluded_images: frozenset[str] = frozenset(),
+) -> IterativeSelection:
+    """``distribution_aware_v1``, recomputed between annotation rounds.
+
+    The **only** scientific difference from
+    :func:`distribution_aware_order` is that the clustering, the rarity and the
+    quota are recomputed after each round against a reference that has grown by
+    what the round bought. Every definition is the one v1 used: the same ``A``
+    gate upstream, the same DINOv2 matrix (**subset**, never re-embedded), the
+    same HDBSCAN family, the same ``C``, the same ``R``, the same quota rule, the
+    same ``U`` ordering, the same ledger.
+
+    Why this is not a new method. ``R_k`` is defined against what is *already
+    labelled*, and one-shot froze that reference for a whole task — so v1 tested
+    a degenerate case of the specification rather than the specification. The
+    2026-08-25 consultation raised rounds directly, and measured them helping
+    exactly the arms with something to update.
+
+    ``min_cluster_size`` is derived from the **task** budget, not the round's, so
+    it stays numerically what v1 used; only the eligible count shrinks, which is
+    a consequence of the round structure and not a choice. Deriving it from the
+    round allowance instead would coarsen the partition roughly sixfold and
+    would be a second scientific change.
+    """
+
+    features = np.asarray(features, dtype=np.float64)
+    entropy = np.asarray(entropy, dtype=np.float64)
+    image_ids = np.asarray(image_ids, dtype=str)
+    if rounds < 1:
+        raise AllocationError(f"rounds must be at least 1, got {rounds}")
+
+    unique_images = sorted(set(image_ids.tolist()))
+    mean_cost = float(np.mean([cost_of(i) for i in unique_images]))
+    size = min_cluster_size(features.shape[0], budget=budget, mean_image_cost=mean_cost)
+
+    blocks = [np.asarray(reference, dtype=np.float64)] if (
+        reference is not None and len(reference)) else []
+    opened: list[str] = []
+    anchors: list[int] = []
+    spent = 0
+    history: list[dict] = []
+
+    for index in range(1, rounds + 1):
+        allowance = round_allowance(budget, rounds, index, spent)
+        eligible = np.flatnonzero(~np.isin(image_ids, list(excluded_images) + opened))
+        if allowance <= 0 or eligible.size == 0:
+            history.append({"round": index, "allowance": allowance,
+                            "eligible": int(eligible.size), "images": 0,
+                            "answers": 0, "stopped": "exhausted"})
+            continue
+
+        labels = cluster(features[eligible], size=size)
+        ids, centres = medoids(features[eligible], labels)
+        stacked = np.vstack(blocks) if blocks else None
+        n_ref = reference_counts(stacked, ids, centres)
+        quota, _ = quotas(labels, ids, n_ref, budget=allowance)
+        local, _ = emit(labels, quota, entropy[eligible],
+                        image_ids[eligible], cost_of)
+
+        from owl.active_selection import budget as ledger_module
+
+        spend = ledger_module.spend_ranking(
+            eligible[local], image_ids, cost_of, budget=allowance,
+            excluded_images=frozenset(excluded_images) | set(opened),
+        )
+        opened.extend(spend.images)
+        anchors.extend(int(a) for a in spend.anchors)
+        spent += spend.ledger.spent
+        # The reference grows by what this round bought — the whole point.
+        bought = np.isin(image_ids, list(spend.images))
+        if bought.any():
+            blocks.append(features[bought])
+        history.append({
+            "round": index, "allowance": int(allowance),
+            "eligible": int(eligible.size), "clusters": int(ids.size),
+            "noise": int(np.count_nonzero(labels < 0)),
+            "min_cluster_size": int(size),
+            "reference_rows": int(sum(len(b) for b in blocks)),
+            "images": len(spend.images), "answers": int(spend.ledger.spent),
+        })
+
+    covered = np.isin(image_ids, list(opened))
+    return IterativeSelection(
+        images=tuple(opened), anchors=tuple(anchors), covered=covered,
+        rounds=tuple(history),
+        diagnostics={
+            "candidates": int(features.shape[0]),
+            "mean_image_cost": round(mean_cost, 4),
+            "min_cluster_size": int(size),
+            "rounds_run": len(history),
+            "answers_spent": int(spent),
+            "images_opened": len(opened),
+            "reference_rows_final": int(sum(len(b) for b in blocks)),
+        },
+    )
+
+
 def cost_aware_order(
     admissibility: np.ndarray, image_ids: Sequence[str]
 ) -> tuple[np.ndarray, dict]:

@@ -257,7 +257,8 @@ def test_the_memo_and_the_gates_agree():
 
 def test_every_gate_is_required_and_one_failure_is_no_go():
     rows, opened = _synthetic(tail_ratio=0.5)
-    verdict = gates.evaluate(rows, opened, seeds=(0,))
+    verdict = gates.evaluate(rows, opened,
+                             method="distribution_aware_v1", seeds=(0,))
     assert not verdict.go
     assert "tail_per_image_vs_entropy" in verdict.failed
 
@@ -266,7 +267,8 @@ def test_a_clearly_better_arm_passes_every_gate():
     """The gates must be satisfiable — otherwise NO-GO proves nothing."""
 
     rows, opened = _synthetic(tail_ratio=3.0)
-    verdict = gates.evaluate(rows, opened, seeds=(0,))
+    verdict = gates.evaluate(rows, opened,
+                             method="distribution_aware_v1", seeds=(0,))
     assert verdict.go, verdict.failed
 
 
@@ -661,3 +663,243 @@ def test_a_resumed_run_reproduces_an_uninterrupted_one(tmp_path):
     assert driver.main(arguments) == 0
     assert (out / "diagnostic_rows.csv").read_bytes() == first
     assert list((out / "work" / "_predict").glob("*.incomplete"))
+
+
+# --------------------------------------------------------------- iterative ---
+
+
+def test_rounds_one_iterative_is_exactly_v1(built, features):
+    """The strongest invariant available: with a single round the iterative arm
+    must reproduce ``distribution_aware_v1`` exactly.
+
+    If it does not, something other than the round structure changed, and the
+    experiment would no longer be the one-variable test it is sold as.
+    """
+
+    index = arms.ranked_positions("distribution_aware_v1", built)
+    common = {
+        "entropy": np.linspace(0, 1, index.size),
+        "image_ids": built.candidates.image_ids[index],
+        "cost_of": lambda i: len(i) % 7 + 1,
+        "budget": 3000,
+    }
+    one_shot = allocation.distribution_aware_order(features, **common)
+    from owl.active_selection import budget as ledger
+
+    expected = ledger.spend_ranking(
+        one_shot.order, common["image_ids"], common["cost_of"], budget=3000)
+    iterative = allocation.distribution_aware_iterative_order(
+        features, rounds=1, **common)
+    assert iterative.images == expected.images
+    assert iterative.diagnostics["min_cluster_size"] == one_shot.diagnostics["min_cluster_size"]
+
+
+def test_the_reference_grows_and_the_eligible_set_shrinks(built, features):
+    """The mechanism, observed rather than asserted about."""
+
+    index = arms.ranked_positions("distribution_aware_v1", built)
+    result = allocation.distribution_aware_iterative_order(
+        features, entropy=np.linspace(0, 1, index.size),
+        image_ids=built.candidates.image_ids[index],
+        cost_of=lambda i: len(i) % 7 + 1, budget=3000, rounds=6,
+    )
+    spent_rounds = [r for r in result.rounds if r.get("images")]
+    assert len(spent_rounds) >= 2, "a single-round run would make this vacuous"
+    eligible = [r["eligible"] for r in spent_rounds]
+    references = [r["reference_rows"] for r in spent_rounds]
+    assert eligible == sorted(eligible, reverse=True) and eligible[0] > eligible[-1]
+    assert references == sorted(references) and references[0] < references[-1]
+    assert result.diagnostics["answers_spent"] <= 3000
+
+
+def test_the_iterative_order_is_reproducible(built, features):
+    index = arms.ranked_positions("distribution_aware_v1", built)
+    kwargs = {
+        "entropy": np.linspace(0, 1, index.size),
+        "image_ids": built.candidates.image_ids[index],
+        "cost_of": lambda i: len(i) % 7 + 1, "budget": 3000, "rounds": 6,
+    }
+    first = allocation.distribution_aware_iterative_order(features, **kwargs)
+    second = allocation.distribution_aware_iterative_order(features, **kwargs)
+    assert first.images == second.images
+    assert first.diagnostics == second.diagnostics
+
+
+def test_the_iterative_arm_reads_no_answer(built):
+    stripped = population.build(
+        proposals.Candidates(
+            image_ids=built.candidates.image_ids, boxes=built.candidates.boxes,
+            posterior=built.candidates.posterior,
+            objectness=built.candidates.objectness,
+            embeddings=built.candidates.embeddings,
+        )
+    )
+    index = arms.ranked_positions("distribution_aware_iterative_v1", stripped)
+    generator = np.random.default_rng(3)
+    block = generator.normal(size=(index.size, 16))
+    block /= np.linalg.norm(block, axis=1, keepdims=True)
+    picked = arms.select(
+        "distribution_aware_iterative_v1", stripped, cost_of=lambda _: 3,
+        answer_budget=200, seed=0, semantic=block.astype(np.float32), rounds=6,
+    )
+    assert len(picked.images) > 0
+    assert picked.row["rounds"] == 6
+
+
+# ----------------------------------------------------- the round schedule ---
+
+
+def test_the_carry_makes_rounds_a_no_op_for_a_static_ranking():
+    """Why the comparators need no re-run, checked on the real code path."""
+
+    from owl.active_selection import budget as ledger
+
+    rng = np.random.default_rng(0)
+    images = np.array([f"i{n:05d}" for n in range(4000)])
+    order = rng.permutation(len(images))
+    cost_of = (lambda i: (int(i[1:]) % 11) + 1)
+
+    one = ledger.spend_ranking(order, images, cost_of, budget=3000)
+    for rounds in (1, 2, 3, 6, 12):
+        many = ledger.spend_ranking_in_rounds(
+            order, images, cost_of, budget=3000, rounds=rounds)
+        assert many.images == one.images, rounds
+        assert many.ledger.spent == one.ledger.spent, rounds
+
+
+def test_without_the_carry_the_schedule_would_shrink_the_campaign():
+    """The confound the carry rule exists to remove — demonstrated, not claimed."""
+
+    from owl.active_selection import budget as ledger
+
+    rng = np.random.default_rng(0)
+    images = np.array([f"i{n:05d}" for n in range(4000)])
+    order = rng.permutation(len(images))
+    cost_of = (lambda i: (int(i[1:]) % 11) + 1)
+    one = ledger.spend_ranking(order, images, cost_of, budget=3000)
+
+    opened: list[str] = []
+    for _ in range(6):                      # a fixed 500 each time, no carry
+        spend = ledger.spend_ranking(
+            order, images, cost_of, budget=500,
+            excluded_images=frozenset(opened))
+        opened.extend(spend.images)
+    assert len(opened) < len(one.images), (
+        "if these ever agree, the carry rule has stopped mattering and this "
+        "test should be reconsidered rather than deleted"
+    )
+
+
+def test_round_allowance_carries_the_whole_remainder():
+    assert allocation.round_allowance(3000, 6, 1, 0) == 500
+    assert allocation.round_allowance(3000, 6, 2, 480) == 520     # 20 carried
+    assert allocation.round_allowance(3000, 6, 6, 2400) == 600
+    assert allocation.round_allowance(3000, 6, 3, 1600) == 0      # never negative
+
+
+def test_the_method_under_test_is_derived_not_assumed():
+    """A default of "distribution_aware_v1" judged the wrong arm the moment a
+    second method existed."""
+
+    assert gates.method_under_test(
+        ["entropy", "cost_aware", "distribution_aware_iterative_v1"]
+    ) == "distribution_aware_iterative_v1"
+    with pytest.raises(ValueError, match="exactly one method"):
+        gates.method_under_test(["entropy", "cost_aware"])
+    with pytest.raises(ValueError, match="exactly one method"):
+        gates.method_under_test(["entropy", "cost_aware", "a", "b"])
+
+
+def test_the_iterative_session_is_frozen():
+    assert gates.ITERATIVE_ROUNDS == 6
+    assert gates.ITERATIVE_ARMS == (
+        "entropy", "cost_aware", "distribution_aware_iterative_v1")
+    assert gates.COMPARATORS == ("entropy", "cost_aware")
+    # the gates themselves are untouched by the iterative session
+    assert {g.key: g.threshold for g in gates.GATES} == {
+        "jaccard_vs_entropy": 0.60, "tail_per_image_vs_entropy": 1.25,
+        "tail_per_image_vs_cost_aware": 1.25,
+        "background_share_vs_entropy": 0.10, "breadth_vs_entropy": 0.75,
+        "t2_not_collapsed": 0.75,
+    }
+
+
+# ------------------------------------------------------------ closing A1 ---
+
+
+def _part_a_csv(path: Path, rows) -> Path:
+    import csv as _csv
+
+    fields = ["arm", "seed", "task", "images_opened", "answers_spent",
+              "current_new_objects", "future_new_objects",
+              "banked_from_earlier", "held_at_declaration", "tail_objects",
+              "acquired_class_breadth"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = _csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def _arm_rows(arm, seed, fh2, ss2, ss3):
+    """A consistent trajectory for one arm, from known per-class purchases."""
+
+    return [
+        {"arm": arm, "seed": seed, "task": "t2", "images_opened": 300,
+         "answers_spent": 3000, "current_new_objects": 70,
+         "future_new_objects": fh2 + ss2, "banked_from_earlier": 0,
+         "held_at_declaration": 70, "tail_objects": 5,
+         "acquired_class_breadth": 50},
+        {"arm": arm, "seed": seed, "task": "t3", "images_opened": 300,
+         "answers_spent": 3000, "current_new_objects": 10,
+         "future_new_objects": ss3, "banked_from_earlier": fh2,
+         "held_at_declaration": 10 + fh2, "tail_objects": 5,
+         "acquired_class_breadth": 50},
+        {"arm": arm, "seed": seed, "task": "t4", "images_opened": 300,
+         "answers_spent": 3000, "current_new_objects": 11,
+         "future_new_objects": 0, "banked_from_earlier": ss2 + ss3,
+         "held_at_declaration": 11 + ss2 + ss3, "tail_objects": 5,
+         "acquired_class_breadth": 50},
+    ]
+
+
+def test_per_class_early_purchase_is_recovered_exactly(tmp_path):
+    """The memo said this was unavailable. It is not: three CSV columns are
+    linear in FH@t2, SS@t2 and SS@t3, and the system is over-determined."""
+
+    from tools.close_part_a import early_purchases, load
+
+    path = _part_a_csv(tmp_path / "rows.csv",
+                       _arm_rows("entropy", 0, 7, 8, 4)
+                       + _arm_rows("distribution_aware_v1", 0, 15, 9, 8))
+    table = load(path)
+    got = early_purchases(table, "distribution_aware_v1", 0)
+    assert got["fire_hydrant_at_t2"] == 15
+    assert got["stop_sign_at_t2"] == 9
+    assert got["stop_sign_at_t3"] == 8
+    assert got["future_tail_bought_early"] == 32
+
+
+def test_the_reconstruction_refuses_a_file_that_fails_its_own_identity(tmp_path):
+    """`future_new(t2)` must equal `banked(t3) + banked(t4) - future_new(t3)`.
+    If it does not, the file is not the run this arithmetic assumes."""
+
+    from tools.close_part_a import ForensicError, early_purchases, load
+
+    rows = _arm_rows("entropy", 0, 7, 8, 4)
+    rows[0]["future_new_objects"] = 99          # break it
+    path = _part_a_csv(tmp_path / "rows.csv", rows)
+    with pytest.raises(ForensicError, match="does not describe the run"):
+        early_purchases(load(path), "entropy", 0)
+
+
+def test_the_reconstruction_refuses_a_negative_split(tmp_path):
+    from tools.close_part_a import ForensicError, early_purchases, load
+
+    rows = _arm_rows("entropy", 0, 7, 8, 4)
+    rows[2]["banked_from_earlier"] = 2          # less than SS@t3 alone
+    rows[0]["future_new_objects"] = 7 + (2 - 4)
+    path = _part_a_csv(tmp_path / "rows.csv", rows)
+    with pytest.raises(ForensicError):
+        early_purchases(load(path), "entropy", 0)
+
