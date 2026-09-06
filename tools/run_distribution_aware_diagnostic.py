@@ -31,10 +31,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+
+# The repository root, so `tools.` is importable when this file is run directly.
+# `run_full_owod_benchmark.py` does the same, for the same reason.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 
@@ -46,6 +52,7 @@ from owl.active_selection import budget as annotation_budget
 from owl.active_selection import diagnostic as gates
 from owl.active_selection import population as population_module
 from owl.active_selection import semantic
+from tools.materialize_pool_images import materialise
 
 ROOT = Path(__file__).resolve().parent.parent
 CANDIDATE_INDEX = ROOT / "data" / "reference" / "per_image_class_counts.json"
@@ -54,6 +61,34 @@ CLASS_GROUPS = ROOT / "data" / "reference" / "class_groups.csv"
 
 class DiagnosticError(RuntimeError):
     """Raised when the diagnostic is asked for something it must not do."""
+
+
+def require_reference(selected: Sequence[str], ref_t1: Path | None) -> None:
+    """REF-T1 is a scientific prerequisite, not a convenience.
+
+    The memo defines ``distribution_aware_v1``'s reference as **REF-T1 plus every
+    image this trajectory has bought**, and ``R_k`` is read against it. Without
+    REF-T1 the reference at ``t2`` is empty, every cluster reads as maximally
+    under-represented and the quota degenerates toward proportional-to-size —
+    a *different method*, silently substituted because an old Drive file was
+    missing. One protocol, or none: this refuses rather than falling back.
+    """
+
+    needs = [a for a in selected
+             if arm_registry.ARMS[a].needs_semantic
+             and arm_registry.ARMS[a].reference_scope == "labelled"]
+    if not needs:
+        return
+    if ref_t1 is None or not Path(ref_t1).is_file():
+        raise DiagnosticError(
+            f"{needs} measure under-representation against REF-T1 plus what the "
+            f"trajectory has bought, and --ref-t1 is {ref_t1 or 'absent'}. "
+            "Running without it would silently measure a different method: an "
+            "empty reference at t2 makes every cluster maximally "
+            "under-represented. Build the frozen export with "
+            "tools/export_ref_t1_features.py --per-class-cap 1000, or run only "
+            "arms that do not consult it."
+        )
 
 
 # ------------------------------------------------------------------ oracle ---
@@ -147,10 +182,35 @@ def run_arm(
         pool_ids = np.asarray([i for i in all_images if i not in used], dtype=object)
         take = min(pool_size, pool_ids.size)
         candidate_ids = [str(v) for v in generator.choice(pool_ids, size=take, replace=False)]
-        if prepare_images is not None:
-            candidate_ids = [str(v) for v in prepare_images(candidate_ids)]
 
-        export = predict_for(candidate_ids, task=task, output=task_dir / "proposals.npz")
+        # The pixels. `prepare_full_owod_benchmark.py` deliberately does not fetch
+        # candidate images — which 2,000 a task scores depends on `(seed, task)`
+        # and on what the arm has already bought — so the caller that draws the
+        # pool is the one that must materialise it. The benchmark launcher does
+        # this through the same materialiser; so does this.
+        if prepare_images is not None:
+            available = [str(v) for v in prepare_images(candidate_ids)]
+            dropped = len(candidate_ids) - len(available)
+            if dropped:
+                print(f"  [{task.name}/{arm}] {dropped} of {len(candidate_ids)} "
+                      "candidate images could not be fetched; dropped", flush=True)
+            candidate_ids = available
+        if not candidate_ids:
+            raise DiagnosticError(
+                f"{task.name}/{arm} has no usable candidate images. PROB reads "
+                "JPEGs off disk, so either the fetch failed for all of them or "
+                "the data root is wrong."
+            )
+
+        # Content-addressed, because at t2 every arm draws the *same* pool
+        # (`used` is empty and the draw is keyed on `(seed, task)` alone). Keying
+        # the cache on the image list rather than on the arm turns 18 detector
+        # passes into 14 — 8,000 images of T4 time, for free and with no effect
+        # on any number, since identical input gives identical output.
+        digest = hashlib.sha256("\n".join(sorted(candidate_ids)).encode()).hexdigest()
+        shared = workspace / "_predict" / f"{digest[:16]}.npz"
+        shared.parent.mkdir(parents=True, exist_ok=True)
+        export = predict_for(candidate_ids, task=task, output=shared)
         candidates = proposals.from_predict(export)
         pool = population_module.build(candidates)
 
@@ -214,6 +274,9 @@ def main(argv=None) -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--seeds", type=int, nargs="+", default=list(gates.DIAGNOSTIC_SEEDS))
     parser.add_argument("--arms", nargs="+", default=list(gates.DIAGNOSTIC_ARMS))
+    parser.add_argument("--fetch-workers", type=int, default=32)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--dry-run", action="store_true",
                         help="stub the detector and DINOv2; exercises every other line")
     args = parser.parse_args(argv)
@@ -240,9 +303,13 @@ def main(argv=None) -> int:
                 "a real run needs --prob-root, --data-root and --checkpoint (the t1 "
                 "anchor). Pass --dry-run to exercise the control flow without them."
             )
-        bridge = bridge_module.Bridge(prob_root=args.prob_root, data_root=args.data_root)
-        if not hasattr(bridge, "predict"):
-            raise DiagnosticError("the bridge has no predict")
+        require_reference(args.arms, args.ref_t1)
+        bridge = bridge_module.Bridge(
+            prob_root=args.prob_root, data_root=args.data_root,
+            device=args.device, num_workers=args.num_workers, seed=0,
+            log_dir=args.out / "logs",
+        )
+        bridge.check()
 
         def predict_for(image_ids, *, task, output):
             return bridge.predict(
@@ -251,9 +318,17 @@ def main(argv=None) -> int:
                 max_proposals_per_image=bm.PROPOSALS_PER_IMAGE,
             )
 
+        jpeg = Path(args.data_root) / "JPEGImages"
+
+        def prepare(image_ids):
+            got = materialise([str(v) for v in image_ids], jpeg,
+                              workers=args.fetch_workers)
+            lost = set(got["unreadable"])
+            return [v for v in dict.fromkeys(str(i) for i in image_ids)
+                    if v not in lost]
+
         features_for = _wrap_features(semantic.cached, args.data_root)
         reference_for = semantic.reference_from_ref_t1
-        prepare = None
 
     rows: list[dict] = []
     opened: dict[tuple[str, int, str], list[str]] = {}
@@ -342,7 +417,17 @@ def _stubs(counts):
         block = generator.normal(size=(500, 24))
         return (block / np.linalg.norm(block, axis=1, keepdims=True)).astype(np.float32)
 
-    return predict_for, features_for, reference_for, None
+    def prepare(image_ids):
+        """Exercise the materialisation branch without a network.
+
+        The real path fetches candidate pixels here, and a dry run that skipped
+        it would leave exactly the branch that was missing untested — which is
+        how the missing fetch survived review in the first place.
+        """
+
+        return [str(i) for i in dict.fromkeys(str(v) for v in image_ids)]
+
+    return predict_for, features_for, reference_for, prepare
 
 
 if __name__ == "__main__":
