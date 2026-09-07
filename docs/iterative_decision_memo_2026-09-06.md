@@ -202,10 +202,21 @@ case of the method as specified.**
 already-labelled knowledge rather than relative to a fixed anchor. One-shot
 selection froze that reference for the whole task, so the feedback loop the plan
 draws was never engaged. The 2026-08-25 consultation raised one-shot versus
-rounds explicitly (point 7) and measured that rounds help exactly the arms with
-something to update (`consult` 26 → 36, **+38 %**) and are a provable no-op for
-`entropy` and `objectness`. That is on the register from before this NO-GO, so
+rounds explicitly (point 7). That is on the register from before this NO-GO, so
 testing it is completing the pre-registration, not reacting to a result.
+
+> **CORRECTION, 2026-09-07.** This paragraph originally said rounds "help exactly
+> the arms with something to update (`consult` 26 → 36, **+38 %**)". Read back
+> from `data/results/selection_arms.csv`, the actual figures for `consult` at
+> 600×1 → 6×100 are **25 → 34, 30 → 32, 37 → 40** across seeds 0/1/2 — **+36 %,
+> +7 %, +8 %** — and `prior_consult_batch`, the arm that combines a prior with
+> batch diversity, gets **worse** on every seed (91 → 82, 81 → 73, 90 → 73). The
+> no-op for `entropy`, `objectness` and `plan` is exact and does hold. So the
+> prior that rounds help is far weaker than stated, and it supports the adverse
+> prediction in §3.1 rather than the case for running the experiment. The
+> decision in §7 is unchanged — it rests on v1 having tested a degenerate form of
+> the specification, not on this figure — but the figure was wrong and the
+> justification is weaker than it read.
 
 ### 3.1 A prediction, recorded before the experiment exists
 
