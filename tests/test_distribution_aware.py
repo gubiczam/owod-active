@@ -1017,3 +1017,40 @@ def test_the_iterative_notebook_defines_every_name_before_use():
 
     report = analyse(code_cells(ITERATIVE_NOTEBOOK))
     assert not {r["cell"]: r["undefined"] for r in report if r["undefined"]}
+
+
+def test_the_iterative_notebook_has_no_hardcoded_registry_tuple():
+    """The second thing that killed Run all.
+
+    A literal copy of ``arm_registry.ORDER`` in a notebook has to be
+    hand-edited every time an arm is registered, and when it is not the cell
+    raises. The properties that matter are asserted instead: the pre-registered
+    prefix, and that no development-seed-informed arm displaces a baseline.
+    """
+
+    source = _iter_cells("code")[2]
+    assert "assert arm_registry.ORDER == (" not in source, (
+        "a hardcoded ORDER tuple is back; it breaks Run all on the next arm")
+    assert "arm_registry.ORDER[:5] == (" in source
+    assert "bm.DEVELOPMENT_SEED_INFORMED" in source
+    assert "set(arm_registry.ORDER) == set(arm_registry.ARMS)" in source
+
+
+def test_the_iterative_notebook_survives_a_clean_room_check():
+    """Runs the notebook's checkable cells against its **pinned checkout**.
+
+    Unit tests pass against the working tree; a fresh Colab runs the pin, and
+    the gap between them is where "Run all works" turns out not to. This is the
+    same tool the release check runs, executed here so the gap cannot reopen.
+    """
+
+    from tools.validate_notebook_freshness import main as validate
+
+    assert validate([str(ITERATIVE_NOTEBOOK)]) == 0
+
+
+def test_the_notebook_checks_its_clustering_dependency_before_the_long_cell():
+    cells = _iter_cells("code")
+    checked = next(i for i, s in enumerate(cells) if "from sklearn.cluster import HDBSCAN" in s)
+    ran = next(i for i, s in enumerate(cells) if "--rounds" in s)
+    assert checked < ran
