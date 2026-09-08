@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
@@ -115,8 +116,9 @@ def verify_cache(workspace: Path) -> dict[str, object]:
     predicts = sorted((workspace / "_predict").glob("*.npz"))
     usable = [p for p in predicts if predict_cache_is_usable(p)]
     spoiled = [p for p in predicts if p not in set(usable)]
-    dino = sorted(workspace.glob("*__seed*/t*/dinov2_pool.npz"))
+    dino = sorted(workspace.glob("*__seed*/t*/dinov2_pool*.npz"))
     partial = sorted(workspace.glob("*__seed*/t*/*.part"))
+    unreadable = sorted(workspace.glob("*__seed*/t*/*.unreadable"))
     references = sorted(workspace.glob("*__seed*/t*/coverage_reference.npz"))
     return {
         "predict_exports": len(predicts),
@@ -126,6 +128,7 @@ def verify_cache(workspace: Path) -> dict[str, object]:
         "dinov2_tasks": [str(p.parent.relative_to(workspace)) for p in dino],
         "coverage_reference_blocks": len(references),
         "abandoned_part_files": [str(p) for p in partial],
+        "quarantined_unreadable": [str(p) for p in unreadable],
     }
 
 
@@ -230,6 +233,7 @@ def run_arm(
     budget: int,
     pool_size: int,
     rounds: int = 1,
+    run_id: str = "",
 ) -> tuple[list[dict], dict[tuple[str, int, str], list[str]]]:
     spec = arm_registry.ARMS[arm]
     cost_of = annotation_budget.cost_function(counts)
@@ -255,10 +259,16 @@ def run_arm(
         # and on what the arm has already bought — so the caller that draws the
         # pool is the one that must materialise it. The benchmark launcher does
         # this through the same materialiser; so does this.
+        dropped = 0
         if prepare_images is not None:
             available = [str(v) for v in prepare_images(candidate_ids)]
             dropped = len(candidate_ids) - len(available)
             if dropped:
+                # Recorded in the row, not only printed. This is the one place
+                # where the environment can change the candidate population --
+                # a COCO fetch that succeeded last time and failed this time --
+                # so a resumed run that differs from an interrupted one differs
+                # visibly in the output rather than only in a log that is gone.
                 print(f"  [{task.name}/{arm}] {dropped} of {len(candidate_ids)} "
                       "candidate images could not be fetched; dropped", flush=True)
             candidate_ids = available
@@ -288,6 +298,8 @@ def run_arm(
 
         features = reference = None
         ranked = arm_registry.ranked_positions(arm, pool)
+        population = semantic.row_fingerprint(
+            pool.candidates.image_ids[ranked], pool.candidates.boxes[ranked])
         if spec.needs_semantic:
             features = features_for(
                 task_dir / "dinov2_pool.npz",
@@ -300,7 +312,8 @@ def run_arm(
             anchor = [reference_for(ref_t1)] if (
                 ref_t1 is not None and spec.reference_scope == "labelled") else []
             reference = semantic.stack_reference([
-                *anchor, *bm.reference_blocks(task_dir, task_index=task.index),
+                *anchor,
+                *bm.reference_blocks(task_dir, task_index=task.index, run_id=run_id),
             ])
 
         picked = arm_registry.select(
@@ -314,7 +327,9 @@ def run_arm(
             temporary = task_dir / "coverage_reference.npz.part"
             with temporary.open("wb") as handle:
                 np.savez_compressed(handle, features=block,
-                                    task=np.asarray(task.name), arm=np.asarray(arm))
+                                    task=np.asarray(task.name), arm=np.asarray(arm),
+                                    run_id=np.asarray(run_id),
+                                    population=np.asarray(population))
             os.replace(temporary, task_dir / "coverage_reference.npz")
 
         row = oracle_row(
@@ -326,6 +341,9 @@ def run_arm(
         row["tail_per_image"] = round(
             row["held_at_declaration"] / max(row["images_opened"], 1), 4)
         row["population_ranked"] = int(ranked.size)
+        row["population_fingerprint"] = population[:12]
+        row["candidate_images_dropped"] = int(dropped)
+        row["run_id"] = run_id
         rows.append(row)
         opened_by_task[(arm, seed, task.name)] = list(picked.images)
 
@@ -376,6 +394,14 @@ def main(argv=None) -> int:
     print("=" * 78)
     print(json.dumps(gates.configuration(), indent=2))
     print("=" * 78, flush=True)
+
+    # One id per process. It stamps each task's contribution to the semantic
+    # reference so a later task can tell "written by this run" from "left over
+    # from a run that died", which is the difference between a loud resume and
+    # silent contamination.
+    run_id = hashlib.sha256(
+        f"{os.getpid()}:{time.time_ns()}".encode()).hexdigest()[:16]
+    print(f"run id: {run_id}")
 
     counts = json.loads(CANDIDATE_INDEX.read_text(encoding="utf-8"))
     groups = class_groups()
@@ -432,6 +458,7 @@ def main(argv=None) -> int:
                 reference_for=reference_for, ref_t1=args.ref_t1,
                 prepare_images=prepare, budget=bm.ANSWER_BUDGET_PER_TASK,
                 pool_size=bm.CANDIDATE_IMAGES_PER_TASK, rounds=args.rounds,
+                run_id=run_id,
             )
             rows.extend(got)
             opened.update(by_task)

@@ -371,7 +371,9 @@ def trajectory_name(arm: str, seed: int) -> str:
 _TASK_DIR = re.compile(r"^t(\d+)_")
 
 
-def reference_blocks(task_dir: Path, *, task_index: int) -> list[np.ndarray]:
+def reference_blocks(
+    task_dir: Path, *, task_index: int, run_id: str | None = None
+) -> list[np.ndarray]:
     """Semantic features of everything this arm bought at **earlier** tasks.
 
     Read off disk rather than held in memory, because a resumed session restores
@@ -386,8 +388,27 @@ def reference_blocks(task_dir: Path, *, task_index: int) -> list[np.ndarray]:
         match = _TASK_DIR.match(path.parent.name)
         if match is None or int(match.group(1)) >= task_index:
             continue
-        payload = np.load(path, allow_pickle=False)
-        blocks.append(np.asarray(payload["features"], dtype=np.float32))
+        try:
+            payload = np.load(path, allow_pickle=False)
+            features = np.asarray(payload["features"], dtype=np.float32)
+            stamp = str(payload["run_id"]) if "run_id" in payload.files else None
+        except Exception as error:
+            raise BenchmarkError(
+                f"{path} is unreadable ({error}). It is an earlier task's "
+                "contribution to this arm's semantic reference, so continuing "
+                "would select against an incomplete reference. Re-run the arm; "
+                "every task rewrites its own block."
+            ) from error
+        if run_id is not None and stamp != run_id:
+            # Written by a different process. The caller walks the chain from
+            # its first task, so every block it legitimately needs is rewritten
+            # in *this* run — a block from another run is a leftover, and using
+            # it would let an interrupted trajectory contaminate a later task
+            # silently rather than loudly.
+            print(f"  [reference] ignoring {path.parent.name}/{path.name} from an "
+                  f"earlier run ({stamp}); this run rewrites it", flush=True)
+            continue
+        blocks.append(features)
     return blocks
 
 

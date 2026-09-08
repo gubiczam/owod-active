@@ -683,8 +683,24 @@ def test_a_resumed_run_reproduces_an_uninterrupted_one(tmp_path):
     assert not driver.predict_cache_is_usable(exports[0])
 
     assert driver.main(arguments) == 0
-    assert (out / "diagnostic_rows.csv").read_bytes() == first
+    second = (out / "diagnostic_rows.csv").read_bytes()
     assert list((out / "work" / "_predict").glob("*.incomplete"))
+
+    # `run_id` is provenance and *must* differ between processes -- it is what
+    # lets a later task tell "written by this run" from "left over from a run
+    # that died". Every scientific column must be identical, and it is the only
+    # column allowed to move; asserting that is stronger than comparing bytes.
+    import csv as _csv
+    import io as _io
+
+    def _rows(blob):
+        return list(_csv.DictReader(_io.StringIO(blob.decode("utf-8"))))
+
+    before, after = _rows(first), _rows(second)
+    assert [r["run_id"] for r in before] != [r["run_id"] for r in after]
+    for one, two in zip(before, after, strict=True):
+        assert {k: v for k, v in one.items() if k != "run_id"} \
+            == {k: v for k, v in two.items() if k != "run_id"}
 
 
 # --------------------------------------------------------------- iterative ---

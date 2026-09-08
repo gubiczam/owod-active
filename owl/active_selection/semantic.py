@@ -36,6 +36,27 @@ class SemanticError(sf.ExportError):
     """Raised when features cannot be produced or do not describe the pool."""
 
 
+class SemanticFingerprintError(SemanticError):
+    """This file describes a *different* population than the one asked for.
+
+    Split out from :class:`SemanticError` because the two need opposite
+    handling. A version mismatch, a missing array or an unreadable file is a
+    problem with the *cache*; a fingerprint mismatch is not a problem at all —
+    it means the file belongs to another population and simply is not ours. The
+    caller may skip it and compute its own. Nothing may be deleted on that
+    basis, and no other ``SemanticError`` may be swallowed.
+    """
+
+
+class SemanticCorruptError(SemanticError):
+    """The file exists but cannot be read as a feature export.
+
+    A session killed mid-write cannot produce this for :func:`write`, which is
+    atomic — but a truncated Drive sync, a full disk or an older writer can, and
+    a three-hour Run all must not die on it.
+    """
+
+
 def row_fingerprint(image_ids: np.ndarray, boxes: np.ndarray) -> str:
     """Identity of the rows a feature matrix describes.
 
@@ -210,18 +231,55 @@ def write(path: str | Path, features: np.ndarray, fingerprint: str, provenance: 
 def read(path: str | Path, *, fingerprint: str | None = None) -> np.ndarray:
     """Read a cached matrix, refusing one that describes different rows."""
 
-    payload = np.load(Path(path), allow_pickle=False)
-    version = str(payload["export_version"])
+    path = Path(path)
+    try:
+        payload = np.load(path, allow_pickle=False)
+        version = str(payload["export_version"])
+        stored = str(payload["fingerprint"])
+        features = np.asarray(payload["features"], dtype=np.float32)
+    except SemanticError:
+        raise
+    except Exception as error:                     # truncated, empty, not an npz
+        raise SemanticCorruptError(f"{path} is not readable: {error}") from error
     if version != EXPORT_VERSION:
         raise SemanticError(f"{path} is {version!r}; this code reads {EXPORT_VERSION!r}.")
-    stored = str(payload["fingerprint"])
     if fingerprint is not None and stored != fingerprint:
-        raise SemanticError(
-            f"{path} describes rows {stored[:12]} and this pool is {fingerprint[:12]}. "
-            "Reusing it would embed one population's geometry in another's "
-            "selection; delete the file to recompute."
+        raise SemanticFingerprintError(
+            f"{path} describes rows {stored[:12]} and this pool is {fingerprint[:12]}."
         )
-    return np.asarray(payload["features"], dtype=np.float32)
+    return features
+
+
+def cache_path(base: str | Path, fingerprint: str) -> Path:
+    """Where the features for *this* population live.
+
+    The name carries the row fingerprint, which is what makes the cache
+    **content-addressed** rather than path-addressed. That one change is the
+    difference between a resumed run that continues and one that dies:
+
+    * path-addressed, as this was, means a task that legitimately draws a
+      different candidate population — a different set of images was fetchable,
+      so the detector ran again and its boxes are not bit-reproducible — finds
+      the *previous* population's file sitting at the name it wants, and the
+      fingerprint check turns a recoverable situation into a fatal one;
+    * content-addressed means that file is simply **not ours**. It is never
+      read, never deleted, and the new population writes beside it.
+
+    The detector cache in ``tools/run_distribution_aware_diagnostic.py`` was
+    already content-addressed on its image list, which is exactly why the same
+    population change never killed it. This removes the asymmetry.
+    """
+
+    base = Path(base)
+    return base.with_name(f"{base.stem}_{fingerprint[:12]}{base.suffix}")
+
+
+def quarantine_unreadable(path: Path) -> Path:
+    """Move an unreadable export aside. Never delete: it is evidence."""
+
+    spoiled = path.with_suffix(path.suffix + ".unreadable")
+    path.replace(spoiled)
+    return spoiled
 
 
 def cached(
@@ -236,12 +294,39 @@ def cached(
     label: str = "dinov2",
     provenance: dict | None = None,
 ) -> np.ndarray:
-    """Read the cache if it matches these rows, otherwise embed and write it."""
+    """Read the cache if it matches these rows, otherwise embed and write it.
 
-    path = Path(path)
+    Two files are considered, in order: the content-addressed name for this
+    population, and — for backward compatibility with exports written before
+    the naming changed — the bare ``path`` itself. A candidate is used only if
+    its fingerprint matches, so the protection against embedding one
+    population's geometry in another's selection is unchanged. A candidate that
+    describes other rows is skipped and left alone; one that cannot be read at
+    all is moved aside and reported.
+    """
+
+    base = Path(path)
     fingerprint = row_fingerprint(image_ids, boxes)
-    if path.exists():
-        return read(path, fingerprint=fingerprint)
+    target = cache_path(base, fingerprint)
+
+    for candidate in (target, base):
+        if not candidate.is_file():
+            continue
+        try:
+            features = read(candidate, fingerprint=fingerprint)
+        except SemanticFingerprintError as mismatch:
+            # Another population's export. Not an error, and not ours.
+            print(f"  [{label}] {candidate.name} belongs to another population "
+                  f"({mismatch}); leaving it and computing this one", flush=True)
+            continue
+        except SemanticCorruptError as broken:
+            spoiled = quarantine_unreadable(candidate)
+            print(f"  [{label}] {broken}; moved to {spoiled.name} and recomputing",
+                  flush=True)
+            continue
+        print(f"  [{label}] cached: {candidate.name}", flush=True)
+        return features
+
     model = model_factory(device)
     try:
         features = embed(
@@ -257,7 +342,7 @@ def cached(
         if freed.get("cuda"):
             print(f"  [{label}] released the backbone; "
                   f"{freed['freed_bytes'] / 1e9:.2f} GB of CUDA cache returned")
-    write(path, features, fingerprint, {
+    write(target, features, fingerprint, {
         "rows": int(features.shape[0]),
         "images": len(set(np.asarray(image_ids, dtype=str).tolist())),
         "crop": sf.crop_specification(),

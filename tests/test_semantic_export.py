@@ -159,17 +159,48 @@ def test_the_cache_is_used_when_the_rows_match(tmp_path, rows):
     assert not calls
 
 
-def test_the_cache_is_refused_rather_than_reused_for_other_rows(tmp_path, rows):
+def test_the_cache_is_never_reused_for_other_rows(tmp_path, rows, monkeypatch):
+    """One population's features must never enter another's selection.
+
+    This test used to assert that :func:`semantic.cached` **raises** on a
+    fingerprint mismatch, matching the message "delete the file". That contract
+    was wrong, not merely inconvenient: a task whose candidate population
+    legitimately differs from a previous run's -- a different set of images was
+    fetchable, so the detector ran again and its boxes are not bit-reproducible
+    -- found the old export at the name it wanted and the run died, twice, with
+    no cure but deleting the file by hand.
+
+    The cache is content-addressed now, so the old file is simply not ours. The
+    *protection* is what this test exists for and it is unchanged and asserted
+    below: the mismatched file is not read, its features never appear, and it is
+    not deleted either.
+    """
+
     image_ids, boxes = rows
-    semantic.write(tmp_path / "f.npz", unit(3),
+    stale = unit(3)
+    semantic.write(tmp_path / "f.npz", stale,
                    semantic.row_fingerprint(image_ids, boxes), {})
+    before = (tmp_path / "f.npz").read_bytes()
+
     moved = boxes.copy()
     moved[0, 0] += 0.1
-    with pytest.raises(semantic.SemanticError, match="delete the file"):
-        semantic.cached(
-            tmp_path / "f.npz", image_ids, moved, tmp_path,
-            model_factory=lambda _d: None, device="cpu",
-        )
+    fresh = unit(3) + 1.0
+    monkeypatch.setattr(semantic, "embed", lambda *a, **k: fresh)
+    monkeypatch.setattr(semantic, "release", lambda **_: {"cuda": False})
+
+    got = semantic.cached(
+        tmp_path / "f.npz", image_ids, moved, tmp_path,
+        model_factory=lambda _d: object(), device="cpu",
+    )
+    # the compute path returns what `embed` produced, before the fp16 write
+    assert np.array_equal(got, fresh)
+    assert not np.allclose(got, stale), "the other population's features leaked in"
+    assert (tmp_path / "f.npz").read_bytes() == before, "the stale export was touched"
+
+    # and reading it directly still refuses, which is what `cached` relies on
+    with pytest.raises(semantic.SemanticFingerprintError):
+        semantic.read(tmp_path / "f.npz",
+                      fingerprint=semantic.row_fingerprint(image_ids, moved))
 
 
 # --------------------------------------------------------------- the crop ---
