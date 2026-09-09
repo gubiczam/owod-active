@@ -253,3 +253,87 @@ def test_the_notebook_pins_the_revision_that_carries_the_chain_support():
         assert not drift, (
             f"{tree} differs between the pinned {pin[:12]} and HEAD:\n{drift}\n"
             "Re-pin, or the session runs code this tree no longer has.")
+
+
+def test_the_notebooks_prose_describes_the_session_it_actually_runs():
+    """The header comment and the configuration must not contradict.
+
+    This notebook was derived from the four-task seed-2 replication notebook,
+    and it inherited that notebook's header: "the three surviving baseline arms
+    at seed 2", including the claim that "Seeds 0 and 1 are both complete for
+    these three arms". It runs two arms at seed 0 on a chain where nothing is
+    complete. Every executable line was right and every sentence above them was
+    wrong, which is the version of this defect a reviewer is least likely to
+    catch -- so it is asserted rather than remembered.
+    """
+
+    parameters = _t10_cells()[0]
+    prose = "\n".join(line for line in parameters.splitlines()
+                      if line.strip().startswith("#"))
+
+    # It must not describe a seed or an arm count this session does not run.
+    for stale in ("seed 2", "Seed 2", "seed-2", "three surviving",
+                  "the third of the pre-registered seed set"):
+        assert stale not in prose, (
+            f"the header comment still says {stale!r}, but SEEDS = (0,) and "
+            "SESSION_ARMS has two arms")
+
+    # And it must name what this session is: two arms, seed 0, ten tasks.
+    assert "seed 0" in prose, "the header must say which seed this is"
+    assert "ten-task" in prose or "ten task" in prose
+    # The excluded arms stay named with their reasons -- that is provenance,
+    # not decoration, and dropping it is how an exclusion becomes invisible.
+    for excluded in ("proposed", "proposed_v2", "coreset"):
+        assert excluded in prose, f"{excluded} must stay recorded as excluded"
+    # Replication seeds must be described as a later session, never as a
+    # promise that can be quietly withdrawn once seed 0's numbers are visible.
+    assert "seeds 1, 2" in prose or "seeds 1 and 2" in prose
+
+
+def test_the_notebook_states_it_cannot_overwrite_a_four_task_result():
+    """Both mechanisms, in the notebook and in the code."""
+
+    parameters = _t10_cells()[0]
+    assert "results/full_owod_chain_t10" in parameters
+    assert "fingerprint" in parameters, (
+        "the header must say why a workspace collision is refused, not only "
+        "that the directory differs")
+
+    from owl import runner
+
+    assert "n_tasks" in runner.CycleConfig.RESULT_AFFECTING
+    assert (runner.CycleConfig(n_tasks=4).fingerprint()
+            != runner.CycleConfig(n_tasks=10).fingerprint())
+
+
+def test_the_notebook_states_the_runtime_for_the_split_it_actually_scores():
+    """22 h, not the 15-18 h inherited from the four-task planner.
+
+    ``plan_full_owod_benchmark.py`` sizes evaluation from Benchmark V1's 837
+    images, and cell [8/10] prints that table. This chain is scored on
+    ``owl_shared_test_t10`` -- 2,817 images, with a second forward pass for
+    ``detections=True`` -- so evaluation costs 36.7 min per arm-task instead of
+    11.1, eighteen times over. Getting this wrong does not corrupt a result; it
+    tells the operator one Run all will finish when it will not, which is how a
+    chain gets abandoned half-done and reported as a failure of the method.
+    """
+
+    body = _t10_cells()[8]
+    assert "15-18 hours" not in body, "the four-task figure must not be restated"
+    assert "22 hours" in body, "the corrected figure must be stated"
+    assert "2,817" in body and "837" in body, (
+        "the comment must show both splits, so the correction can be checked")
+    assert "MORE THAN ONCE" in body, (
+        "the operator must be told one session will not finish")
+    assert "restored from state.json" in body
+
+
+def test_the_time_budget_is_below_the_expected_runtime_on_purpose():
+    """A budget under the runtime is the resume design, not an error."""
+
+    parameters = _t10_cells()[0]
+    assert "TIME_BUDGET_MINUTES = 1200" in parameters
+    body = _t10_cells()[8]
+    assert "BELOW that" in body and "deliberate" in body, (
+        "a reader who notices 1200 min < 22 h must find the reason here, or "
+        "they will 'fix' it by raising the budget and lose the graceful stop")
