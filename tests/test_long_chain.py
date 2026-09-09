@@ -213,14 +213,43 @@ def test_the_notebook_states_the_second_experiment_rule_and_the_banking_limit():
     assert "published S-OWODB" in markdown  # markdown carries **not** in bold
 
 
-def test_the_notebook_pin_fails_closed_until_it_is_set():
-    """It cannot contain the SHA of the commit containing it, so it must refuse."""
+def test_the_notebook_pins_the_revision_that_carries_the_chain_support():
+    """A full SHA that exists, and whose code is what the notebook needs.
+
+    The pin necessarily lags the commit that sets it by one -- a notebook cannot
+    contain the SHA of the commit containing it -- so what must hold is that
+    nothing the notebook *executes* differs between the two. Checked here on
+    ``owl/`` and on every tool the notebook invokes; the clean-room validator
+    proves the same thing by running the pinned code.
+    """
 
     import re
+    import subprocess
+    from pathlib import Path
 
+    root = Path(__file__).resolve().parent.parent
     source = _t10_cells()[0]
-    pin = re.search(r'OWL_COMMIT = "([^"]*)"', source).group(1)
-    assert pin == "PIN_AFTER_PUSH", pin
-    assert len(pin) != 40, "a placeholder must not look like a real SHA"
+    pin = re.search(r'OWL_COMMIT = "([0-9a-f]*)"', source).group(1)
+    assert len(pin) == 40, f"OWL_COMMIT is {pin!r}, not a full 40-character SHA"
     assert "assert len(PROB_COMMIT) == 40 and len(OWL_COMMIT) == 40" in source, (
-        "the 40-character assertion is what makes the placeholder fail closed")
+        "the 40-character assertion must stay; it is what catches a short pin")
+    assert subprocess.run(
+        ["git", "-C", str(root), "cat-file", "-e", f"{pin}^{{commit}}"],
+        capture_output=True, check=False).returncode == 0, f"{pin} is not a commit"
+
+    # the pinned revision must already carry the chain support
+    listing = subprocess.run(
+        ["git", "-C", str(root), "show", f"{pin}:tools/run_full_owod_benchmark.py"],
+        capture_output=True, text=True, check=True).stdout
+    assert '"--n-tasks"' in listing, "the pinned launcher has no --n-tasks"
+
+    invoked = set(re.findall(r'"tools"\s*/\s*"([a-z0-9_]+\.py)"',
+                             "\n".join(_t10_cells())))
+    assert invoked, "no tool invocations found"
+    for tree in ["owl/", *(f"tools/{t}" for t in sorted(invoked))]:
+        drift = subprocess.run(
+            ["git", "-C", str(root), "diff", "--name-only", pin, "HEAD", "--", tree],
+            capture_output=True, text=True, check=True).stdout.strip()
+        assert not drift, (
+            f"{tree} differs between the pinned {pin[:12]} and HEAD:\n{drift}\n"
+            "Re-pin, or the session runs code this tree no longer has.")
