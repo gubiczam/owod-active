@@ -42,15 +42,22 @@ ARCHIVES = (
 TEST_ARCHIVE = ARCHIVES[1]
 
 
-def shared_test_split(data_root: Path, *, write: bool = True):
-    """Write the one shared evaluation split; return its name and its images."""
+def shared_test_split(data_root: Path, *, write: bool = True, n_tasks: int | None = None):
+    """Write the one shared evaluation split; return its name and its images.
 
+    ``n_tasks`` defaults to the frozen Benchmark V1 length. A longer chain
+    declares more classes and therefore gets a **differently named** split, so
+    the two can coexist in one data root and neither can silently overwrite the
+    other: 837 images for four tasks, 2,817 for ten.
+    """
+
+    length = bm.N_TASKS if n_tasks is None else int(n_tasks)
     subset = evaluation_subset.from_archive(
-        TEST_ARCHIVE, bm.declared_classes(), seed=bm.DEVELOPMENT_SEED,
+        TEST_ARCHIVE, bm.declared_classes(length), seed=bm.DEVELOPMENT_SEED,
         remainder_multiplier=bm.EVAL_REMAINDER_RATIO,
         max_per_class=bm.EVAL_MAX_PER_CLASS,
     )
-    name = evaluation_subset.SHARED_TEST_SET
+    name = evaluation_subset.shared_test_set_name(length)
     if write:
         target = data_root / "ImageSets" / "OWDETR" / f"{name}.txt"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -65,13 +72,18 @@ def main() -> None:
     parser.add_argument("--annotations-only", action="store_true",
                         help="extract the archives and write the split, fetch "
                              "no pixels; what the dry run needs")
+    parser.add_argument("--n-tasks", type=int, default=None,
+                        help="chain length. Defaults to the frozen Benchmark V1 "
+                             "value; a different value builds that chain's own "
+                             "shared evaluation split under its own name")
     parser.add_argument("--verify-only", action="store_true",
                         help="report what is present and change nothing")
     arguments = parser.parse_args()
 
     data_root = Path(arguments.data_root)
     jpeg = data_root / "JPEGImages"
-    name, subset = shared_test_split(data_root, write=not arguments.verify_only)
+    name, subset = shared_test_split(
+        data_root, write=not arguments.verify_only, n_tasks=arguments.n_tasks)
     test_ids = sorted(subset.image_ids)
 
     if arguments.verify_only:
@@ -95,8 +107,8 @@ def main() -> None:
     print(f"[prepare] candidate index {len(candidate_index):,} images; "
           f"replay index {len(replay_index):,} images")
     print(f"[prepare] shared evaluation split {name}: {len(test_ids):,} images "
-          f"over {len(bm.declared_classes())} declared classes "
-          f"{list(bm.declared_classes())}")
+          f"over {len(bm.declared_classes(arguments.n_tasks))} declared classes "
+          f"{list(bm.declared_classes(arguments.n_tasks))}")
 
     if arguments.annotations_only:
         print("[prepare] --annotations-only: no pixels fetched")

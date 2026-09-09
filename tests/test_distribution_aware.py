@@ -991,11 +991,47 @@ def test_the_iterative_notebook_pin_carries_this_code():
     commit = match.group(1)
     assert _sp.run(["git", "-C", str(ROOT), "cat-file", "-e", f"{commit}^{{commit}}"],
                    capture_output=True, check=False).returncode == 0
-    for tree in ("owl/", "tools/run_distribution_aware_diagnostic.py"):
-        drift = _sp.run(
-            ["git", "-C", str(ROOT), "diff", "--name-only", commit, "HEAD", "--", tree],
-            capture_output=True, text=True, check=True).stdout.strip()
-        assert not drift, f"{tree} differs from the pinned {commit[:12]}:\n{drift}"
+    # The driver must be byte-identical: the pin exists to carry the cache
+    # repair, and a version of it without that is the bug this notebook fixed.
+    drift = _sp.run(
+        ["git", "-C", str(ROOT), "diff", "--name-only", commit, "HEAD", "--",
+         "tools/run_distribution_aware_diagnostic.py"],
+        capture_output=True, text=True, check=True).stdout.strip()
+    assert not drift, f"the driver differs from the pinned {commit[:12]}:\n{drift}"
+
+    # `owl/` is checked *behaviourally*, not as a tree. This used to be a tree
+    # diff, which was right while nothing else was being added to the package
+    # and wrong as soon as something was: the T1->T10 support adds optional
+    # parameters to `benchmark.chain` and a helper to `evaluation_subset`,
+    # neither of which any arm in this session calls. What must hold is that the
+    # arms select identically at the pin and in this tree, and a tree diff can
+    # neither prove that nor tolerate a genuinely inert addition.
+    import json as _json
+    import os
+    import tempfile
+
+    probe = ROOT / "tests" / "data" / "arm_behaviour_probe.py"
+    named = _json.dumps(list(gates.ITERATIVE_ARMS))
+
+    def fingerprint(tree: Path) -> str:
+        done = _sp.run(
+            [sys.executable, str(probe), named, str(gates.ITERATIVE_ROUNDS)],
+            capture_output=True, text=True, check=False,
+            env=dict(os.environ, PYTHONPATH=str(tree)), cwd=str(tree))
+        assert done.returncode == 0, done.stderr[-2000:]
+        return done.stdout.strip()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        pinned = Path(temporary)
+        archive = _sp.run(["git", "-C", str(ROOT), "archive", commit, "owl"],
+                          capture_output=True, check=True).stdout
+        _sp.run(["tar", "-x", "-C", str(pinned)], input=archive, check=True)
+        before = fingerprint(pinned)
+    assert before == fingerprint(ROOT), (
+        f"the arms this session runs behave differently at the pinned "
+        f"{commit[:12]} than in this tree; the interrupted seed cannot be "
+        "resumed into a comparable result"
+    )
 
 
 def test_every_tool_the_iterative_notebook_calls_accepts_its_flags():

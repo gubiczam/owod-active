@@ -307,16 +307,29 @@ REPORTING: tuple[str, ...] = (
 )
 
 
-def chain() -> tuple[protocol.Task, ...]:
-    """The benchmark's task chain: t1 anchor, then t2, t3, t4."""
+def chain(n_tasks: int | None = None) -> tuple[protocol.Task, ...]:
+    """The task chain: t1 anchor, then one new class per task.
 
-    return protocol.build_chain(N_TASKS)
+    ``n_tasks`` defaults to :data:`N_TASKS`, the frozen Benchmark V1 length, so
+    every existing caller is unchanged. It is a parameter because the
+    2026-08-25 consultation asked for the protocol to be measured through
+    ``t1 -> ... -> t10`` and ``owl.protocol.build_chain`` has always supported
+    it; what was missing was a way to say so without editing a frozen constant.
+
+    A chain of a different length is a **different experiment**, not a longer
+    version of this one: it declares more classes, so
+    :func:`declared_classes` differs, so the shared evaluation split differs,
+    so every metric is measured on a different image set. Callers that mix the
+    two are comparing across measurements.
+    """
+
+    return protocol.build_chain(N_TASKS if n_tasks is None else int(n_tasks))
 
 
-def declared_classes() -> tuple[str, ...]:
+def declared_classes(n_tasks: int | None = None) -> tuple[str, ...]:
     """The classes the chain introduces — what the shared eval split is built on."""
 
-    return tuple(task.new_class for task in chain()[1:] if task.new_class)
+    return tuple(task.new_class for task in chain(n_tasks)[1:] if task.new_class)
 
 
 def tail_band(task: protocol.Task, groups: Mapping[str, str] | None = None) -> tuple[str, ...]:
@@ -329,8 +342,16 @@ def tail_band(task: protocol.Task, groups: Mapping[str, str] | None = None) -> t
 # ------------------------------------------------------------------ configs ---
 
 
-def cycle_config(arm: str, seed: int) -> runner.CycleConfig:
-    """The frozen :class:`owl.runner.CycleConfig` for one trajectory."""
+def cycle_config(
+    arm: str, seed: int, *, n_tasks: int | None = None
+) -> runner.CycleConfig:
+    """The frozen :class:`owl.runner.CycleConfig` for one trajectory.
+
+    Everything except the chain length is frozen. ``n_tasks`` defaults to
+    :data:`N_TASKS`; passing another value runs the same protocol over a longer
+    chain and is only meaningful into a separate results directory with its own
+    evaluation split.
+    """
 
     if arm not in arm_registry.ARMS:
         raise BenchmarkError(
@@ -338,8 +359,11 @@ def cycle_config(arm: str, seed: int) -> runner.CycleConfig:
         )
     if seed not in SEEDS:
         raise BenchmarkError(f"seed={seed} is not one of the declared seeds {SEEDS}.")
+    length = N_TASKS if n_tasks is None else int(n_tasks)
+    if length < 2:
+        raise BenchmarkError(f"a chain needs the anchor and at least one task, got {length}")
     return runner.CycleConfig(
-        n_tasks=N_TASKS,
+        n_tasks=length,
         budget_per_task=ANSWER_BUDGET_PER_TASK,
         budget_unit="answers",
         rounds_per_task=ROUNDS_PER_TASK,
@@ -646,11 +670,34 @@ def manifest(
     test_set: str,
     test_images: int,
     dry_run: bool = False,
+    n_tasks: int | None = None,
 ) -> dict[str, object]:
-    """The machine-readable record of one session."""
+    """The machine-readable record of one session.
 
+    ``n_tasks`` is the chain length actually run. It matters for provenance and
+    not only for tidiness: ``frozen`` records the **protocol's** frozen
+    ``n_tasks`` (4, which :func:`check_protocol` pins against the document), so
+    without this the manifest of a ten-task session would describe a four-task
+    chain and carry V1's experiment name. A session of a different length gets
+    its own name and an explicit statement that its numbers are not comparable
+    with V1's, because the evaluation split differs.
+    """
+
+    length = N_TASKS if n_tasks is None else int(n_tasks)
     return {
-        "experiment": "full_owod_active_benchmark_v1",
+        "experiment": ("full_owod_active_benchmark_v1" if length == N_TASKS
+                       else f"full_owod_chain_t{length}"),
+        "chain_length": length,
+        "comparable_with_benchmark_v1": length == N_TASKS,
+        "comparability_note": (
+            "same chain length and therefore the same shared evaluation split"
+            if length == N_TASKS else
+            f"a {length}-task chain declares "
+            f"{len(declared_classes(length))} classes against V1's "
+            f"{len(declared_classes())}, so it is measured on a different "
+            "shared evaluation split. These numbers must NOT be placed in the "
+            "same table as Benchmark V1's."
+        ),
         "dry_run": bool(dry_run),
         "protocol": str(PROTOCOL_PATH.relative_to(ROOT)),
         "frozen": frozen_values(),
@@ -664,7 +711,7 @@ def manifest(
         "chain": [
             {"task": task.name, "new_class": task.new_class,
              "known_after": task.n_current, "tail_band": list(tail_band(task))}
-            for task in chain()
+            for task in chain(length)
         ],
         "pins": {
             "owl_commit": owl_commit,

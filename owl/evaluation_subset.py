@@ -192,6 +192,25 @@ MARKER_BEHAVIOUR = {
 SHARED_TEST_SET = "owl_shared_test"
 
 
+def shared_test_set_name(n_tasks: int) -> str:
+    """The split's name for a chain of ``n_tasks``.
+
+    A longer chain declares more classes, so it gets a **different** shared
+    split — 837 images for four tasks, 2,817 for ten. Those are different
+    measurements, and giving them the same name would let one silently overwrite
+    the other in a data root and make two experiments look like one.
+
+    Four tasks keeps the bare name, so Benchmark V1 is byte-identical to what it
+    was measured as. Everything else is suffixed. The result still contains
+    ``test`` as its only PROB marker, which
+    :func:`check_split_name` requires and asserts.
+    """
+
+    name = SHARED_TEST_SET if int(n_tasks) == 4 else f"{SHARED_TEST_SET}_t{int(n_tasks)}"
+    check_split_name(name)
+    return name
+
+
 class SplitNameError(ValueError):
     """Raised when a split name would make PROB do the wrong thing silently."""
 

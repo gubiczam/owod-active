@@ -124,6 +124,12 @@ def main() -> None:
     parser.add_argument("--fetch-workers", type=int, default=32)
     parser.add_argument("--dino-batch-size", type=int, default=128)
     parser.add_argument("--seeds", type=int, nargs="+", default=[bm.DEVELOPMENT_SEED])
+    parser.add_argument("--n-tasks", type=int, default=None,
+                        help="chain length. Defaults to the frozen Benchmark V1 "
+                             "value. A different length declares more classes, "
+                             "so it uses its own shared evaluation split and its "
+                             "numbers are NOT comparable with V1's -- run it into "
+                             "a separate --out")
     parser.add_argument("--arms", nargs="+", default=list(arm_registry.ORDER),
                         choices=list(arm_registry.ARMS),
                         help="defaults to the pre-declared order; naming a "
@@ -155,7 +161,8 @@ def main() -> None:
 
     candidate_index = json.loads(CANDIDATE_INDEX.read_text(encoding="utf-8"))
     replay_index = json.loads(REPLAY_INDEX.read_text(encoding="utf-8"))
-    test_set, subset = shared_test_split(data_root, write=True)
+    test_set, subset = shared_test_split(
+        data_root, write=True, n_tasks=arguments.n_tasks)
     print(f"[evaluation] shared split {test_set}: {len(subset.image_ids):,} images")
 
     wanted = [a for a in arm_registry.ORDER if a in set(arguments.arms)]
@@ -216,7 +223,7 @@ def main() -> None:
     # arms would pay for the identical evaluation five times. It is cached on the
     # output path existing, so one real evaluation copied into each workspace
     # skips the other four.
-    chain = bm.chain()
+    chain = bm.chain(arguments.n_tasks)
     # The shared split's pixels must be on disk before anything is evaluated,
     # and /content does not survive a Colab session even though Drive does. A
     # real run finds them already fetched and this is a validating no-op.
@@ -268,7 +275,7 @@ def main() -> None:
             print("=" * 78)
             print(f"[{name}] {arm_registry.ARMS[arm].description}")
             print("=" * 78)
-            config = bm.cycle_config(arm, seed)
+            config = bm.cycle_config(arm, seed, n_tasks=arguments.n_tasks)
             selector = bm.make_selector(
                 arm,
                 candidate_index=candidate_index,
@@ -359,6 +366,7 @@ def main() -> None:
         test_set=test_set,
         test_images=len(subset.image_ids),
         dry_run=bool(arguments.dry_run),
+        n_tasks=arguments.n_tasks,
     ))
     shutil.copyfile(bm.PROTOCOL_PATH, out / bm.PROTOCOL_PATH.name)
     print(f"\n[manifest] {manifest_path}")
