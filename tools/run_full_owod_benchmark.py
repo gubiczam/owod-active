@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from owl import metrics, runner
+from owl import metrics, replay, runner, supervision
 from owl.active_selection import arms as arm_registry
 from owl.active_selection import benchmark as bm
 from owl.bridge import PROB_REPOSITORY, Bridge
@@ -140,6 +140,37 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true",
                         help="stub the detector and the semantic pass; proves "
                              "the orchestration on a laptop")
+    # --- the V2 axes. Every one defaults to the frozen V1 value, so omitting
+    #     all of them reproduces a committed trajectory exactly. See
+    #     docs/full_owod_v2_protocol.md.
+    v2 = parser.add_argument_group(
+        "V2 axes (docs/full_owod_v2_protocol.md)",
+        "Each defaults to the frozen Benchmark V1 value. Naming one changes "
+        "what the numbers mean, so it also changes the workspace fingerprint "
+        "and an older workspace is refused rather than continued.")
+    v2.add_argument("--annotation-policy", default=None,
+                    choices=list(supervision.POLICIES),
+                    help="per-box annotation policy, written as filtered "
+                         "annotations. Default: PROB's --supervision-mode, "
+                         "which cannot tell full_image from known_plus_selected")
+    v2.add_argument("--ignore-mechanism", default=None,
+                    choices=list(supervision.IGNORE_MECHANISMS),
+                    help="how known_plus_selected_ignore_rest delivers ignore. "
+                         "'drop' is the honest name for what the pipeline did "
+                         "before: the region becomes background")
+    v2.add_argument("--replay-mode", default=None, choices=sorted(replay.MODES),
+                    help="m_c proportional to n_c**alpha. Default: uniform")
+    v2.add_argument("--replay-refresh", default=None,
+                    choices=sorted(replay.REFRESH),
+                    help="'per_task' re-derives the allocation from the class "
+                         "distribution known at this task. Default: fixed")
+    v2.add_argument("--acquisition-batch-size", type=int, default=None,
+                    help="answers per mini-round; rounds = ceil(budget/batch). "
+                         "Default: one round")
+    v2.add_argument("--answer-budget", type=int, default=None,
+                    help="oracle answers per task. It has to move with the "
+                         "annotation policy, because the price of an image is a "
+                         "property of the policy. Default: the frozen 3000")
     arguments = parser.parse_args()
 
     out = Path(arguments.out)
@@ -275,11 +306,28 @@ def main() -> None:
             print("=" * 78)
             print(f"[{name}] {arm_registry.ARMS[arm].description}")
             print("=" * 78)
-            config = bm.cycle_config(arm, seed, n_tasks=arguments.n_tasks)
+            config = bm.cycle_config(
+                arm, seed, n_tasks=arguments.n_tasks,
+                answer_budget=arguments.answer_budget,
+                acquisition_batch_size=arguments.acquisition_batch_size,
+                annotation_policy=arguments.annotation_policy,
+                ignore_mechanism=arguments.ignore_mechanism,
+                replay_mode=arguments.replay_mode,
+                replay_refresh=arguments.replay_refresh,
+            )
             selector = bm.make_selector(
                 arm,
                 candidate_index=candidate_index,
                 jpeg_dir=jpeg,
+                # The ledger must charge the policy's price, not full-image's.
+                annotation_policy=(
+                    arguments.annotation_policy or bm.LABELLING_POLICY),
+                # `run_chain` does not hand the selector a round count, so the
+                # schedule is closed over here. Before this it was never passed
+                # at all and every arm ran one round whatever the config said --
+                # harmless while ROUNDS_PER_TASK was 1, and wrong the moment
+                # --acquisition-batch-size exists.
+                rounds=config.rounds_per_task,
                 ref_t1=arguments.ref_t1 or ("dry-run" if arguments.dry_run else None),
                 device=arguments.device,
                 batch_size=arguments.dino_batch_size,
@@ -302,6 +350,7 @@ def main() -> None:
                     prepare_images=prepare_images,
                     replay_index=replay_index,
                     replay_root=data_root,
+                    data_root=data_root,
                     selector=selector,
                 )
             except Exception as error:                    # noqa: BLE001

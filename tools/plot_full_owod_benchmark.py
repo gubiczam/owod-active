@@ -23,7 +23,43 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from owl.active_selection import arms as arm_registry
 
-TASKS = ("t2", "t3", "t4")
+#: Benchmark V1's chain. Kept only as the fallback for a results directory that
+#: holds no rows at all; the axis is otherwise read from the CSVs.
+DEFAULT_TASKS = ("t2", "t3", "t4")
+
+
+def chain_tasks(rows):
+    """The task axis this results directory actually contains, in chain order.
+
+    Hard-coding ``("t2", "t3", "t4")`` was a Benchmark V1 assumption, and on the
+    ten-task chain it silently dropped ``t5`` through ``t10`` from every figure —
+    the filter was ``row["task"] not in TASKS``, so the points did not go
+    missing loudly, they went missing quietly. The axis is derived instead, and
+    sorted by the task's index in the chain rather than by its name, because
+    ``t10`` sorts before ``t2`` as a string.
+    """
+
+    present = {str(row.get("task")) for row in rows if row.get("task")}
+    if not present:
+        return DEFAULT_TASKS
+    from owl import protocol
+
+    order = [task.name for task in protocol.build_chain(n_tasks=10)]
+    known = [name for name in order if name in present]
+    unknown = sorted(present - set(order))
+    return tuple(known + unknown)
+
+
+def task_label(name):
+    """``t3`` -> ``t3\\nfire hydrant\\n(tail)``, from the protocol, not a literal."""
+
+    from owl import protocol
+
+    groups = protocol.load_groups()
+    for task in protocol.build_chain(n_tasks=10):
+        if task.name == name and task.new_class:
+            return f"{name}\n{task.new_class}\n({groups.get(task.new_class, '?')})"
+    return str(name)
 
 #: One figure per endpoint: (csv, column, title, y label).
 PANELS = (
@@ -101,13 +137,14 @@ def main() -> None:
 
     for source, column, title, ylabel in PANELS:
         rows = cache.get(source) or []
+        tasks = chain_tasks(rows)
         series: dict[tuple[str, str], list[tuple[float, float]]] = {}
         for row in rows:
             got = value(row, column)
-            if got is None or row["task"] not in TASKS:
+            if got is None or row["task"] not in tasks:
                 continue
             key = (row["arm"], row.get("seed", "0"))
-            series.setdefault(key, []).append((TASKS.index(row["task"]), got))
+            series.setdefault(key, []).append((tasks.index(row["task"]), got))
         if not series:
             continue
         figure, axis = plt.subplots(figsize=(6.4, 4.0))
@@ -119,10 +156,9 @@ def main() -> None:
                 axis.plot([p[0] for p in points], [p[1] for p in points],
                           marker="o", label=f"{name}" if seed in ("0", 0) else
                           f"{name} (seed {seed})")
-        axis.set_xticks(range(len(TASKS)))
-        axis.set_xticklabels([f"{t}\n{d}" for t, d in zip(
-            TASKS, ("traffic light\n(head)", "fire hydrant\n(tail)", "stop sign\n(tail)")
-        )], fontsize=8)
+        axis.set_xticks(range(len(tasks)))
+        axis.set_xticklabels([task_label(t) for t in tasks],
+                             fontsize=8 if len(tasks) <= 5 else 6)
         axis.set_ylabel(ylabel)
         axis.set_title(title, fontsize=11)
         axis.grid(alpha=0.3)

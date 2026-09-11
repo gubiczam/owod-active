@@ -302,3 +302,77 @@ ARMS: dict[str, dict] = {
     "herding": {"total": 400, "alpha": 0.0, "selector": "herding"},
     "herding_tail": {"total": 400, "alpha": -0.5, "selector": "herding"},
 }
+
+
+# ------------------------------------------------- the V2 configuration names ---
+#
+# The 2026-09 redesign brief asks for the replay axis under four mode names and
+# two refresh names. They are a *vocabulary over the arms above*, not new
+# behaviour: each maps onto a registered arm, so a V2 configuration and a
+# committed result that used the arm name are the same run and can be tabulated
+# together. Anything else would have meant a second allocator.
+
+#: ``replay_mode -> registered arm``. ``m_c ∝ n_c**alpha`` with ``Σ m_c = M``
+#: throughout, and :func:`allocate` is the single implementation: capacity-aware,
+#: with largest-remainder rounding, so the sum is exact and the tie-breaking is
+#: deterministic and documented rather than incidental.
+#:
+#: =================  =======  ==================================================
+#: mode               alpha    what it is
+#: =================  =======  ==================================================
+#: ``none``           —        no rehearsal. The lower bound.
+#: ``uniform``        ``0``    equal per class. Today's standard, and the arm
+#:                             every committed chain in this repository holds
+#:                             fixed so replay cannot become the explanation.
+#: ``proportional``   ``1``    proportional to class size. Head-favouring, and
+#:                             the failure mode the research plan predicts: the
+#:                             rarest class gets one exemplar, which ``minimum=1``
+#:                             is all that keeps off zero.
+#: ``tail_aware``     ``-0.5`` tail-favouring. The plan's ``alpha < 0`` branch and
+#:                             contribution B's proposal.
+#: =================  =======  ==================================================
+MODES: dict[str, str] = {
+    "none": "none",
+    "uniform": "uniform",
+    "proportional": "head_favouring",
+    "tail_aware": "tail_favouring",
+}
+
+#: ``replay_refresh -> runner.CycleConfig.replay_reallocate``.
+#:
+#: ``fixed``
+#:     the memory keeps the exemplars it already had wherever they still serve
+#:     the new allocation. What every committed chain ran.
+#: ``per_task``
+#:     the allocation is re-derived from the class distribution known *at this
+#:     task*, which is the consultation's "different memory in every task". It is
+#:     the main new possibility on this axis, and it matters most exactly where
+#:     the plan says it should: a class that was unknown at t2 and is known at t5
+#:     has no share of a memory sized at t2.
+#:
+#: Both re-satisfy the object budget from scratch, so neither can let the memory
+#: drift in size — see the note above :data:`ARMS`. What differs is only whether
+#: the previous memory is offered as a priority.
+REFRESH: dict[str, bool] = {"fixed": False, "per_task": True}
+
+
+def resolve_mode(mode: str) -> tuple[str, dict]:
+    """``replay_mode`` to ``(arm name, arm spec)``. Raises on an unknown mode."""
+
+    if mode not in MODES:
+        raise ValueError(
+            f"Unknown replay_mode {mode!r}; expected one of {sorted(MODES)}. "
+            f"To reach an arm outside the V2 vocabulary — {sorted(set(ARMS) - set(MODES.values()))} "
+            "— name the arm directly."
+        )
+    arm = MODES[mode]
+    return arm, dict(ARMS[arm])
+
+
+def resolve_refresh(refresh: str) -> bool:
+    """``replay_refresh`` to the reallocation flag. Raises on an unknown value."""
+
+    if refresh not in REFRESH:
+        raise ValueError(
+            f"Unknown replay_refresh {refresh!r}; expected one of {sorted(REFRESH)}")
+    return REFRESH[refresh]

@@ -684,6 +684,16 @@ def task_row(
         "new_mAP50": evaluation.current_map50,
         "U_Recall50": evaluation.unknown_recall50,
     }
+    # Wilderness Impact and Absolute Open-Set Error are both named in the
+    # research plan's evaluation section and both were already in every metrics
+    # file the bridge wrote — PROB's own evaluator returns them and
+    # `daowod_prob_bridge` normalises `AOSA` to `A_OSE`. They were simply never
+    # put in a row. Read defensively because `parse_evaluation`, the older log
+    # parser, does not always recover a recall level.
+    if 0.8 in evaluation.wilderness_impact and 50.0 in evaluation.wilderness_impact[0.8]:
+        row["WI08"] = evaluation.wi_at(0.8, 50.0)
+    if 50.0 in evaluation.absolute_ose:
+        row["A_OSE"] = evaluation.aose_at(50.0)
     if new_class and new_class in evaluation.per_class_ap50:
         row["new_class_AP50"] = evaluation.per_class_ap50[new_class]
     if previous_baseline is not None and evaluation.previous_map50 is not None:

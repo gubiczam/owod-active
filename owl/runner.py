@@ -68,6 +68,28 @@ class CycleConfig:
     replay_arm: str = "tail_favouring"  # owl.replay.ARMS
     replay_reallocate: bool = False     # re-size the memory every task
 
+    #: The **per-box** annotation policy, written as filtered annotations rather
+    #: than mapped onto PROB's two-valued ``--supervision-mode``. One of
+    #: :data:`owl.supervision.POLICIES`.
+    #:
+    #: ``None`` is the committed behaviour and is bit-identical to it: the
+    #: policy is expressed through ``labelling_policy`` -> ``supervision_mode``,
+    #: which has two settings for three policies and therefore ran ``full_image``
+    #: and ``known_plus_selected`` as the same experiment. Set it, and the
+    #: annotation itself decides what the detector is taught — which is the only
+    #: place a per-box rule can live, since PROB has no ignore channel
+    #: (``owl.supervision`` reads the pinned source and says so).
+    #:
+    #: Requires ``data_root``: the policy is materialised as alias annotations
+    #: next to the originals.
+    annotation_policy: str | None = None
+
+    #: How ``known_plus_selected_ignore_rest`` delivers "ignore". One of
+    #: :data:`owl.supervision.IGNORE_MECHANISMS`; ``None`` takes the policy's own
+    #: default. ``drop`` is the honest name for what the pipeline did before —
+    #: the region becomes background — and is kept as the control.
+    ignore_mechanism: str | None = None
+
     #: What "replay" means in this run, and the arm name does not say it — so it
     #: is part of the fingerprint and an older workspace is refused rather than
     #: continued under a new meaning.
@@ -135,7 +157,16 @@ class CycleConfig:
     #: older workspace on that basis would strand the completed Replay-V3 chains
     #: for no scientific gain, so a field listed here joins the fingerprint only
     #: when it is set to something other than the value the older code implied.
-    LATER_ADDITIONS: tuple[tuple[str, object], ...] = (("budget_unit", "regions"),)
+    LATER_ADDITIONS: tuple[tuple[str, object], ...] = (
+        ("budget_unit", "regions"),
+        # A workspace stamped before the per-box policy existed meant
+        # "labelling_policy through supervision_mode", which is exactly what
+        # `annotation_policy=None` means. So a legacy workspace stays resumable,
+        # and the moment a real policy is named the fingerprint changes and a
+        # collision is refused rather than blended.
+        ("annotation_policy", None),
+        ("ignore_mechanism", None),
+    )
 
     def fingerprint(self) -> dict[str, object]:
         row = {name: getattr(self, name) for name in self.RESULT_AFFECTING}
@@ -262,6 +293,7 @@ def run_chain(
     prepare_images: Callable[[Sequence[str]], Sequence[str]] | None = None,
     replay_index: Mapping[str, Mapping[str, int]] | None = None,
     replay_root: Path | None = None,
+    data_root: Path | None = None,
     selector: Callable[..., object] | None = None,
 ) -> list[TaskResult]:
     """Run the task chain on the GPU, one checkpoint per task, resumable.
@@ -309,6 +341,12 @@ def run_chain(
     """
 
     chain = chain or protocol.build_chain(config.n_tasks)
+    # `replay_root` has always been the PROB data root — `write_aliases` writes
+    # into its `Annotations/` and `JPEGImages/`. The per-box annotation policy
+    # needs the same directory, so it defaults to it rather than asking the
+    # caller for the same path twice under a second name.
+    data_root = Path(data_root) if data_root is not None else (
+        Path(replay_root) if replay_root is not None else None)
     groups = protocol.load_groups()
     workspace = Path(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
@@ -398,6 +436,12 @@ def run_chain(
     #: Every image the oracle has ever answered for, and whether it has been
     #: trained on yet. An entry that is not yet trainable is not lost.
     ledger: set[str] = set()
+    # image id -> the proposal boxes the oracle was asked about on it, in
+    # normalised cxcywh. Only a per-box annotation policy needs this, and it has
+    # to survive a task boundary: an image banked at t2 rejoins training at t3,
+    # and its filtered annotation has to be rewritten from the box that was
+    # actually selected back then.
+    selected_boxes: dict[str, list[list[float]]] = {}
     trained_on: set[str] = set()
     #: ``E_(k-1)``: the exemplar objects stored after the previous task. Empty
     #: before t2, where the pool is the canonical old-data index itself.
@@ -467,6 +511,7 @@ def run_chain(
             saved = json.loads(state_path.read_text(encoding="utf-8"))
             used_images.update(saved["used_images"])
             ledger.update(saved["ledger"])
+            selected_boxes.update(saved.get("selected_boxes") or {})
             trained_on.update(saved["trained_on"])
             labelled_history[task.name] = saved["labelled"]
             exemplars = tuple(
@@ -589,6 +634,16 @@ def run_chain(
             # cost is per image, so de-duplicating with a set would lose both.
             opened = list(dict.fromkeys(str(v) for v in bought.images))
             acquired = dict(bought.row)
+            # The box the oracle was asked about on each opened image. Kept for
+            # the whole chain, because an image banked now rejoins training at a
+            # later task and its filtered annotation has to be rewritten from
+            # the region that was actually selected here.
+            boxes = np.asarray(
+                getattr(bought, "anchor_boxes", np.zeros((0, 4))), dtype=np.float32
+            ).reshape(-1, 4)
+            for image, box in zip(bought.images, boxes.tolist(), strict=False):
+                selected_boxes.setdefault(str(image), []).append(
+                    [float(value) for value in box])
         used_images.update(opened)
 
         # ---- 4. what the oracle's answers are worth ----------------------
@@ -796,10 +851,77 @@ def run_chain(
             }
             exemplars = chosen
 
-        # ---- 6. fine-tune -------------------------------------------------
+        # ---- 5d. the per-box annotation policy ----------------------------
+        #
+        # Runs here and not earlier because it reads the source JPEGs and the
+        # source annotations, and 5b is what guarantees they are on disk. The
+        # replay aliases are already written and live under a different prefix
+        # (`9` against this module's `8`), so neither clears the other.
+        #
+        # `annotation_policy=None` is the committed behaviour: the policy is
+        # expressed through PROB's two-valued `--supervision-mode`, which cannot
+        # tell `full_image` from `known_plus_selected`. With a policy named, the
+        # annotation itself decides, and PROB is handed alias ids.
+        training_ids = list(trainable)
+        supervision_mode_reason = "labelling_policy -> --supervision-mode"
         supervision = "train" if config.labelling_policy == "box_only" else "ft"
+        supervision_row: dict[str, object] = {}
+        if config.annotation_policy is not None:
+            from owl import supervision as supervision_module
+
+            if data_root is None:
+                raise ValueError(
+                    f"annotation_policy={config.annotation_policy!r} is materialised "
+                    "as alias annotations next to the originals, and no `data_root` "
+                    "was given. Pass the PROB data root, or leave annotation_policy "
+                    "at None to keep the committed --supervision-mode behaviour."
+                )
+            asked = {
+                image: np.asarray(
+                    selected_boxes.get(image, []), dtype=np.float32
+                ).reshape(-1, 4)
+                for image in training_ids
+            }
+            missing = sorted(image for image, boxes in asked.items() if not len(boxes))
+            if missing:
+                # An image with no recorded selection cannot have a per-box
+                # policy applied to it: there is no "selected region". This is a
+                # bug in the bookkeeping, not a datum, so it stops the run.
+                raise RuntimeError(
+                    f"{task.name}: {len(missing)} of {len(asked)} training images "
+                    "have no recorded selected box, so the per-box policy has "
+                    f"nothing to key on (first: {missing[0]}). The selector must "
+                    "report `anchor_boxes`, and they must survive into state.json."
+                )
+            plan = supervision_module.plan(
+                data_root, asked,
+                policy=config.annotation_policy,
+                previously_known=task.previous_classes,
+                declared=task.known_classes,
+                ignore_mechanism=config.ignore_mechanism,
+            )
+            written_plan = supervision_module.write_supervision(
+                plan, data_root=data_root)
+            training_ids = sorted(written_plan.aliases)
+            supervision_row = written_plan.summary()
+            supervision = "ft"
+            supervision_mode_reason = (
+                f"per-box alias annotations ({config.annotation_policy})")
+            print(f"  [{task.name}] {config.annotation_policy}: "
+                  f"{supervision_row['objects_supervised']} objects supervised, "
+                  f"{supervision_row['objects_ignored']} ignored, "
+                  f"{supervision_row['objects_banked']} banked over "
+                  f"{len(training_ids)} alias images")
+            if len(training_ids) < config.batch_size:
+                raise RuntimeError(
+                    f"{task.name} produced only {len(training_ids)} alias images "
+                    f"with any supervision, and PROB drops the last partial batch, "
+                    f"so it needs {config.batch_size}. Raise budget_per_task."
+                )
+
+        # ---- 6. fine-tune -------------------------------------------------
         checkpoint = bridge.train(
-            trainable,
+            training_ids,
             previous_checkpoint=checkpoint,
             output_checkpoint=task_dir / "checkpoint.pth",
             output_dir=task_dir / "train",
@@ -895,13 +1017,25 @@ def run_chain(
                     # PROB drops the last partial batch, so this is what the
                     # optimiser actually took. Equal supervision does not imply
                     # equal steps and the difference has to be visible.
-                    "training_images": len(trainable) + len(replay_aliases),
-                    "training_iterations": ((len(trainable) + len(replay_aliases))
+                    # What PROB was handed, which under a per-box policy is the
+                    # alias list and not `trainable`: an image whose whole
+                    # annotation was ignored or banked produces no alias.
+                    "training_images": len(training_ids) + len(replay_aliases),
+                    "training_iterations": ((len(training_ids) + len(replay_aliases))
                                             // max(config.batch_size, 1)) * config.epochs,
+                    "gradient_steps": ((len(training_ids) + len(replay_aliases))
+                                       // max(config.batch_size, 1)) * config.epochs,
                     **{k: v for k, v in ledger_row.items() if k not in acquired},
+                    # The per-box policy's own ledger. It goes here, with the
+                    # other cost columns, and not into `annotation_row` — whose
+                    # keys `flat()` prefixes with `label_`, which would hide
+                    # objects_ignored from every table that reads a cost column.
+                    **{k: v for k, v in supervision_row.items()
+                       if k not in acquired and k not in ledger_row},
                 },
                 annotation_row={"policy": config.labelling_policy,
-                                "supervision": supervision},
+                                "supervision": supervision,
+                                "supervision_from": supervision_mode_reason},
                 replay_row=dict(replay_diagnostics),
                 evaluation_row=row,
         )
@@ -910,6 +1044,7 @@ def run_chain(
         state_path.write_text(json.dumps({
             "used_images": sorted(used_images),
             "ledger": sorted(ledger),
+            "selected_boxes": selected_boxes,
             "trained_on": sorted(trained_on),
             "labelled": labelled_history[task.name],
             # E_k, as objects: the identities this task rehearsed on and the

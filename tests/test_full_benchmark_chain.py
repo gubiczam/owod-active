@@ -221,13 +221,18 @@ def _lineage_bridge():
             self.calls[-1] |= {
                 "previous": str(kwargs["previous_checkpoint"]),
                 "output": str(produced),
+                # What PROB was actually handed. Under a per-box annotation
+                # policy these are alias ids, not source ids, and that
+                # substitution is the whole mechanism.
+                "handed": [str(i) for i in labelled_ids],
             }
             return produced
 
     return LineageBridge()
 
 
-def _run(tmp_path, index, config, arm, *, features_for=None, workspace=None):
+def _run(tmp_path, index, config, arm, *, features_for=None, workspace=None,
+         with_data_root=False):
     from tests.test_run_chain import prob_data_root
 
     data_root = prob_data_root(tmp_path, index)
@@ -258,6 +263,10 @@ def _run(tmp_path, index, config, arm, *, features_for=None, workspace=None):
         test_set="owl_shared_test",
         chain=benchmark.chain(),
         selector=selector,
+        # Only when asked: the per-box annotation policy materialises alias
+        # annotations under the data root, and every other test here runs the
+        # committed `annotation_policy=None` path, which must not touch it.
+        **({"data_root": data_root} if with_data_root else {}),
     )
     return results, bridge, seen
 
@@ -913,3 +922,163 @@ def test_the_kill_rule_stops_proposed_v2_on_its_measured_seed_zero():
     assert any("0.06" in reason for reason in outcome["reasons"])
     # the guard threshold was met; the new-class threshold is what stopped it
     assert not any("known_mAP50" in reason for reason in outcome["reasons"])
+
+
+# ---------------------------------------------------- the V2 axes, on the chain ---
+
+
+def test_a_research_arm_grows_its_labelled_pool_along_the_chain(
+    tmp_path, small_index, small_config
+):
+    """Test-list item 3: the labelled pool must actually grow per task.
+
+    The 2026-08-25 consultation's objection to the old `D` was that it measured
+    distance to a *fixed* task-1 anchor, so at t3 it had no idea what t2 had
+    taught. This is the assertion that the objection is answered: the reference
+    the arm scores against at t4 is strictly larger than the one it had at t2.
+    """
+
+    results, _, seen = _run(tmp_path / "r", small_index, small_config, "research_v2")
+    assert [r.task for r in results] == ["t2", "t3", "t4"]
+    assert len(seen) == 3, "one semantic pass per task"
+
+    initial = [r.selection_row["reference_rows_initial"] for r in results]
+    final = [r.selection_row["reference_rows_final"] for r in results]
+    assert initial[0] == 0, "nothing is labelled at the first purchase task"
+    assert initial[1] > 0 and initial[2] > initial[1], (
+        f"the pool each task *starts* from must grow along the chain, got {initial}")
+    for start, end in zip(initial, final, strict=True):
+        assert end > start, (
+            f"the pool did not grow within a task: {start} -> {end}")
+
+
+def test_a_research_arm_leaves_a_candidate_level_trail(
+    tmp_path, small_index, small_config
+):
+    """D_labeled, D_batch, the final D, w, coh and the cluster, per candidate."""
+
+    import csv
+
+    workspace = tmp_path / "w"
+    _run(tmp_path / "r", small_index, small_config, "research_v2",
+         workspace=workspace)
+    log = workspace / "t3_research_v2" / "candidate_log.csv"
+    assert log.is_file(), sorted(p.name for p in workspace.iterdir())
+    with log.open(encoding="utf-8") as handle:
+        picks = list(csv.DictReader(handle))
+    assert picks
+    for column in ("round", "U", "D_labeled", "D_batch", "D", "w", "coh",
+                   "cluster", "cluster_status", "score", "redundant"):
+        assert column in picks[0], column
+    assert {row["cluster_status"] for row in picks} <= {"core", "border", "noise"}
+
+
+def test_an_earlier_arm_leaves_no_candidate_log(tmp_path, small_index, small_config):
+    """The trail is a research-arm feature; it may not appear where it did not."""
+
+    workspace = tmp_path / "w"
+    _run(tmp_path / "a", small_index, small_config, "random", workspace=workspace)
+    assert not list(workspace.glob("*/candidate_log.csv"))
+
+
+def _per_box_config(small_config):
+    from dataclasses import replace
+
+    return replace(
+        small_config,
+        annotation_policy="known_plus_selected_ignore_rest",
+        ignore_mechanism="drop",     # no Pillow dependency in this test
+        budget_per_task=12,          # cost(image) == 1 under this policy
+    )
+
+
+def test_the_per_box_policy_hands_prob_alias_ids_and_reconciles(
+    tmp_path, small_index, small_config
+):
+    """The policy reaches the detector, and its ledger adds up.
+
+    ``annotation_policy`` is the field that turns PROB's two-valued
+    ``--supervision-mode`` into a real per-box rule. What has to hold is that
+    PROB is handed the *aliases* — not the source ids — and that every annotated
+    object is accounted for exactly once.
+    """
+
+    config = _per_box_config(small_config)
+    results, bridge, _ = _run(tmp_path / "p", small_index, config, "random",
+                              with_data_root=True)
+    assert [r.task for r in results] == ["t2", "t3", "t4"]
+
+    trains = [c for c in bridge.calls if c["verb"] == "train"]
+    assert trains
+    for call in trains:
+        handed = call["handed"]
+        assert handed, "nothing was handed to the detector"
+        assert all(i.startswith("8") for i in handed), (
+            f"PROB was handed source ids, not supervision aliases: {handed[:3]}")
+
+    for row in (r.selection_row for r in results):
+        labelled = row["objects_labelled"]
+        assert labelled > 0
+        assert (row["objects_supervised"] + row["objects_ignored"]
+                + row["objects_banked"]) == labelled, row
+        assert row["objects_ignored"] > 0, (
+            "this policy's whole point is an ignore set; an empty one makes it "
+            "indistinguishable from full_image")
+        assert row["annotation_policy"] == "known_plus_selected_ignore_rest"
+
+    for row in (r.annotation_row for r in results):
+        assert row["supervision_from"].startswith("per-box"), row
+
+
+def test_the_committed_path_is_untouched_when_no_policy_is_named(
+    tmp_path, small_index, small_config
+):
+    """`annotation_policy=None` must be bit-identical to the committed run."""
+
+    results, bridge, _ = _run(tmp_path / "n", small_index, small_config, "random")
+    for call in (c for c in bridge.calls if c["verb"] == "train"):
+        handed = call["handed"]
+        assert not any(i.startswith("8") for i in handed), (
+            "a run that named no policy wrote supervision aliases anyway")
+    for row in (r.annotation_row for r in results):
+        assert row["supervision_from"] == "labelling_policy -> --supervision-mode"
+    for row in (r.selection_row for r in results):
+        assert "objects_ignored" not in row
+
+
+def test_a_per_box_chain_resumes_without_retraining(
+    tmp_path, small_index, small_config
+):
+    """Test-list item 9, with the state the per-box policy added.
+
+    The boxes the oracle was asked about have to survive a task boundary: an
+    image banked at t2 rejoins training at t3 and its filtered annotation is
+    rewritten from the region selected back then. So `selected_boxes` is in
+    `state.json`, and a resumed chain has to reproduce its rows from it.
+    """
+
+    config = _per_box_config(small_config)
+    workspace = tmp_path / "shared"
+    first, _, _ = _run(tmp_path / "a", small_index, config, "random",
+                       workspace=workspace, with_data_root=True)
+    again, bridge, _ = _run(tmp_path / "a", small_index, config, "random",
+                            workspace=workspace, with_data_root=True)
+
+    assert [r.flat() for r in first] == [r.flat() for r in again]
+    assert not [c for c in bridge.calls if c["verb"] == "train"], (
+        "a completed chain retrained on resume")
+    saved = json.loads(
+        (workspace / "t2_random" / "state.json").read_text(encoding="utf-8"))
+    assert saved["selected_boxes"], "the selected boxes did not reach state.json"
+    for boxes in saved["selected_boxes"].values():
+        assert boxes and len(boxes[0]) == 4
+
+
+def test_a_named_policy_changes_the_fingerprint(small_config):
+    """A per-box run may not silently continue a workspace that was not one."""
+
+    assert "annotation_policy" not in small_config.fingerprint()
+    named = _per_box_config(small_config)
+    assert named.fingerprint()["annotation_policy"] == (
+        "known_plus_selected_ignore_rest")
+    assert named.fingerprint() != small_config.fingerprint()

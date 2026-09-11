@@ -38,7 +38,7 @@ from pathlib import Path
 
 import numpy as np
 
-from owl import protocol, runner
+from owl import protocol, replay, runner, supervision
 from owl.active_selection import arms as arm_registry
 from owl.active_selection import budget as annotation_budget
 from owl.active_selection import population as population_module
@@ -249,9 +249,18 @@ KILL_RULE = KillRule()
 #: Arms whose design followed inspection of a detector endpoint. Reported as
 #: such, always. Everything else in :data:`owl.active_selection.arms.ORDER` was
 #: fixed before the first trajectory ran.
+#:
+#: The ``research_*`` arms carry the label conservatively rather than exactly.
+#: No V1 endpoint informed a single term of them — every term comes from the
+#: research plan and the 2026-08-25 consultation, and
+#: ``docs/full_owod_v2_protocol.md`` pre-registers them before the V2 chain
+#: runs. But they were *added* after V1 seed-0 numbers existed, and the
+#: convention here is that anything added after results exist says so.
 DEVELOPMENT_SEED_INFORMED: tuple[str, ...] = (
     "proposed_v2", "cost_aware", "distribution_aware_v1",
     "distribution_aware_iterative_v1",
+    "research_v2", "research_v2_plan", "research_v2_no_gate",
+    "research_v2_labeled_only", "research_v2_batch_only",
 )
 
 PROVENANCE: tuple[str, ...] = (
@@ -277,6 +286,16 @@ PROVENANCE: tuple[str, ...] = (
         "The CPU candidate-side diagnostics that informed Proposed-v2 are "
         "supporting development evidence only. They are oracle counts over an "
         "already-committed pool, not a detector result."
+    ),
+    (
+        "The research_* arms are the research plan's own equation, "
+        "s(x) = U + lambda*D + gamma*w*coh, with the 2026-08-25 redesigns of D "
+        "and coh. Their design reads no V1 endpoint: lambda and gamma are the "
+        "values owl.scoring froze in 2026-08, min_samples comes from the answer "
+        "budget and eps from the candidate geometry. They are pre-registered by "
+        "docs/full_owod_v2_protocol.md and are nonetheless reported as "
+        "development-seed-informed, because they were added after V1 seed-0 "
+        "numbers existed and that is the more conservative claim."
     ),
 )
 
@@ -343,14 +362,42 @@ def tail_band(task: protocol.Task, groups: Mapping[str, str] | None = None) -> t
 
 
 def cycle_config(
-    arm: str, seed: int, *, n_tasks: int | None = None
+    arm: str, seed: int, *, n_tasks: int | None = None,
+    answer_budget: int | None = None,
+    acquisition_batch_size: int | None = None,
+    annotation_policy: str | None = None,
+    ignore_mechanism: str | None = None,
+    replay_mode: str | None = None,
+    replay_refresh: str | None = None,
 ) -> runner.CycleConfig:
     """The frozen :class:`owl.runner.CycleConfig` for one trajectory.
 
-    Everything except the chain length is frozen. ``n_tasks`` defaults to
+    Everything except the chain length is frozen for V1. ``n_tasks`` defaults to
     :data:`N_TASKS`; passing another value runs the same protocol over a longer
     chain and is only meaningful into a separate results directory with its own
     evaluation split.
+
+    **The V2 axes.** Every keyword below defaults to ``None`` and ``None`` means
+    "the V1 frozen value", so a call that passes only ``arm`` and ``seed``
+    produces byte-identically the configuration every committed trajectory ran.
+    Naming one opens the axis ``docs/full_owod_v2_protocol.md`` declares:
+
+    ``annotation_policy`` / ``ignore_mechanism``
+        the per-box policy of :mod:`owl.supervision`, written as filtered
+        annotations rather than mapped onto PROB's two-valued
+        ``--supervision-mode``.
+    ``replay_mode`` / ``replay_refresh``
+        the ``m_c ∝ n_c**alpha`` vocabulary of :data:`owl.replay.MODES` and
+        :data:`owl.replay.REFRESH`.
+    ``acquisition_batch_size``
+        answers per mini-round. ``rounds = ceil(budget / batch)``, which is how
+        the consultation's "600 at once, or the best 100 then recompute" is
+        expressed. Refuses a batch larger than the budget rather than silently
+        collapsing to one round.
+    ``answer_budget``
+        the per-task oracle budget. It has to move with the annotation policy,
+        because the *price of an image* is a property of the policy — see
+        :func:`owl.active_selection.budget.cost_function`.
     """
 
     if arm not in arm_registry.ARMS:
@@ -362,17 +409,49 @@ def cycle_config(
     length = N_TASKS if n_tasks is None else int(n_tasks)
     if length < 2:
         raise BenchmarkError(f"a chain needs the anchor and at least one task, got {length}")
+    budget = ANSWER_BUDGET_PER_TASK if answer_budget is None else int(answer_budget)
+    if budget < 1:
+        raise BenchmarkError(f"answer_budget must be positive, got {budget}")
+
+    rounds = ROUNDS_PER_TASK
+    if acquisition_batch_size is not None:
+        batch = int(acquisition_batch_size)
+        if batch < 1 or batch > budget:
+            raise BenchmarkError(
+                f"acquisition_batch_size={batch} must be between 1 and the "
+                f"answer budget {budget}. A batch larger than the budget would "
+                "silently collapse to one round, which is a different "
+                "experiment wearing an iterative name.")
+        rounds = -(-budget // batch)          # ceil
+
+    replay_arm = REPLAY_ARM
+    if replay_mode is not None:
+        replay_arm, _ = replay.resolve_mode(replay_mode)
+    reallocate = (
+        False if replay_refresh is None else replay.resolve_refresh(replay_refresh))
+
+    if annotation_policy is not None and annotation_policy not in supervision.POLICIES:
+        raise BenchmarkError(
+            f"annotation_policy={annotation_policy!r}; expected one of "
+            f"{supervision.POLICIES}")
+    if ignore_mechanism is not None and annotation_policy is None:
+        raise BenchmarkError(
+            "ignore_mechanism was given without an annotation_policy, so it "
+            "would describe a mechanism nothing uses.")
+
     return runner.CycleConfig(
         n_tasks=length,
-        budget_per_task=ANSWER_BUDGET_PER_TASK,
+        budget_per_task=budget,
         budget_unit="answers",
-        rounds_per_task=ROUNDS_PER_TASK,
+        rounds_per_task=rounds,
         candidate_images_per_task=CANDIDATE_IMAGES_PER_TASK,
         proposals_per_image=PROPOSALS_PER_IMAGE,
         arm=arm,
         labelling_policy=LABELLING_POLICY,
-        replay_arm=REPLAY_ARM,
-        replay_reallocate=False,
+        annotation_policy=annotation_policy,
+        ignore_mechanism=ignore_mechanism,
+        replay_arm=replay_arm,
+        replay_reallocate=reallocate,
         replay_protocol_version=3,
         epochs=EPOCHS,
         learning_rate=LEARNING_RATE,
@@ -444,6 +523,8 @@ def make_selector(
     ref_t1: str | Path | None = None,
     device: str = "cuda",
     batch_size: int = 128,
+    annotation_policy: str = LABELLING_POLICY,
+    rounds: int = ROUNDS_PER_TASK,
     features_for: Callable[..., np.ndarray] = semantic.cached,
     reference_for: Callable[..., np.ndarray] = semantic.reference_from_ref_t1,
 ) -> Callable[..., arm_registry.ArmSelection]:
@@ -457,7 +538,10 @@ def make_selector(
     """
 
     spec = arm_registry.ARMS[arm]
-    cost_of = annotation_budget.cost_function(candidate_index)
+    # The price of an image belongs to the annotation policy. `LABELLING_POLICY`
+    # is the default, so every committed trajectory is charged exactly what it
+    # was charged before.
+    cost_of = annotation_budget.cost_function(candidate_index, annotation_policy)
     jpeg_dir = Path(jpeg_dir)
     wants_ref_t1 = spec.needs_semantic and spec.reference_scope == "labelled"
     if wants_ref_t1 and ref_t1 is None:
@@ -517,6 +601,7 @@ def make_selector(
             semantic=features,
             reference=reference,
             excluded_images=frozenset(used_images),
+            rounds=int(rounds),
         )
 
         if spec.needs_semantic and features is not None:
@@ -533,6 +618,23 @@ def make_selector(
                                     task=np.asarray(task.name), arm=np.asarray(arm))
             os.replace(temporary, task_dir / "coverage_reference.npz")
 
+        # The candidate-level trail a research arm leaves. Written next to the
+        # task rather than folded into the row: it is one line per taken
+        # candidate, which is the granularity the consultation asked for
+        # ("log D_labeled, D_batch and the final D per candidate") and far too
+        # long for a metrics row. The row keeps the aggregates.
+        if picked.picks:
+            picks_path = task_dir / "candidate_log.csv"
+            fields = list(picked.picks[0])
+            temporary = picks_path.with_suffix(".csv.part")
+            with temporary.open("w", encoding="utf-8", newline="") as handle:
+                import csv as _csv
+
+                writer = _csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(picked.picks)
+            os.replace(temporary, picks_path)
+
         row = dict(picked.row) | {
             "population_proposals": pool.diagnostics["proposals_after_nms"],
             "population_images": pool.diagnostics["images"],
@@ -540,9 +642,18 @@ def make_selector(
             "population_ranked": int(arm_registry.ranked_positions(arm, pool).size),
             "reference_scope": spec.reference_scope,
         }
+        # The anchor positions index this task's `pool`, which the runner never
+        # sees. Resolve them to boxes here, where the pool is in scope, so a
+        # per-box annotation policy has something to match the oracle against.
+        anchor_boxes = (
+            np.asarray(pool.candidates.boxes[list(picked.anchors)], dtype=np.float32)
+            if picked.anchors
+            else np.zeros((0, 4), dtype=np.float32)
+        )
         return arm_registry.ArmSelection(
             arm=picked.arm, images=picked.images, anchors=picked.anchors,
-            row=row, covered=picked.covered,
+            row=row, covered=picked.covered, picks=picked.picks,
+            anchor_boxes=anchor_boxes,
         )
 
     return selector

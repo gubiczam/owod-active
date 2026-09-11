@@ -200,10 +200,23 @@ owl/                 tíz modul, modulonként egy fogalom
   bridge.py          a PROB hívása — az egyetlen modul, ami tud a GPU-ról
   runner.py          a ciklus: szimulálva vagy élesben
   evaluation_subset.py  közös, csökkentett teszthalmaz, hogy tíz taszk megfizethető legyen
+  supervision.py     **V2** — a per-doboz annotációs protokoll: mit tanít a detektor
+                     egy megnyitott képen, dobozonként. A PROB-nak nincs ignore
+                     csatornája (a modul a pinnelt forrásból idézi), tehát az
+                     ignore mechanizmusa meg van nevezve, nem elhallgatva.
+  active_selection/  a GPU-lánc: populáció, ledger, armok, a benchmark protokollja
+    research_score.py  **V2** — a kutatási terv saját egyenlete, s(x) = U + λD + γ·w·coh,
+                       konfigurálható D-vel, bináris DBSCAN-kapuval és klaszter-ritkasággal
+    v2.py              **V2** — a V2 protokoll mint értékek, és a két fázis presetje
 
 notebooks/owod_active.ipynb   EGY notebook, mind a két üzemmóddal
+notebooks/OWOD_FULL_CHAIN_V2.ipynb   **V2** — a terv egyenlete a detektoron, t1→t10,
+                              újraindítható, emberi olvasású config-cellával
 docs/konzultacio_2026-08-25_lefedettseg.md   a konzultáció pontról pontra: hol van, mi jött ki
 docs/method.md                a specifikáció: minden tag, minden súly, egy taszk lépésről lépésre
+docs/full_owod_v2_protocol.md **V2** — az előre rögzített protokoll: score, D, coh, ritkaság,
+                              annotációs szabály, replay, batch, seedek, végpontok,
+                              kudarc-kritériumok. A futás ELŐTT íródott.
 docs/inkrementalis_baselinek.md   mihez mérjük magunkat, és mi az, ami még nincs kész
 docs/futtatas.md              mit kell csinálni, sorrendben, a próbafutástól a valódi láncig
 data/pool/                    a commitolt PROB-átfutás (60 MB)
@@ -211,7 +224,19 @@ data/results/                 minden jelentett szám ide generálódik
 data/reference/measured/      korábbi valódi GPU-futások metrikái, hivatkozási pontnak
 tests/                        egy állítás publikált állításonként, a rosszul sültekre is
 tools/run_experiments.py      minden szám újraszámolása
+tools/dry_run_owod_full_chain_v2.py   a V2 notebook minden cellája, GPU nélkül
 ```
+
+**V2 — mi változott a konzultáció után.** A meglévő lánc olyan armokat futtatott,
+amelyek **nem** a kutatási terv módszere: három statikus rangsor, két
+farthest-first bejárás és egy klaszter-kvóta allokátor. A terv egyenlete csak a
+`owl/scoring.py`-ban élt, ami a fagyasztott CPU-készleten fut és soha nem tanít
+detektort. A V2 ezt teszi rá a GPU-ágra, és a 2026-08-25-i konzultáció nyitott
+kérdéseit **konfigurálható tengelyekké** teszi: `D` (címkézett-újdonság növő
+poolhoz / batch-diverzitás / mind a kettő), `coh` (bináris DBSCAN-kapu /
+folytonos / nyitott), per-doboz annotáció valódi ignore-ral, `m_c ∝ n_c^α`
+taszkonként újraszámolva, és a keret mini-körökre bontva. Részletek:
+[`docs/full_owod_v2_protocol.md`](docs/full_owod_v2_protocol.md).
 
 ---
 

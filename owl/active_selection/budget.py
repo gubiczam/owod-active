@@ -60,11 +60,46 @@ def image_cost(counts: Mapping[str, int] | None) -> int:
 
 def cost_function(
     candidate_index: Mapping[str, Mapping[str, int]],
+    policy: str = "full_image",
 ) -> Callable[[str], int]:
-    """``image id -> answers``, closed over the benchmark's own object counts."""
+    """``image id -> answers``, closed over the benchmark's own object counts.
 
-    def cost(image_id: str) -> int:
-        return image_cost(candidate_index.get(str(image_id)))
+    The price of opening an image is a property of the **annotation policy**, not
+    of the image, and holding one policy's price fixed while running another is
+    how the 2026-08-25 consultation's "3,000 regions is not 3,000 images"
+    becomes an invisible confound.
+
+    ``full_image``
+        ``max(1, annotated objects on the image)`` — the annotator is handed the
+        image and labels everything in it. The default, and what every committed
+        trajectory was charged.
+    ``selected_box_only`` / ``known_plus_selected_ignore_rest``
+        ``1``. The annotator is asked about **the selected region only**. Under
+        the second policy the already-known boxes come free — the detector
+        produces them, no human is needed — and the unselected unknowns are not
+        asked about at all.
+
+    The consequence is deliberate and must be reported rather than smoothed
+    over: at the same answer budget the two cheap policies open roughly ten
+    times as many images as ``full_image`` does on this pool, whose measured
+    density is 9.56 annotated objects per candidate image. That is the finding,
+    not an artefact. See ``docs/full_owod_v2_protocol.md`` §7 for how the V2
+    budgets are set so that *images opened* is comparable and the oracle cost is
+    reported as the outcome.
+    """
+
+    if policy == "full_image":
+        def cost(image_id: str) -> int:
+            return image_cost(candidate_index.get(str(image_id)))
+    elif policy in ("selected_box_only", "known_plus_selected_ignore_rest"):
+        def cost(_image_id: str) -> int:
+            return ANSWER_FLOOR
+    else:
+        raise ValueError(
+            f"Unknown annotation policy {policy!r}. The price of an image is a "
+            "property of the policy, so an unrecognised policy cannot be "
+            "charged for; expected 'full_image', 'selected_box_only' or "
+            "'known_plus_selected_ignore_rest'.")
 
     return cost
 

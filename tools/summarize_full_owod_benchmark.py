@@ -41,6 +41,11 @@ DETECTOR_COLUMNS = (
     "known_mAP50", "prev_mAP50", "new_mAP50", "new_class_AP50", "U_Recall50",
     "forgetting", "drop_from_anchor", "mAP50_head", "mAP50_medium", "mAP50_tail",
     "U_Recall_head", "U_Recall_medium", "U_Recall_tail", "exchange_rate",
+    # Both named in the research plan's evaluation section, both already present
+    # in every metrics file the bridge wrote. A row written before 2026-09-10
+    # does not carry them and reports None, which is correct: the number is in
+    # its metrics.json and was never tabulated.
+    "WI08", "A_OSE",
 )
 COST_COLUMNS = (
     "answers_spent", "answers_unspent", "images_opened", "answers_per_image",
@@ -50,13 +55,29 @@ COST_COLUMNS = (
     # what PROB was actually handed, which is not what the task bought
     "boxes_trained_on", "boxes_trained_on_head", "boxes_trained_on_medium",
     "boxes_trained_on_tail",
-    "training_images", "training_iterations",
+    "training_images", "training_iterations", "gradient_steps",
+    # The per-box annotation policy's ledger. Blank for a run that left
+    # `annotation_policy` at None, which is correct: such a run expressed the
+    # policy through PROB's two-valued --supervision-mode and has no per-box
+    # accounting to report.
+    "annotation_policy", "ignore_mechanism", "objects_labelled",
+    "objects_supervised", "objects_ignored", "objects_banked",
+    "known_boxes_reused", "new_boxes_supervised", "answers_charged",
+    "alias_images_written", "images_without_supervision",
+    "images_pixel_suppressed", "selections_matching_no_object",
+    "pixels_suppressed_share", "label_supervision_from",
 )
 ACQUISITION_COLUMNS = (
     "acquired_objects", "acquired_classes", "acquired_new_class",
     "acquired_known_now", "acquired_becomes_known_t3", "acquired_becomes_known_t4",
     "acquired_stays_unknown", "acquired_head_objects", "acquired_medium_objects",
     "acquired_tail_objects",
+    # The V2 acquisition diagnostics. Blank for a run whose arm is not a
+    # research arm, which is correct: those arms compute none of these.
+    "positions_redundant", "reference_rows_initial", "reference_rows_final",
+    "final_noise_rate", "final_clusters", "final_accepted", "final_rejected",
+    "final_eps", "min_samples", "diversity_mode", "coherence_mode",
+    "rarity_mode", "rounds_run",
 )
 
 

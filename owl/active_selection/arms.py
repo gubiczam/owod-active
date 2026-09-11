@@ -66,6 +66,7 @@ from owl.active_selection import allocation as allocation_module
 from owl.active_selection import budget as ledger_module
 from owl.active_selection import coverage as coverage_module
 from owl.active_selection import population as population_module
+from owl.active_selection import research_score
 from owl.active_selection.population import Population
 
 
@@ -95,6 +96,11 @@ class Arm:
     #:                 which stops using DINOv2 as a distance-to-REF-T1 novelty
     #:                 score at all.
     reference_scope: str = "labelled"
+
+    #: For a ``research`` arm: which configuration of
+    #: ``s(x) = U + λ·D + γ·w·coh`` it is. ``None`` for every other kind, so no
+    #: earlier arm's behaviour can be changed by this field existing.
+    score_spec: research_score.ScoreSpec | None = None
 
     @property
     def slug(self) -> str:
@@ -189,6 +195,76 @@ ARMS: dict[str, Arm] = {
         description="A-gated, images ordered by descending sum-A over G — a "
                     "label-free cheap-image preference, no clustering",
     ),
+    # ------------------------------------------ V2, the research score itself
+    # Frozen by docs/full_owod_v2_protocol.md before the V2 chain ran.
+    #
+    # These are the first arms on the GPU path that compute the research plan's
+    # own equation, `s(x) = U + λ·D + γ·w·coh`. Until now that equation existed
+    # only in `owl.scoring`, which runs on the frozen CPU pool and never trains
+    # a detector; the arms above are a different method family. See
+    # `owl.active_selection.research_score` for every term.
+    #
+    # They are listed in `benchmark.DEVELOPMENT_SEED_INFORMED` and reported as
+    # not-pre-registered, and the label is deliberately conservative rather than
+    # exact: their *design* comes from the research plan and the 2026-08-25
+    # consultation, and no V1 endpoint informed a single term of it — but they
+    # were added after V1's seed-0 numbers existed, and the repository's
+    # convention is that anything added after results exist carries the label.
+    # `docs/full_owod_v2_protocol.md` is their pre-registration for V2.
+    "research_v2": Arm(
+        name="research_v2", kind="research", needs_semantic=True, gated=True,
+        reference_aware=True, reference_scope="labelled",
+        score_spec=research_score.ScoreSpec(
+            diversity_mode="combined", coherence_mode="dbscan_binary",
+            rarity_mode="cluster_rarity",
+        ),
+        description="U + 0.2*(labelled novelty + intra-batch)/2 + 0.5*rarity*"
+                    "DBSCAN gate, A-gated, recomputed every round",
+    ),
+    #: The plan's equation as it is literally written in the PDF: `D` as
+    #: distance to what is labelled and `coh` as the inverse k-th neighbour
+    #: distance. The one variable between this and `research_v2` is the pair of
+    #: 2026-08-25 redesigns, so the contrast measures the consultation.
+    "research_v2_plan": Arm(
+        name="research_v2_plan", kind="research", needs_semantic=True, gated=True,
+        reference_aware=True, reference_scope="labelled",
+        score_spec=research_score.ScoreSpec(
+            diversity_mode="labeled_novelty", coherence_mode="continuous",
+            rarity_mode="cluster_rarity",
+        ),
+        description="the plan's equation as written: labelled-novelty D, "
+                    "continuous coherence",
+    ),
+    #: Gate ablation. `coh ≡ 1` — not the same as γ=0, because the rarity weight
+    #: still acts. It is what separates "the gate helped" from "the weight helped".
+    "research_v2_no_gate": Arm(
+        name="research_v2_no_gate", kind="research", needs_semantic=True,
+        gated=True, reference_aware=True, reference_scope="labelled",
+        score_spec=research_score.ScoreSpec(
+            diversity_mode="combined", coherence_mode="none",
+            rarity_mode="cluster_rarity",
+        ),
+        description="research_v2 with the coherence gate held open",
+    ),
+    #: The two halves of `D`, each alone, so the combined term is decomposable.
+    "research_v2_labeled_only": Arm(
+        name="research_v2_labeled_only", kind="research", needs_semantic=True,
+        gated=True, reference_aware=True, reference_scope="labelled",
+        score_spec=research_score.ScoreSpec(
+            diversity_mode="labeled_novelty", coherence_mode="dbscan_binary",
+            rarity_mode="cluster_rarity",
+        ),
+        description="research_v2 with D = labelled novelty only",
+    ),
+    "research_v2_batch_only": Arm(
+        name="research_v2_batch_only", kind="research", needs_semantic=True,
+        gated=True, reference_aware=True, reference_scope="labelled",
+        score_spec=research_score.ScoreSpec(
+            diversity_mode="batch_diversity", coherence_mode="dbscan_binary",
+            rarity_mode="cluster_rarity",
+        ),
+        description="research_v2 with D = intra-batch diversity only",
+    ),
 }
 
 #: Execution priority, fixed before the first trajectory ran. A session that
@@ -203,9 +279,14 @@ ARMS: dict[str, Arm] = {
 #: ``cost_aware`` and ``distribution_aware_v1`` are **appended** for the same
 #: reason ``proposed_v2`` was: both were designed after seeing seed-0 results and
 #: may not displace a pre-registered baseline in the execution order.
+#: ``research_*`` are appended for the same reason: they were added after V1's
+#: seed-0 numbers existed, so they may not displace a pre-registered baseline in
+#: the execution order even though the V2 protocol pre-registers them.
 ORDER: tuple[str, ...] = (
     "random", "admissibility", "proposed", "entropy", "coreset", "proposed_v2",
     "cost_aware", "distribution_aware_v1", "distribution_aware_iterative_v1",
+    "research_v2", "research_v2_plan", "research_v2_no_gate",
+    "research_v2_labeled_only", "research_v2_batch_only",
 )
 
 
@@ -219,6 +300,13 @@ ALLOCATED: frozenset[str] = frozenset({"distribution_aware_v1", "cost_aware"})
 #: needs its own branch in :func:`select` because the ledger is consulted
 #: *between* recomputations, not once at the end.
 ITERATIVE: frozenset[str] = frozenset({"distribution_aware_iterative_v1"})
+
+#: The arms that compute the research plan's own equation. Membership routes an
+#: arm to :mod:`owl.active_selection.research_score`, so an arm outside this set
+#: cannot have its measured behaviour changed by that module existing.
+RESEARCH: frozenset[str] = frozenset(
+    name for name, spec in ARMS.items() if spec.kind == "research"
+)
 
 
 class ArmError(ValueError):
@@ -237,6 +325,21 @@ class ArmSelection:
     #: for, not only the region that triggered the purchase. The coverage arms
     #: carry this forward as next task's labelled reference.
     covered: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+
+    #: Candidate-level trail, one row per taken candidate: ``U``, ``D_labeled``,
+    #: ``D_batch``, ``D``, ``w``, ``coh``, cluster id and core/border/noise
+    #: status. Only a ``research`` arm fills this; everything else leaves it
+    #: empty, which is what keeps the earlier arms' rows byte-identical.
+    picks: tuple[dict, ...] = ()
+
+    #: The proposal box that opened each image, aligned with :attr:`images`, in
+    #: normalised ``cxcywh``. A per-box annotation policy needs to know *which*
+    #: region the answer was about; only :func:`ArmSelection.anchors` knew that,
+    #: and those are positions in the arm's own population, which the runner
+    #: cannot resolve. Filled by
+    #: :func:`owl.active_selection.benchmark.make_selector`.
+    anchor_boxes: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 4), dtype=np.float32))
 
     def __len__(self) -> int:
         return len(self.images)
@@ -393,6 +496,37 @@ def select(
             f"Arm {arm!r} does not read semantic features, but some were passed. "
             "Paying for an export nothing consults would misreport the cost of "
             "this arm."
+        )
+
+    if spec.kind == "research":
+        features = np.asarray(semantic, dtype=np.float32)
+        index = ranked_positions(arm, pool)
+        if features.shape[0] != index.size:
+            raise ArmError(
+                f"semantic has {features.shape[0]} rows and arm {arm!r} selects "
+                f"over {index.size} candidates (the admissible subset G); the "
+                "export does not describe what this arm ranks."
+            )
+        result = research_score.select(
+            features,
+            entropy=scoring.uncertainty(pool.candidates, "entropy")[index],
+            image_ids=pool.candidates.image_ids[index],
+            cost_of=cost_of, budget=int(answer_budget), spec=spec.score_spec,
+            rounds=int(rounds), reference=reference,
+            excluded_images=frozenset(excluded_images),
+        )
+        covered = np.zeros(len(pool), dtype=bool)
+        covered[index[result.covered]] = True
+        row = (
+            {"arm": arm, "selector": spec.kind, "rounds": int(rounds),
+             "selector_detail": "research_score"}
+            | result.diagnostics
+            | {"round_log": json.dumps(list(result.rounds))}
+        )
+        return ArmSelection(
+            arm=arm, images=result.images,
+            anchors=tuple(int(index[a]) for a in result.anchors),
+            row=row, covered=covered, picks=result.picks,
         )
 
     if spec.kind == "iterative":

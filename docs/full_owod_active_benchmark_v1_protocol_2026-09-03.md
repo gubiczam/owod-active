@@ -484,6 +484,20 @@ declares the same values in code and `check_protocol()` compares them **as
 values**, field by field. Prose above is documentation; this block is the
 contract.
 
+**2026-09-10 — why `arms` names five arms Benchmark V1 never ran.** The
+`research_v2*` arms were added for Full OWOD Chain V2
+(`docs/full_owod_v2_protocol.md`), which puts the research plan's own equation
+`s(x) = U + λ·D + γ·w·coh` on the GPU path for the first time. `arms` in this
+block is the *registry*, not V1's session list, and `check_protocol()` compares
+it against `owl.active_selection.arms.ORDER` — so a new registered arm has to
+be acknowledged here or the guard fires, which is exactly what it did. **No V1
+value in this block moved, and no V1 trajectory is affected:** the new arms are
+appended after every pre-registered one, they carry their own frozen
+`ScoreSpec`, and every existing arm's `score_spec` is `None`. They are listed in
+`development_seed_informed` for the conservative reason given in
+`owl.active_selection.benchmark` — their design reads no V1 endpoint, but they
+were added after V1's seed-0 numbers existed.
+
 ```json protocol
 {
   "n_tasks": 4,
@@ -503,8 +517,8 @@ contract.
   "seeds": [0, 1, 2],
   "nms_iou": 0.6,
   "admissible_share": 0.3,
-  "arms": ["random", "admissibility", "proposed", "entropy", "coreset", "proposed_v2", "cost_aware", "distribution_aware_v1", "distribution_aware_iterative_v1"],
-  "development_seed_informed": ["proposed_v2", "cost_aware", "distribution_aware_v1", "distribution_aware_iterative_v1"],
+  "arms": ["random", "admissibility", "proposed", "entropy", "coreset", "proposed_v2", "cost_aware", "distribution_aware_v1", "distribution_aware_iterative_v1", "research_v2", "research_v2_plan", "research_v2_no_gate", "research_v2_labeled_only", "research_v2_batch_only"],
+  "development_seed_informed": ["proposed_v2", "cost_aware", "distribution_aware_v1", "distribution_aware_iterative_v1", "research_v2", "research_v2_plan", "research_v2_no_gate", "research_v2_labeled_only", "research_v2_batch_only"],
   "kill_rule": {
     "arm": "proposed_v2",
     "seed": 0,
